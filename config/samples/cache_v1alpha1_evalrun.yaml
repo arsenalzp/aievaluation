@@ -1,0 +1,9 @@
+apiVersion: cache.ai.evaluation.io/v1alpha1
+kind: EvalRun
+metadata:
+  labels:
+    app.kubernetes.io/name: ai-eval
+    app.kubernetes.io/managed-by: kustomize
+  name: evalrun-sample
+spec:
+  # TODO(user): Add fields here
