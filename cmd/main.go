@@ -21,9 +21,11 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -202,9 +204,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	cfg := ctrl.GetConfigOrDie()
+
 	if err := (&controller.EvalSuiteReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		RequeueWhileRunning: 10 * time.Second,
+
+		RestConfig: cfg,
+		Kube:       kubernetes.NewForConfigOrDie(cfg),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EvalSuite")
 		os.Exit(1)

@@ -1,4 +1,4 @@
-apiVersion: cache.ai.evaluation.io/v1alpha1
+apiVersion: ai.evaluation.io/v1alpha1
 kind: EvalDataset
 metadata:
   labels:

@@ -2,9 +2,9 @@
 # since it depends on service name and namespace that are out of this kustomize package.
 # It should be run by config/default
 resources:
-- bases/cache.ai.evaluation.io_evalsuites.yaml
-- bases/cache.ai.evaluation.io_evalruns.yaml
-- bases/cache.ai.evaluation.io_evaldatasets.yaml
+- bases/ai.evaluation.io_evalsuites.yaml
+- bases/ai.evaluation.io_evalruns.yaml
+- bases/ai.evaluation.io_evaldatasets.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
