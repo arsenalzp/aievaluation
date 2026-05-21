@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the ai-eval itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- evaldataset_admin_role.yaml
+- evaldataset_editor_role.yaml
+- evaldataset_viewer_role.yaml
 - evalrun_admin_role.yaml
 - evalrun_editor_role.yaml
 - evalrun_viewer_role.yaml

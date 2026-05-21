@@ -5,9 +5,36 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - cache.ai.evaluation.io
+  - ai.evaluation.io
   resources:
+  - evaldatasets
   - evalsuites
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ai.evaluation.io
+  resources:
+  - evalruns
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ai.evaluation.io
+  resources:
+  - evalruns/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - batch
+  resources:
+  - jobs
   verbs:
   - create
   - delete
@@ -16,17 +43,3 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - cache.ai.evaluation.io
-  resources:
-  - evalsuites/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - cache.ai.evaluation.io
-  resources:
-  - evalsuites/status
-  verbs:
-  - get
-  - patch
-  - update

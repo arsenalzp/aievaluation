@@ -4,6 +4,7 @@
 resources:
 - bases/cache.ai.evaluation.io_evalsuites.yaml
 - bases/cache.ai.evaluation.io_evalruns.yaml
+- bases/cache.ai.evaluation.io_evaldatasets.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

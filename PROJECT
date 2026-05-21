@@ -28,4 +28,12 @@ resources:
   kind: EvalRun
   path: github.com/arsenalzp/aievaluation/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: ai.evaluation.io
+  group: cache
+  kind: EvalDataset
+  path: github.com/arsenalzp/aievaluation/api/v1alpha1
+  version: v1alpha1
 version: "3"

@@ -1,0 +1,9 @@
+apiVersion: cache.ai.evaluation.io/v1alpha1
+kind: EvalDataset
+metadata:
+  labels:
+    app.kubernetes.io/name: ai-eval
+    app.kubernetes.io/managed-by: kustomize
+  name: evaldataset-sample
+spec:
+  # TODO(user): Add fields here

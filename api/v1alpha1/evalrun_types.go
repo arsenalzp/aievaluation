@@ -21,11 +21,24 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const (
+	PhaseCompleted = "COMPLETED"
+	PhaseFailed    = "FAILED"
+	PhaseRunning   = "RUNNING"
+	PhasePending   = "PENDING"
+)
+
+type Phase = string
+
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 type Revision struct {
-	GitSha   *string `json:"gitSha,omitempty"`
-	PrNumber *int32  `json:"prNumber,omitempty"`
+	GitSHA   *string `json:"GitSHA,omitempty"`
+	PRnumber *int32  `json:"prNumber,omitempty"`
+}
+
+type RootCause struct {
+	Stage string `json:"stage,omitempty"`
 }
 
 // EvalRunSpec defines the desired state of EvalRun.
@@ -34,10 +47,31 @@ type EvalRunSpec struct {
 	Revision `json:"revision,omitempty"`
 }
 
+type ExecutionFailure struct {
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+type GateSummary struct {
+	Verdict string
+	Summary string
+	RootCause
+	Artifacts string
+}
+
 // EvalRunStatus defines the observed state of EvalRun.
 type EvalRunStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	Phase            `json:"phase,omitempty"`
+	Conditions       []metav1.Condition      `json:"conditions,omitempty"`
+	Verdict          string                  `json:"verdict,omitempty"`
+	Summary          string                  `json:"summary,omitempty"`
+	StartedAt        metav1.Time             `json:"startedAt,omitempty"`
+	CompletedAt      metav1.Time             `json:"CompletedAt,omitempty"`
+	JobRef           v1.LocalObjectReference `json:"jobRef,omitempty"`
+	SuiteSpecHash    string                  `json:"suiteSpecHash,omitempty"`
+	RootCause        `json:"rootCause,omitempty"`
+	Artifacts        string            `json:"artifacts,omitempty"`
+	ExecutionFailure *ExecutionFailure `json:"executionFailure,omitempty"`
 }
 
 // +kubebuilder:object:root=true
