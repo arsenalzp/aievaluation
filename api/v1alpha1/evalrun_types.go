@@ -33,7 +33,7 @@ type Phase = string
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 type Revision struct {
-	GitSHA   *string `json:"GitSHA,omitempty"`
+	GitSHA   *string `json:"gitSHA,omitempty"`
 	PRnumber *int32  `json:"prNumber,omitempty"`
 }
 
@@ -53,10 +53,10 @@ type ExecutionFailure struct {
 }
 
 type GateSummary struct {
-	Verdict string
-	Summary string
-	RootCause
-	Artifacts string
+	Verdict   string    `json:"verdict,omitempty"`
+	Summary   string    `json:"summary,omitempty"`
+	RootCause RootCause `json:"rootCause,omitempty"`
+	Artifacts string    `json:"artifacts,omitempty"`
 }
 
 // EvalRunStatus defines the observed state of EvalRun.
@@ -66,7 +66,7 @@ type EvalRunStatus struct {
 	Verdict          string                  `json:"verdict,omitempty"`
 	Summary          string                  `json:"summary,omitempty"`
 	StartedAt        metav1.Time             `json:"startedAt,omitempty"`
-	CompletedAt      metav1.Time             `json:"CompletedAt,omitempty"`
+	CompletedAt      metav1.Time             `json:"completedAt,omitempty"`
 	JobRef           v1.LocalObjectReference `json:"jobRef,omitempty"`
 	SuiteSpecHash    string                  `json:"suiteSpecHash,omitempty"`
 	RootCause        `json:"rootCause,omitempty"`

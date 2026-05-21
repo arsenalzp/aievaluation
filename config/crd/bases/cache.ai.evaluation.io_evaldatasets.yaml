@@ -44,11 +44,12 @@ spec:
               source:
                 properties:
                   fileName:
+                    description: FileName is optional subPath inside PVC (directory
+                      or file).
                     type: string
                   sourceRef:
-                    description: |-
-                      LocalObjectReference contains enough information to let you locate the
-                      referenced object inside the same namespace.
+                    description: SourceRef points to PVC name in the same namespace
+                      that contains dataset files.
                     properties:
                       name:
                         default: ""

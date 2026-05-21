@@ -44,7 +44,7 @@ spec:
                   EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
                   NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
                 properties:
-                  gitSha:
+                  gitSHA:
                     type: string
                   prNumber:
                     format: int32
@@ -70,6 +70,11 @@ spec:
           status:
             description: EvalRunStatus defines the observed state of EvalRun.
             properties:
+              artifacts:
+                type: string
+              completedAt:
+                format: date-time
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -126,7 +131,40 @@ spec:
                   - type
                   type: object
                 type: array
+              executionFailure:
+                properties:
+                  message:
+                    type: string
+                  reason:
+                    type: string
+                type: object
+              jobRef:
+                description: |-
+                  LocalObjectReference contains enough information to let you locate the
+                  referenced object inside the same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
               phase:
+                type: string
+              rootCause:
+                properties:
+                  stage:
+                    type: string
+                type: object
+              startedAt:
+                format: date-time
+                type: string
+              suiteSpecHash:
                 type: string
               summary:
                 type: string

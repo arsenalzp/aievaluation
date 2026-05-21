@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -39,6 +40,32 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+type suiteConfigJSON struct {
+	Metrics struct {
+		Retrieval struct {
+			MinContextRecall    *float32 `json:"minContextRecall,omitempty"`
+			MinContextPrecision *float32 `json:"minContextPrecision,omitempty"`
+		} `json:"retrieval,omitempty"`
+		Generation struct {
+			MinFaithfulness *float32 `json:"minFaithfulness,omitempty"`
+			MinCorrectness  *float32 `json:"minCorrectness,omitempty"`
+		} `json:"generation,omitempty"`
+		Trustworthiness struct {
+			MaxStaleChunkRatio   *float32 `json:"maxStaleChunkRatio,omitempty"`
+			MaxUnknownOwnerRatio *float32 `json:"maxUnknownOwnerRatio,omitempty"`
+		} `json:"trustworthiness,omitempty"`
+	} `json:"metrics,omitempty"`
+
+	RegressionPolicy struct {
+		MaxDrop *float32 `json:"maxDrop,omitempty"`
+	} `json:"regressionPolicy,omitempty"`
+
+	Execution struct {
+		Mode           *string `json:"mode,omitempty"`
+		TimeoutSeconds *int64  `json:"timeoutSeconds,omitempty"`
+	} `json:"execution,omitempty"`
+}
+
 // EvalSuiteReconciler reconciles a EvalSuite object
 type EvalSuiteReconciler struct {
 	client.Client
@@ -51,6 +78,8 @@ type EvalSuiteReconciler struct {
 // +kubebuilder:rbac:groups=ai.evaluation.io,resources=evalsuites,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ai.evaluation.io,resources=evaldatasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx).WithValues("evalrun", req.NamespacedName)
 
@@ -82,6 +111,35 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
+	// 2.1) Load EvalDataset referenced by EvalSuite
+	if suite.Spec.DatasetRef == nil || suite.Spec.DatasetRef.Name == "" {
+		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "", "DatasetRefMissing",
+			"EvalSuite.spec.datasetRef is empty (must reference EvalDataset)", 30*time.Second)
+	}
+
+	var dataset aieval.EvalDataset
+	if err := r.Get(ctx,
+		types.NamespacedName{Name: suite.Spec.DatasetRef.Name, Namespace: run.Namespace},
+		&dataset,
+	); err != nil {
+		if apierrors.IsNotFound(err) {
+			return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "", "EvalDatasetNotFound",
+				fmt.Sprintf("EvalDataset %q not found", suite.Spec.DatasetRef.Name), 30*time.Second)
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Validate that dataset points to PVC
+	if dataset.Spec.Source.SourceRef == nil || dataset.Spec.Source.SourceRef.Name == "" {
+		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "", "DatasetPVCMissing",
+			fmt.Sprintf("EvalDataset %q spec.source.sourceRef.name must be PVC name", dataset.Name), 30*time.Second)
+	}
+
+	if dataset.Spec.Source.FileName == nil || *dataset.Spec.Source.FileName == "" {
+		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "", "DatasetFileMissing",
+			fmt.Sprintf("EvalDataset %q: spec.source.fileName must be file path inside PVC", dataset.Name), 30*time.Second)
+	}
+
 	// 3) Snapshot suiteSpecHash into EvalRun.status (prevents policy drift mid-run)
 	suiteHash := hashSuiteSpec(&suite)
 	if run.Status.SuiteSpecHash == "" {
@@ -103,8 +161,16 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	var job batchv1.Job
 	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: run.Namespace}, &job)
 	if apierrors.IsNotFound(err) {
+
+		// Before creating of Job it is necessary to create ConfigMap resource
+		// and render EvalSuite resource in that ConfigMap.
+		suiteCfgCM, err := r.ensureSuiteConfigMap(ctx, &suite, suiteHash)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
 		// Create Job
-		newJob := buildEvalJob(&run, &suite, jobName)
+		newJob := buildEvalJob(&run, &suite, &dataset, jobName, "eval-artifacts-pvc", suiteCfgCM)
 
 		// Set owner reference (this is your preferred pattern)
 		if err := controllerutil.SetControllerReference(&run, newJob, r.Scheme); err != nil {
@@ -191,8 +257,9 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 // SetupWithManager sets up the controller with the Manager.
 func (r *EvalSuiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&aieval.EvalSuite{}).
-		Named("evalsuite").
+		For(&aieval.EvalRun{}).
+		Owns(&batchv1.Job{}).
+		Named("evalrun").
 		Complete(r)
 }
 
@@ -253,7 +320,15 @@ func hashSuiteSpec(suite *aieval.EvalSuite) string {
 	return hex.EncodeToString(h[:8]) // short hash ok
 }
 
-func buildEvalJob(run *aieval.EvalRun, suite *aieval.EvalSuite, jobName string) *batchv1.Job {
+func buildEvalJob(
+	run *aieval.EvalRun,
+	suite *aieval.EvalSuite,
+	dataset *aieval.EvalDataset,
+	jobName string,
+	artifactsPVC string, // "eval-artifacts-pvc"
+	suiteCfgCM string, // ensured CM name
+) *batchv1.Job {
+
 	labels := map[string]string{
 		"app.kubernetes.io/name":      "eval-gate",
 		"ai.evaluation.io/evalrun":    run.Name,
@@ -261,9 +336,17 @@ func buildEvalJob(run *aieval.EvalRun, suite *aieval.EvalSuite, jobName string) 
 		"ai.evaluation.io/suite-hash": run.Status.SuiteSpecHash,
 	}
 
-	datasetCM := suite.Spec.DatasetRef // string (name) in this MVP
+	datasetPVC := dataset.Spec.Source.SourceRef.Name
+	datasetFile := *dataset.Spec.Source.FileName
+
+	mountedDatasetFilePath := "/datasets/dataset" // FILE PATH (important)
+	runDir := fmt.Sprintf("/artifacts/runs/%s", run.Name)
+	baselineFile := fmt.Sprintf("/artifacts/baselines/%s.json", suite.Name)
 
 	backoff := int32(0)
+
+	runnerImage := ptr.Deref(suite.Spec.Execution.RunnerImage, "")
+
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
@@ -273,27 +356,41 @@ func buildEvalJob(run *aieval.EvalRun, suite *aieval.EvalSuite, jobName string) 
 		Spec: batchv1.JobSpec{
 			BackoffLimit: &backoff,
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
-				},
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{
 							Name:  "runner",
-							Image: *suite.Spec.Execution.RunnerImage, // your python runner
+							Image: runnerImage,
 							Env: []corev1.EnvVar{
 								{Name: "EVALRUN_NAME", Value: run.Name},
 								{Name: "EVALSUITE_NAME", Value: suite.Name},
-								{Name: "GIT_SHA", Value: *run.Spec.Revision.GitSHA},
-								// Optional: PR number
+								{Name: "GIT_SHA", Value: ptr.Deref(run.Spec.Revision.GitSHA, "")},
 								{Name: "PR_NUMBER", Value: fmt.Sprintf("%d", ptr.Deref(run.Spec.Revision.PRnumber, 0))},
-								// Where to write artifacts; you can switch to S3 later
+
+								{Name: "DATASET_FILE", Value: mountedDatasetFilePath},
 								{Name: "ARTIFACT_DIR", Value: "/artifacts"},
+								{Name: "RUN_DIR", Value: runDir},
+								{Name: "BASELINE_FILE", Value: baselineFile},
+
+								// suite config from ConfigMap as a file
+								{Name: "SUITE_CONFIG", Value: "/config/suite.json"},
 							},
 							VolumeMounts: []corev1.VolumeMount{
+								// artifacts directory on shared PVC
 								{Name: "artifacts", MountPath: "/artifacts"},
-								{Name: "dataset", MountPath: "/datasets", ReadOnly: true},
+
+								// dataset single FILE via subPath (file inside PVC)
+								{
+									Name:      "dataset",
+									MountPath: mountedDatasetFilePath,
+									SubPath:   datasetFile,
+									ReadOnly:  true,
+								},
+
+								// suite config
+								{Name: "suite-config", MountPath: "/config", ReadOnly: true},
 							},
 						},
 					},
@@ -301,14 +398,29 @@ func buildEvalJob(run *aieval.EvalRun, suite *aieval.EvalSuite, jobName string) 
 						{
 							Name: "artifacts",
 							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: artifactsPVC,
+									ReadOnly:  false,
+								},
 							},
 						},
 						{
 							Name: "dataset",
 							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: datasetPVC,
+									ReadOnly:  true,
+								},
+							},
+						},
+						{
+							Name: "suite-config",
+							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{Name: datasetCM.Name},
+									LocalObjectReference: corev1.LocalObjectReference{Name: suiteCfgCM},
+									Items: []corev1.KeyToPath{
+										{Key: "suite.json", Path: "suite.json"},
+									},
 								},
 							},
 						},
@@ -317,6 +429,73 @@ func buildEvalJob(run *aieval.EvalRun, suite *aieval.EvalSuite, jobName string) 
 			},
 		},
 	}
+}
+
+// A render from EvalSuite.Spec to suite.json
+func renderSuiteConfigJSON(suite *aieval.EvalSuite) ([]byte, error) {
+	var cfg suiteConfigJSON
+
+	// Metrics (у тебя они embedded в suite.Spec)
+	cfg.Metrics.Retrieval.MinContextRecall = suite.Spec.Metrics.MinContextRecall
+	cfg.Metrics.Retrieval.MinContextPrecision = suite.Spec.Metrics.MinContextPrecision
+
+	cfg.Metrics.Generation.MinFaithfulness = suite.Spec.Metrics.MinFaithfulness
+	cfg.Metrics.Generation.MinCorrectness = suite.Spec.Metrics.MinCorrectness
+
+	cfg.Metrics.Trustworthiness.MaxStaleChunkRatio = suite.Spec.Metrics.MaxStaleChunkRatio
+	cfg.Metrics.Trustworthiness.MaxUnknownOwnerRatio = suite.Spec.Metrics.MaxUnknownOwnerRatio
+
+	// RegressionPolicy
+	cfg.RegressionPolicy.MaxDrop = suite.Spec.RegressionPolicy.MaxDrop
+
+	// Execution
+	cfg.Execution.Mode = suite.Spec.Execution.Mode
+	cfg.Execution.TimeoutSeconds = suite.Spec.Execution.TimeoutSeconds
+
+	return json.MarshalIndent(cfg, "", "  ")
+}
+
+func suiteConfigMapName(suiteName, suiteHash string) string {
+	short := suiteHash
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	return fmt.Sprintf("evalsuite-%s-%s-cfg", suiteName, short)
+}
+
+func (r *EvalSuiteReconciler) ensureSuiteConfigMap(ctx context.Context, suite *aieval.EvalSuite, suiteHash string) (string, error) {
+	name := suiteConfigMapName(suite.Name, suiteHash)
+
+	payload, err := renderSuiteConfigJSON(suite)
+	if err != nil {
+		return "", err
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: suite.Namespace,
+		},
+	}
+
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data["suite.json"] = string(payload)
+
+		if cm.Labels == nil {
+			cm.Labels = map[string]string{}
+		}
+		cm.Labels["ai.evaluation.io/evalsuite"] = suite.Name
+		cm.Labels["ai.evaluation.io/suite-hash"] = suiteHash
+
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 // fetchGateSummary is intentionally a placeholder.

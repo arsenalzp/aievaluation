@@ -25,8 +25,11 @@ import (
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
 type Source struct {
+	// SourceRef points to PVC name in the same namespace that contains dataset files.
 	SourceRef *v1.LocalObjectReference `json:"sourceRef,omitempty"`
-	FileName  *string                  `json:"fileName,omitempty"`
+
+	// FileName is optional subPath inside PVC (directory or file).
+	FileName *string `json:"fileName,omitempty"`
 }
 
 // EvalDatasetSpec defines the desired state of EvalDataset.
