@@ -43,8 +43,9 @@ type RootCause struct {
 
 // EvalRunSpec defines the desired state of EvalRun.
 type EvalRunSpec struct {
-	SuiteRef *v1.LocalObjectReference `json:"suiteRef,omitempty"`
-	Revision `json:"revision,omitempty"`
+	SuiteRef      *v1.LocalObjectReference `json:"suiteRef,omitempty"`
+	Revision      `json:"revision,omitempty"`
+	SummaryBucket string `json:"summaryBucket,omitempty"`
 }
 
 type ExecutionFailure struct {

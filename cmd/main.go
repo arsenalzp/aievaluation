@@ -25,12 +25,15 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
-	"k8s.io/client-go/kubernetes"
+	objectstorage "github.com/metorial/object-storage/clients/go"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	cachev1alpha1 "github.com/arsenalzp/aievaluation/api/v1alpha1"
+	"github.com/arsenalzp/aievaluation/internal/controller"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -38,9 +41,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
-
-	cachev1alpha1 "github.com/arsenalzp/aievaluation/api/v1alpha1"
-	"github.com/arsenalzp/aievaluation/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -204,15 +204,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	cfg := ctrl.GetConfigOrDie()
-
 	if err := (&controller.EvalSuiteReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		RequeueWhileRunning: 10 * time.Second,
 
-		RestConfig: cfg,
-		Kube:       kubernetes.NewForConfigOrDie(cfg),
+		Objectstorage: objectstorage.NewClient("http://k8s:9876"),
+		ObjectBuket:   "summary",
+		Queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{},
+		),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EvalSuite")
 		os.Exit(1)

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	aieval "github.com/arsenalzp/aievaluation/api/v1alpha1"
+	objectstorage "github.com/metorial/object-storage/clients/go"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
@@ -33,18 +34,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/workqueue"
 	ptr "k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
 	artifactsPVCName = "eval-artifacts-pvc"
 	artifactsMount   = "/artifacts"
+	maxRetries       = 3
 )
 
 type gateSummaryJSON struct {
@@ -90,8 +92,9 @@ type EvalSuiteReconciler struct {
 	Scheme              *runtime.Scheme
 	RequeueWhileRunning time.Duration
 
-	RestConfig *rest.Config
-	Kube       kubernetes.Interface
+	Objectstorage *objectstorage.Client
+	ObjectBuket   string
+	Queue         workqueue.TypedRateLimitingInterface[string]
 }
 
 // +kubebuilder:rbac:groups=ai.evaluation.io,resources=evalruns,verbs=get;list;watch;update;patch
@@ -152,32 +155,28 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	// Validate that dataset points to PVC
-	if dataset.Spec.Source.SourceRef == nil || dataset.Spec.Source.SourceRef.Name == "" {
-		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "", "DatasetPVCMissing",
-			fmt.Sprintf("EvalDataset %q spec.source.sourceRef.name must be PVC name", dataset.Name), 30*time.Second)
-	}
-
-	if dataset.Spec.Source.FileName == nil || *dataset.Spec.Source.FileName == "" {
-		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "", "DatasetFileMissing",
-			fmt.Sprintf("EvalDataset %q: spec.source.fileName must be file path inside PVC", dataset.Name), 30*time.Second)
+	// Validate that dataset points on a bucket
+	if dataset.Spec.Source.ObjectKey == nil || *dataset.Spec.Source.ObjectKey == "" {
+		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "",
+			"DatasetObjectKeyMissing", fmt.Sprintf("EvalDataset %s: spec.source.objectKey must be set", dataset.Name), 30*time.Second)
 	}
 
 	// 3) Snapshot suiteSpecHash into EvalRun.status (prevents policy drift mid-run)
 	suiteHash := hashSuiteSpec(&suite)
-	if run.Status.SuiteSpecHash == "" {
-		patch := client.MergeFrom(run.DeepCopy())
-		run.Status.SuiteSpecHash = suiteHash
-		if err := r.Status().Patch(ctx, &run, patch); err != nil {
-			return ctrl.Result{}, err
-		}
-		l.Info("snapshotted suite spec hash", "hash", suiteHash)
-	} else if run.Status.SuiteSpecHash != suiteHash {
-		// MVP: do not change running evaluation; just record a warning condition.
-		// You can choose stricter behavior later.
-		_ = r.setCondition(ctx, &run, "SuiteChanged", corev1.ConditionTrue,
-			"SuiteSpecUpdated", "EvalSuite spec changed after EvalRun started")
-	}
+	// if run.Status.SuiteSpecHash == "" {
+	// 	patch := client.MergeFrom(run.DeepCopy())
+	// 	run.Status.SuiteSpecHash = suiteHash
+	// 	if err := r.Status().Patch(ctx, &run, patch); err != nil {
+	// 		return ctrl.Result{}, err
+	// 	}
+	// 	l.Info("snapshotted suite spec hash", "hash", suiteHash)
+	// } else if run.Status.SuiteSpecHash != suiteHash && run.Status.Phase == aieval.PhaseRunning {
+	// 	// MVP: do not change running evaluation; just record a warning condition.
+	// 	// You can choose stricter behavior later.
+	// 	run.Status.SuiteSpecHash = suiteHash
+	// 	return r.setStatusAndRequeue(ctx, &run, aieval.PhaseRunning, "Running",
+	// 		"SuiteSpecUpdated", "EvalSuite spec changed after EvalRun started", 3*time.Second)
+	// }
 
 	// 4) Ensure Job exists (owned by EvalRun)
 	jobName := desiredJobName(&run)
@@ -193,7 +192,7 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 
 		// Create Job
-		newJob := buildEvalJob(&run, &suite, &dataset, jobName, "eval-artifacts-pvc", suiteCfgCM)
+		newJob := buildEvalJob(&run, &suite, &dataset, jobName, suiteCfgCM)
 
 		// Set owner reference (this is your preferred pattern)
 		if err := controllerutil.SetControllerReference(&run, newJob, r.Scheme); err != nil {
@@ -234,46 +233,61 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// 6) Finalize: read gate_summary.json (or equivalent) and set EvalRun.status
 	// IMPORTANT: Job Succeeded does NOT mean quality PASS; quality verdict is in gate_summary.
-	var gate aieval.GateSummary
+	var gate *aieval.GateSummary
 	if completed {
-		// TODO: implement artifact retrieval
-		// Example: gate, err = r.fetchGateSummaryFromS3(ctx, &suite, &run)
-		// For MVP: you can store summary in a small object store or as a ConfigMap created by the job.
-		var err error
-		gate, err = r.fetchGateSummary(ctx, &suite, &run)
-		if err != nil {
-			// If artifact missing, mark infra failure
-			return r.setStatusAndRequeue(ctx, &run, aieval.PhaseCompleted, "FAIL", "ArtifactMissing",
-				fmt.Sprintf("Job succeeded but gate_summary not found: %v", err), 60*time.Second)
+		if r.Queue.NumRequeues(run.Name) >= maxRetries && run.Status.Phase == aieval.PhaseRunning {
+			run.Status.Phase = aieval.PhaseFailed
+			run.Status.Verdict = "FAIL"
+			r.Queue.Forget(run.Name)
+			l.Info("finalized EvalRun", "verdict", run.Status.Verdict)
+			err := r.setCondition(ctx, &run, "ArtifactMissing", metav1.ConditionTrue, "MaximumRetriesReached", "Unable to get gate_summary")
+			if err != nil {
+				return ctrl.Result{}, reconcile.TerminalError(err)
+			}
+			return ctrl.Result{}, nil
+		}
+
+		if run.Status.Phase == aieval.PhaseRunning {
+			gate, err = r.fetchGateSummary(ctx, &suite, &run)
+			if err != nil {
+				r.Queue.AddRateLimited(run.Name)
+				// If artifact missing, mark infra failure
+				return r.setStatusAndRequeue(ctx, &run, aieval.PhaseRunning, "Running", "ArtifactMissing",
+					fmt.Sprintf("Job succeeded but gate_summary not found: %v", err), 10*time.Second)
+			} else {
+				run.Status.Phase = aieval.PhaseCompleted
+				run.Status.CompletedAt = metav1.Now()
+				run.Status.Verdict = gate.Verdict
+				run.Status.Summary = gate.Summary
+				run.Status.RootCause = gate.RootCause
+				run.Status.Artifacts = gate.Artifacts
+				if err := r.Status().Update(ctx, &run); err != nil {
+					return ctrl.Result{}, err
+				}
+				l.Info("finalized EvalRun", "verdict", run.Status.Verdict, "stage", run.Status.RootCause.Stage)
+				r.Queue.Forget(run.Name)
+			}
 		}
 	} else {
 		// job failed at infrastructure level
-		gate = aieval.GateSummary{
+		gate = &aieval.GateSummary{
 			Verdict: "FAIL",
 			Summary: fmt.Sprintf("Execution job failed: %s: %s", reason, msg),
 			RootCause: aieval.RootCause{
 				Stage: "Execution",
 			},
 		}
+		run.Status.Phase = aieval.PhaseFailed
+		run.Status.CompletedAt = metav1.Now()
+		run.Status.Verdict = gate.Verdict
+		run.Status.Summary = gate.Summary
+		run.Status.RootCause = gate.RootCause
+		run.Status.Artifacts = gate.Artifacts
+		if err := r.Status().Update(ctx, &run); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
-	patch := client.MergeFrom(run.DeepCopy())
-	run.Status.Phase = aieval.PhaseCompleted
-	run.Status.CompletedAt = metav1.Now()
-	run.Status.Verdict = gate.Verdict
-	run.Status.Summary = gate.Summary
-	run.Status.RootCause = gate.RootCause
-	run.Status.Artifacts = gate.Artifacts
-	if failed {
-		run.Status.ExecutionFailure = &aieval.ExecutionFailure{Reason: reason, Message: msg}
-	}
-	if err := r.Status().Patch(ctx, &run, patch); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	l.Info("finalized EvalRun", "verdict", run.Status.Verdict, "stage", run.Status.RootCause.Stage)
-
-	// 7) Optional cleanup (MVP: keep job for debugging; later add TTL / cleanup policy)
 	return ctrl.Result{}, nil
 }
 
@@ -296,12 +310,11 @@ func (r *EvalSuiteReconciler) setStatusAndRequeue(ctx context.Context, run *aiev
 	if err := r.Status().Patch(ctx, run, patch); err != nil {
 		return ctrl.Result{}, err
 	}
-	_ = r.setCondition(ctx, run, condType, corev1.ConditionTrue, "Error", msg)
+	_ = r.setCondition(ctx, run, condType, metav1.ConditionTrue, "Error", msg)
 	return ctrl.Result{RequeueAfter: after}, nil
 }
 
-func (r *EvalSuiteReconciler) setCondition(ctx context.Context, run *aieval.EvalRun, condType string, status corev1.ConditionStatus, reason, msg string) error {
-	patch := client.MergeFrom(run.DeepCopy())
+func (r *EvalSuiteReconciler) setCondition(ctx context.Context, run *aieval.EvalRun, condType string, status metav1.ConditionStatus, reason, msg string) error {
 	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             metav1.ConditionStatus(status),
@@ -309,7 +322,7 @@ func (r *EvalSuiteReconciler) setCondition(ctx context.Context, run *aieval.Eval
 		Message:            msg,
 		LastTransitionTime: metav1.Now(),
 	})
-	return r.Status().Patch(ctx, run, patch)
+	return r.Status().Update(ctx, run)
 }
 
 func (r *EvalSuiteReconciler) runningRequeue() time.Duration {
@@ -339,7 +352,8 @@ func desiredJobName(run *aieval.EvalRun) string {
 func hashSuiteSpec(suite *aieval.EvalSuite) string {
 	// You can hash only the fields you care about; JSON marshal is also fine.
 	// Keep it stable.
-	h := sha256.Sum256([]byte(fmt.Sprintf("%v", suite.Spec)))
+	data, _ := json.Marshal(suite.Spec)
+	h := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(h[:8]) // short hash ok
 }
 
@@ -348,10 +362,8 @@ func buildEvalJob(
 	suite *aieval.EvalSuite,
 	dataset *aieval.EvalDataset,
 	jobName string,
-	artifactsPVC string, // "eval-artifacts-pvc"
-	suiteCfgCM string, // ensured CM name
+	suiteCfgCM string,
 ) *batchv1.Job {
-
 	labels := map[string]string{
 		"app.kubernetes.io/name":      "eval-gate",
 		"ai.evaluation.io/evalrun":    run.Name,
@@ -359,48 +371,115 @@ func buildEvalJob(
 		"ai.evaluation.io/suite-hash": run.Status.SuiteSpecHash,
 	}
 
-	datasetPVC := dataset.Spec.Source.SourceRef.Name
-	datasetFile := *dataset.Spec.Source.FileName
-
-	mountedDatasetFilePath := "/datasets/dataset" // FILE PATH (important)
-	runDir := fmt.Sprintf("/artifacts/runs/%s", run.Name)
-	baselineFile := fmt.Sprintf("/artifacts/baselines/%s.json", suite.Name)
-
 	backoff := int32(0)
-
 	runnerImage := ptr.Deref(suite.Spec.Execution.RunnerImage, "")
-	container := []corev1.Container{
-		{
-			Name:  "runner",
-			Image: runnerImage,
-			Env: []corev1.EnvVar{
-				{Name: "EVALRUN_NAME", Value: run.Name},
-				{Name: "EVALSUITE_NAME", Value: suite.Name},
-				{Name: "GIT_SHA", Value: ptr.Deref(run.Spec.Revision.GitSHA, "")},
-				{Name: "PR_NUMBER", Value: fmt.Sprintf("%d", ptr.Deref(run.Spec.Revision.PRnumber, 0))},
 
-				{Name: "DATASET_FILE", Value: mountedDatasetFilePath},
-				{Name: "ARTIFACT_DIR", Value: "/artifacts"},
-				{Name: "RUN_DIR", Value: runDir},
-				{Name: "BASELINE_FILE", Value: baselineFile},
+	runPrefix := fmt.Sprintf("runs/%s", run.Name)
+	baselineKey := fmt.Sprintf("baselines/%s.json", suite.Name)
 
-				// suite config from ConfigMap as a file
-				{Name: "SUITE_CONFIG", Value: "/config/suite.json"},
-			},
-			VolumeMounts: []corev1.VolumeMount{
-				// artifacts directory on shared PVC
-				{Name: "artifacts", MountPath: "/artifacts"},
+	datasetBucket := ""
+	if dataset.Spec.Source.Bucket != nil {
+		datasetBucket = *dataset.Spec.Source.Bucket
+	}
 
-				// dataset single FILE via subPath (file inside PVC)
-				{
-					Name:      "dataset",
-					MountPath: mountedDatasetFilePath,
-					SubPath:   datasetFile,
-					ReadOnly:  true,
+	datasetObjectKey := ptr.Deref(dataset.Spec.Source.ObjectKey, "")
+	datasetVersionID := ptr.Deref(dataset.Spec.Source.VersionId, "")
+
+	env := []corev1.EnvVar{
+		{Name: "EVALRUN_NAME", Value: run.Name},
+		{Name: "EVALSUITE_NAME", Value: suite.Name},
+		{Name: "GIT_SHA", Value: ptr.Deref(run.Spec.Revision.GitSHA, "")},
+		{Name: "PR_NUMBER", Value: fmt.Sprintf("%d", ptr.Deref(run.Spec.Revision.PRnumber, 0))},
+
+		// local paths
+		{Name: "WORK_DIR", Value: "/work"},
+		{Name: "DATASET_FILE", Value: "/work/dataset"},
+		{Name: "SUITE_CONFIG", Value: "/config/suite.json"},
+
+		// dataset location in S3
+		{Name: "DATASET_S3_BUCKET", Value: datasetBucket},
+		{Name: "DATASET_S3_KEY", Value: datasetObjectKey},
+		{Name: "DATASET_S3_VERSION_ID", Value: datasetVersionID},
+		{Name: "DATASET_FORMAT", Value: dataset.Spec.Format},
+
+		// artifacts / baseline in S3
+		{Name: "S3_RUN_PREFIX", Value: runPrefix},
+		{Name: "S3_BASELINE_KEY", Value: baselineKey},
+		{Name: "GATE_SUMMARY_KEY", Value: fmt.Sprintf("%s/gate_summary.json", runPrefix)},
+		{Name: "SCORES_KEY", Value: fmt.Sprintf("%s/scores.json", runPrefix)},
+		{Name: "DETAILS_KEY", Value: fmt.Sprintf("%s/details.jsonl", runPrefix)},
+	}
+
+	// shared S3 credentials/config from Secret
+	env = append(env,
+		corev1.EnvVar{
+			Name: "S3_ENDPOINT",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "eval-s3-credentials"},
+					Key:                  "endpoint",
 				},
+			},
+		},
+		corev1.EnvVar{
+			Name: "S3_BUCKET",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "eval-s3-credentials"},
+					Key:                  "bucket",
+				},
+			},
+		},
+		corev1.EnvVar{
+			Name: "S3_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "eval-s3-credentials"},
+					Key:                  "accessKey",
+				},
+			},
+		},
+		corev1.EnvVar{
+			Name: "S3_SECRET_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "eval-s3-credentials"},
+					Key:                  "secretKey",
+				},
+			},
+		},
+		corev1.EnvVar{
+			Name: "S3_USE_SSL",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "eval-s3-credentials"},
+					Key:                  "useSSL",
+				},
+			},
+		},
+		corev1.EnvVar{
+			Name:  "SUMMARY_BUCKET",
+			Value: run.Spec.SummaryBucket,
+		},
+		corev1.EnvVar{
+			Name:  "SUMMARY_KEY",
+			Value: fmt.Sprintf("runs/%s/gate_summary.json", run.Name),
+		},
+	)
 
-				// suite config
-				{Name: "suite-config", MountPath: "/config", ReadOnly: true},
+	container := corev1.Container{
+		Name:  "runner",
+		Image: runnerImage,
+		Env:   env,
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "workdir",
+				MountPath: "/work",
+			},
+			{
+				Name:      "suite-config",
+				MountPath: "/config",
+				ReadOnly:  true,
 			},
 		},
 	}
@@ -409,15 +488,21 @@ func buildEvalJob(
 	if suite.Spec.Execution.Mode != nil {
 		mode = *suite.Spec.Execution.Mode
 	}
+
 	if mode == "dummy" {
-		container[0].Image = "alpine:3"
-		container[0].Command = []string{"sh", "-c"}
-		container[0].Args = []string{
-			`set -e;
-     mkdir -p "$RUN_DIR";
-     echo '{"verdict":"PASS","summary":"dummy run ok","rootCause":{"stage":"None"},"artifacts":{"scores":"scores.json"}}' > "$RUN_DIR/gate_summary.json";
-     echo '{"groundedness":0.9,"correctness":0.8}' > "$RUN_DIR/scores.json";
-    `,
+		container.Image = "nginx:stable-alpine3.23-perl"
+		container.Command = []string{"sh", "-c"}
+		container.Args = []string{
+			`set -e
+			echo "creating fake gate_summary in object bucket"
+			curl -H "Content-Type: application/json" -X PUT http://k8s:9876/buckets/${SUMMARY_BUCKET}/objects/${SUMMARY_KEY} --data '{
+"verdict": "PASS",
+"summary": "Fake gate_summary uploaded successfully for integration test",
+"rootCause": {
+  "stage": "None"
+},
+"artifacts": "{\"gateSummaryUri\":\"s3://${SUMMARY_BUCKET}/${SUMMARY_KEY}\",\"scoresUri\":\"s3://${SUMMARY_BUCKET}/${SCORES_KEY}\"}"
+}'`,
 		}
 	}
 
@@ -430,27 +515,19 @@ func buildEvalJob(
 		Spec: batchv1.JobSpec{
 			BackoffLimit: &backoff,
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
-					Containers:    container,
+					Containers: []corev1.Container{
+						container,
+					},
 					Volumes: []corev1.Volume{
 						{
-							Name: "artifacts",
+							Name: "workdir",
 							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: artifactsPVC,
-									ReadOnly:  false,
-								},
-							},
-						},
-						{
-							Name: "dataset",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: datasetPVC,
-									ReadOnly:  true,
-								},
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
 						},
 						{
@@ -475,7 +552,7 @@ func buildEvalJob(
 func renderSuiteConfigJSON(suite *aieval.EvalSuite) ([]byte, error) {
 	var cfg suiteConfigJSON
 
-	// Metrics (у тебя они embedded в suite.Spec)
+	// Metrics
 	cfg.Metrics.Retrieval.MinContextRecall = suite.Spec.Metrics.MinContextRecall
 	cfg.Metrics.Retrieval.MinContextPrecision = suite.Spec.Metrics.MinContextPrecision
 
@@ -580,73 +657,18 @@ func (r *EvalSuiteReconciler) buildGateReaderPod(run *aieval.EvalRun) *corev1.Po
 	}
 }
 
-func (r *EvalSuiteReconciler) fetchGateSummary(ctx context.Context, suite *aieval.EvalSuite, run *aieval.EvalRun) (aieval.GateSummary, error) {
-	podName := fmt.Sprintf("gate-reader-%s", run.Name)
-
-	// 1) Ensure helper pod exists
-	var pod corev1.Pod
-	err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: run.Namespace}, &pod)
-	if apierrors.IsNotFound(err) {
-		p := r.buildGateReaderPod(run)
-
-		// ownerRef -> the Pod is deleted along with EvalRun (GC)
-		if err := controllerutil.SetControllerReference(run, p, r.Scheme); err != nil {
-			return aieval.GateSummary{}, err
-		}
-
-		if err := r.Create(ctx, p); err != nil {
-			return aieval.GateSummary{}, err
-		}
-
-		// The Pod has just been created, let's wait for its complete
-		return aieval.GateSummary{}, fmt.Errorf("gate reader pod created, retry soon")
-	}
+func (r *EvalSuiteReconciler) fetchGateSummary(ctx context.Context, suite *aieval.EvalSuite, run *aieval.EvalRun) (*aieval.GateSummary, error) {
+	key := fmt.Sprintf("runs/%s/gate_summary.json", run.Name)
+	//key := fmt.Sprintf("runs/%s/gate_summary.json_", run.Name)
+	obj, err := r.Objectstorage.GetObject(run.Spec.SummaryBucket, key)
 	if err != nil {
-		return aieval.GateSummary{}, err
+		return nil, fmt.Errorf("unable to get gate_summary object: %s", err)
 	}
 
-	// 2) Wait terminal
-	phase := pod.Status.Phase
-	if phase == corev1.PodPending || phase == corev1.PodRunning {
-		return aieval.GateSummary{}, fmt.Errorf("gate reader pod still running, retry soon")
-	}
-	if phase != corev1.PodSucceeded {
-		// Trying to fetch logs for analyze
-		b, _ := r.Kube.CoreV1().Pods(run.Namespace).GetLogs(podName, &corev1.PodLogOptions{}).Do(ctx).Raw()
-		_ = r.Delete(ctx, &pod)
-		return aieval.GateSummary{}, fmt.Errorf("gate reader pod failed (%s): %s", phase, string(b))
+	var gate aieval.GateSummary
+	if err := json.Unmarshal(obj.Data, &gate); err != nil {
+		return nil, fmt.Errorf("failed to parse gate_summary json: %w; raw=%s", err, string(obj.Data))
 	}
 
-	// 3) Read logs (gate_summary.json file content)
-	raw, err := r.Kube.CoreV1().Pods(run.Namespace).GetLogs(podName, &corev1.PodLogOptions{}).Do(ctx).Raw()
-	if err != nil {
-		_ = r.Delete(ctx, &pod)
-		return aieval.GateSummary{}, err
-	}
-
-	// 4) Parse JSON
-	var gs gateSummaryJSON
-	if err := json.Unmarshal(raw, &gs); err != nil {
-		_ = r.Delete(ctx, &pod)
-		return aieval.GateSummary{}, fmt.Errorf("failed to parse gate_summary from logs: %w; raw=%s", err, string(raw))
-	}
-
-	// 5) Map to an API type
-	gate := aieval.GateSummary{
-		Verdict: gs.Verdict,
-		Summary: gs.Summary,
-		RootCause: aieval.RootCause{
-			Stage: gs.RootCause.Stage,
-		},
-	}
-	if gs.Artifacts != nil {
-		if b, e := json.Marshal(gs.Artifacts); e == nil {
-			gate.Artifacts = string(b)
-		}
-	}
-
-	// 6) Cleanup helper pod
-	_ = r.Delete(ctx, &pod)
-
-	return gate, nil
+	return &gate, nil
 }

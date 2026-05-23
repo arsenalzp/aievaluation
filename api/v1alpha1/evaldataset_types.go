@@ -17,25 +17,22 @@ limitations under the License.
 package v1alpha1
 
 import (
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-type Source struct {
-	// SourceRef points to PVC name in the same namespace that contains dataset files.
-	SourceRef *v1.LocalObjectReference `json:"sourceRef,omitempty"`
-
-	// FileName is optional subPath inside PVC (directory or file).
-	FileName *string `json:"fileName,omitempty"`
+type DatasetObjectSource struct {
+	Bucket    *string `json:"bucket,omitempty"`
+	ObjectKey *string `json:"objectKey,omitempty"`
+	VersionId *string `json:"versionId,omitempty"`
 }
 
 // EvalDatasetSpec defines the desired state of EvalDataset.
 type EvalDatasetSpec struct {
-	Source `json:"source,omitempty"`
-	Format string `json:"format,omitempty"`
+	Source DatasetObjectSource `json:"source,omitempty"`
+	Format string              `json:"format,omitempty"`
 }
 
 // EvalDatasetStatus defines the observed state of EvalDataset.

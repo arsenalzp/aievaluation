@@ -43,25 +43,12 @@ spec:
                 type: string
               source:
                 properties:
-                  fileName:
-                    description: FileName is optional subPath inside PVC (directory
-                      or file).
+                  bucket:
                     type: string
-                  sourceRef:
-                    description: SourceRef points to PVC name in the same namespace
-                      that contains dataset files.
-                    properties:
-                      name:
-                        default: ""
-                        description: |-
-                          Name of the referent.
-                          This field is effectively required, but due to backwards compatibility is
-                          allowed to be empty. Instances of this type with an empty value here are
-                          almost certainly wrong.
-                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                        type: string
-                    type: object
-                    x-kubernetes-map-type: atomic
+                  objectKey:
+                    type: string
+                  versionId:
+                    type: string
                 type: object
             type: object
           status:

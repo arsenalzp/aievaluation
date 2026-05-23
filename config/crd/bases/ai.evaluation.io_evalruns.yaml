@@ -66,6 +66,8 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              summaryBucket:
+                type: string
             type: object
           status:
             description: EvalRunStatus defines the observed state of EvalRun.
