@@ -89,8 +89,7 @@ type suiteConfigJSON struct {
 // EvalSuiteReconciler reconciles a EvalSuite object
 type EvalSuiteReconciler struct {
 	client.Client
-	Scheme              *runtime.Scheme
-	RequeueWhileRunning time.Duration
+	Scheme *runtime.Scheme
 
 	Objectstorage *objectstorage.Client
 	ObjectBuket   string
@@ -115,7 +114,6 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// If being deleted, we can optionally do finalization logic. For MVP, do nothing.
 	if !run.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
@@ -123,78 +121,60 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// 2) Load EvalSuite (policy/dependency)
 	suiteName := run.Spec.SuiteRef
 	if suiteName.Name == "" {
-		// Mark status and stop requeueing aggressively
-		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "", "SuiteRefMissing",
-			"EvalRun.spec.suiteRef is empty", 30*time.Second)
+		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "SuiteRefMissing", "Pending", "EvalRun.spec.suiteRef is empty", 30*time.Second)
 	}
 
 	var suite aieval.EvalSuite
 	if err := r.Get(ctx, types.NamespacedName{Name: suiteName.Name, Namespace: run.Namespace}, &suite); err != nil {
 		if apierrors.IsNotFound(err) {
-			return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "", "SuiteNotFound",
-				fmt.Sprintf("EvalSuite %q not found", suiteName), 30*time.Second)
+			return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "SuiteNotFound", "Pending", fmt.Sprintf("EvalSuite %q not found", suiteName), 30*time.Second)
 		}
 		return ctrl.Result{}, err
 	}
 
 	// 2.1) Load EvalDataset referenced by EvalSuite
 	if suite.Spec.DatasetRef == nil || suite.Spec.DatasetRef.Name == "" {
-		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "", "DatasetRefMissing",
-			"EvalSuite.spec.datasetRef is empty (must reference EvalDataset)", 30*time.Second)
+		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "DatasetRefMissing", "Pending", "EvalSuite.spec.datasetRef is empty (must reference EvalDataset)", 30*time.Second)
 	}
 
 	var dataset aieval.EvalDataset
-	if err := r.Get(ctx,
-		types.NamespacedName{Name: suite.Spec.DatasetRef.Name, Namespace: run.Namespace},
-		&dataset,
-	); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: suite.Spec.DatasetRef.Name, Namespace: run.Namespace}, &dataset); err != nil {
 		if apierrors.IsNotFound(err) {
-			return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "", "EvalDatasetNotFound",
-				fmt.Sprintf("EvalDataset %q not found", suite.Spec.DatasetRef.Name), 30*time.Second)
+			return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "EvalDatasetNotFound", "Pending", fmt.Sprintf("EvalDataset %q not found", suite.Spec.DatasetRef.Name), 30*time.Second)
 		}
 		return ctrl.Result{}, err
 	}
 
-	// Validate that dataset points on a bucket
 	if dataset.Spec.Source.ObjectKey == nil || *dataset.Spec.Source.ObjectKey == "" {
-		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "",
-			"DatasetObjectKeyMissing", fmt.Sprintf("EvalDataset %s: spec.source.objectKey must be set", dataset.Name), 30*time.Second)
+		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "DatasetObjectKeyMissing", "Pending", fmt.Sprintf("EvalDataset %s: spec.source.objectKey must be set", dataset.Name), 30*time.Second)
 	}
 
-	// 3) Snapshot suiteSpecHash into EvalRun.status (prevents policy drift mid-run)
+	// 3) Snapshot suiteSpecHash (Skipped comment block for brevity)
 	suiteHash := hashSuiteSpec(&suite)
-	// if run.Status.SuiteSpecHash == "" {
-	// 	patch := client.MergeFrom(run.DeepCopy())
-	// 	run.Status.SuiteSpecHash = suiteHash
-	// 	if err := r.Status().Patch(ctx, &run, patch); err != nil {
-	// 		return ctrl.Result{}, err
-	// 	}
-	// 	l.Info("snapshotted suite spec hash", "hash", suiteHash)
-	// } else if run.Status.SuiteSpecHash != suiteHash && run.Status.Phase == aieval.PhaseRunning {
-	// 	// MVP: do not change running evaluation; just record a warning condition.
-	// 	// You can choose stricter behavior later.
-	// 	run.Status.SuiteSpecHash = suiteHash
-	// 	return r.setStatusAndRequeue(ctx, &run, aieval.PhaseRunning, "Running",
-	// 		"SuiteSpecUpdated", "EvalSuite spec changed after EvalRun started", 3*time.Second)
-	// }
+	if run.Status.SuiteSpecHash == "" {
+		patch := client.MergeFrom(run.DeepCopy())
+		run.Status.SuiteSpecHash = suiteHash
+		if err := r.Status().Patch(ctx, &run, patch); err != nil {
+			return ctrl.Result{}, err
+		}
+		l.Info("snapshotted suite spec hash", "hash", suiteHash)
+	} else if run.Status.SuiteSpecHash != suiteHash {
+		// TODO: do not change running evaluation; just record a warning condition.
+		_ = r.setCondition(ctx, &run, "SuiteChanged", metav1.ConditionTrue,
+			"SuiteSpecUpdated", "EvalSuite spec changed after EvalRun started")
+	}
 
-	// 4) Ensure Job exists (owned by EvalRun)
+	// 4) Ensure Job exists
 	jobName := desiredJobName(&run)
 	var job batchv1.Job
 	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: run.Namespace}, &job)
 	if apierrors.IsNotFound(err) {
-
-		// Before creating of Job it is necessary to create ConfigMap resource
-		// and render EvalSuite resource in that ConfigMap.
 		suiteCfgCM, err := r.ensureSuiteConfigMap(ctx, &suite, suiteHash)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
-		// Create Job
 		newJob := buildEvalJob(&run, &suite, &dataset, jobName, suiteCfgCM)
-
-		// Set owner reference (this is your preferred pattern)
 		if err := controllerutil.SetControllerReference(&run, newJob, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -203,7 +183,6 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{}, err
 		}
 
-		// Update EvalRun status -> Running + jobRef
 		patch := client.MergeFrom(run.DeepCopy())
 		run.Status.Phase = aieval.PhaseRunning
 		run.Status.JobRef = v1.LocalObjectReference{Name: jobName}
@@ -213,7 +192,7 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 
 		l.Info("created eval Job", "job", jobName)
-		return ctrl.Result{RequeueAfter: r.runningRequeue()}, nil
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if err != nil {
 		return ctrl.Result{}, err
@@ -222,24 +201,21 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// 5) Observe Job completion/failure
 	completed, failed, reason, msg := jobTerminalState(&job)
 	if !completed && !failed {
-		// Still running
 		if run.Status.Phase != aieval.PhaseRunning {
 			patch := client.MergeFrom(run.DeepCopy())
 			run.Status.Phase = aieval.PhaseRunning
 			_ = r.Status().Patch(ctx, &run, patch)
 		}
-		return ctrl.Result{RequeueAfter: r.runningRequeue()}, nil
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// 6) Finalize: read gate_summary.json (or equivalent) and set EvalRun.status
-	// IMPORTANT: Job Succeeded does NOT mean quality PASS; quality verdict is in gate_summary.
-	var gate *aieval.GateSummary
+	// 6) Finalize
 	if completed {
 		if r.Queue.NumRequeues(run.Name) >= maxRetries && run.Status.Phase == aieval.PhaseRunning {
 			run.Status.Phase = aieval.PhaseFailed
 			run.Status.Verdict = "FAIL"
 			r.Queue.Forget(run.Name)
-			l.Info("finalized EvalRun", "verdict", run.Status.Verdict)
+			l.Info("finalized EvalRun due to max retries", "verdict", run.Status.Verdict)
 			err := r.setCondition(ctx, &run, "ArtifactMissing", metav1.ConditionTrue, "MaximumRetriesReached", "Unable to get gate_summary")
 			if err != nil {
 				return ctrl.Result{}, reconcile.TerminalError(err)
@@ -248,42 +224,29 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 
 		if run.Status.Phase == aieval.PhaseRunning {
-			gate, err = r.fetchGateSummary(ctx, &suite, &run)
+			gate, err := r.fetchGateSummary(ctx, &suite, &run)
 			if err != nil {
 				r.Queue.AddRateLimited(run.Name)
-				// If artifact missing, mark infra failure
-				return r.setStatusAndRequeue(ctx, &run, aieval.PhaseRunning, "Running", "ArtifactMissing",
-					fmt.Sprintf("Job succeeded but gate_summary not found: %v", err), 10*time.Second)
-			} else {
-				run.Status.Phase = aieval.PhaseCompleted
-				run.Status.CompletedAt = metav1.Now()
-				run.Status.Verdict = gate.Verdict
-				run.Status.Summary = gate.Summary
-				run.Status.RootCause = gate.RootCause
-				run.Status.Artifacts = gate.Artifacts
-				if err := r.Status().Update(ctx, &run); err != nil {
-					return ctrl.Result{}, err
-				}
-				l.Info("finalized EvalRun", "verdict", run.Status.Verdict, "stage", run.Status.RootCause.Stage)
-				r.Queue.Forget(run.Name)
+				return r.setStatusAndRequeue(ctx, &run, aieval.PhaseRunning, "ArtifactMissing", "Running", fmt.Sprintf("Job succeeded but gate_summary not found: %v", err), 10*time.Second)
 			}
+
+			// Successfully completed
+			if err := r.completeEvalRun(ctx, &run, aieval.PhaseCompleted, gate); err != nil {
+				return ctrl.Result{}, err
+			}
+			l.Info("finalized EvalRun", "verdict", run.Status.Verdict, "stage", run.Status.RootCause.Stage)
+			r.Queue.Forget(run.Name)
 		}
 	} else {
-		// job failed at infrastructure level
-		gate = &aieval.GateSummary{
+		// Job failed
+		gate := &aieval.GateSummary{
 			Verdict: "FAIL",
 			Summary: fmt.Sprintf("Execution job failed: %s: %s", reason, msg),
 			RootCause: aieval.RootCause{
 				Stage: "Execution",
 			},
 		}
-		run.Status.Phase = aieval.PhaseFailed
-		run.Status.CompletedAt = metav1.Now()
-		run.Status.Verdict = gate.Verdict
-		run.Status.Summary = gate.Summary
-		run.Status.RootCause = gate.RootCause
-		run.Status.Artifacts = gate.Artifacts
-		if err := r.Status().Update(ctx, &run); err != nil {
+		if err := r.completeEvalRun(ctx, &run, aieval.PhaseFailed, gate); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -300,36 +263,39 @@ func (r *EvalSuiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *EvalSuiteReconciler) setStatusAndRequeue(ctx context.Context, run *aieval.EvalRun, phase aieval.Phase, verdict, condType, msg string, after time.Duration) (ctrl.Result, error) {
+func (r *EvalSuiteReconciler) completeEvalRun(ctx context.Context, run *aieval.EvalRun, phase aieval.Phase, gate *aieval.GateSummary) error {
+	run.Status.Phase = phase
+	run.Status.CompletedAt = metav1.Now()
+	run.Status.Verdict = gate.Verdict
+	run.Status.Summary = gate.Summary
+	run.Status.RootCause = gate.RootCause
+	run.Status.Artifacts = gate.Artifacts
+	return r.Status().Update(ctx, run)
+}
+
+func (r *EvalSuiteReconciler) setStatusAndRequeue(ctx context.Context, run *aieval.EvalRun, phase aieval.Phase, condType, reason, msg string, after time.Duration) (ctrl.Result, error) {
 	patch := client.MergeFrom(run.DeepCopy())
 	run.Status.Phase = phase
-	if verdict != "" {
-		run.Status.Verdict = verdict
-	}
 	run.Status.Summary = msg
 	if err := r.Status().Patch(ctx, run, patch); err != nil {
 		return ctrl.Result{}, err
 	}
-	_ = r.setCondition(ctx, run, condType, metav1.ConditionTrue, "Error", msg)
+
+	if condType != "" {
+		_ = r.setCondition(ctx, run, condType, metav1.ConditionTrue, reason, msg)
+	}
 	return ctrl.Result{RequeueAfter: after}, nil
 }
 
 func (r *EvalSuiteReconciler) setCondition(ctx context.Context, run *aieval.EvalRun, condType string, status metav1.ConditionStatus, reason, msg string) error {
 	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 		Type:               condType,
-		Status:             metav1.ConditionStatus(status),
+		Status:             status,
 		Reason:             reason,
 		Message:            msg,
 		LastTransitionTime: metav1.Now(),
 	})
 	return r.Status().Update(ctx, run)
-}
-
-func (r *EvalSuiteReconciler) runningRequeue() time.Duration {
-	if r.RequeueWhileRunning <= 0 {
-		return 10 * time.Second
-	}
-	return r.RequeueWhileRunning
 }
 
 func jobTerminalState(job *batchv1.Job) (completed bool, failed bool, reason string, message string) {

@@ -21,7 +21,6 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
-	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -205,9 +204,8 @@ func main() {
 	}
 
 	if err := (&controller.EvalSuiteReconciler{
-		Client:              mgr.GetClient(),
-		Scheme:              mgr.GetScheme(),
-		RequeueWhileRunning: 10 * time.Second,
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
 
 		Objectstorage: objectstorage.NewClient("http://k8s:9876"),
 		ObjectBuket:   "summary",
