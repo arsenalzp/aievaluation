@@ -20,13 +20,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
+// Source of dataset
 type DatasetObjectSource struct {
-	Bucket    *string `json:"bucket,omitempty"`
-	ObjectKey *string `json:"objectKey,omitempty"`
-	VersionId *string `json:"versionId,omitempty"`
+	ObjectStorageEndpoint string `json:"objectStorageEndpoint,omitempty"`
+	Bucket                string `json:"bucket,omitempty"`
+	ObjectKey             string `json:"objectKey,omitempty"`
+	VersionId             string `json:"versionId,omitempty"`
 }
 
 // EvalDatasetSpec defines the desired state of EvalDataset.

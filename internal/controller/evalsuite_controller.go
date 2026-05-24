@@ -145,7 +145,7 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	if dataset.Spec.Source.ObjectKey == nil || *dataset.Spec.Source.ObjectKey == "" {
+	if dataset.Spec.Source.ObjectKey == "" || dataset.Spec.Source.ObjectKey == "" {
 		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "DatasetObjectKeyMissing", "Pending", fmt.Sprintf("EvalDataset %s: spec.source.objectKey must be set", dataset.Name), 30*time.Second)
 	}
 
@@ -344,12 +344,12 @@ func buildEvalJob(
 	baselineKey := fmt.Sprintf("baselines/%s.json", suite.Name)
 
 	datasetBucket := ""
-	if dataset.Spec.Source.Bucket != nil {
-		datasetBucket = *dataset.Spec.Source.Bucket
+	if dataset.Spec.Source.Bucket != "" {
+		datasetBucket = dataset.Spec.Source.Bucket
 	}
 
-	datasetObjectKey := ptr.Deref(dataset.Spec.Source.ObjectKey, "")
-	datasetVersionID := ptr.Deref(dataset.Spec.Source.VersionId, "")
+	datasetObjectKey := dataset.Spec.Source.ObjectKey
+	datasetVersionID := dataset.Spec.Source.VersionId
 
 	env := []corev1.EnvVar{
 		{Name: "EVALRUN_NAME", Value: run.Name},
@@ -367,6 +367,7 @@ func buildEvalJob(
 		{Name: "DATASET_S3_KEY", Value: datasetObjectKey},
 		{Name: "DATASET_S3_VERSION_ID", Value: datasetVersionID},
 		{Name: "DATASET_FORMAT", Value: dataset.Spec.Format},
+		{Name: "S3_ENDPOINT", Value: dataset.Spec.Source.ObjectStorageEndpoint},
 
 		// artifacts / baseline in S3
 		{Name: "S3_RUN_PREFIX", Value: runPrefix},
@@ -374,28 +375,12 @@ func buildEvalJob(
 		{Name: "GATE_SUMMARY_KEY", Value: fmt.Sprintf("%s/gate_summary.json", runPrefix)},
 		{Name: "SCORES_KEY", Value: fmt.Sprintf("%s/scores.json", runPrefix)},
 		{Name: "DETAILS_KEY", Value: fmt.Sprintf("%s/details.jsonl", runPrefix)},
+		{Name: "S3_SUMMARY_BUCKET", Value: run.Spec.SummaryBucket},
+		{Name: "S3_SUMMARY_KEY", Value: fmt.Sprintf("runs/%s/gate_summary.json", run.Name)},
 	}
 
 	// shared S3 credentials/config from Secret
 	env = append(env,
-		corev1.EnvVar{
-			Name: "S3_ENDPOINT",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "eval-s3-credentials"},
-					Key:                  "endpoint",
-				},
-			},
-		},
-		corev1.EnvVar{
-			Name: "S3_BUCKET",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "eval-s3-credentials"},
-					Key:                  "bucket",
-				},
-			},
-		},
 		corev1.EnvVar{
 			Name: "S3_ACCESS_KEY",
 			ValueFrom: &corev1.EnvVarSource{
@@ -413,23 +398,6 @@ func buildEvalJob(
 					Key:                  "secretKey",
 				},
 			},
-		},
-		corev1.EnvVar{
-			Name: "S3_USE_SSL",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "eval-s3-credentials"},
-					Key:                  "useSSL",
-				},
-			},
-		},
-		corev1.EnvVar{
-			Name:  "SUMMARY_BUCKET",
-			Value: run.Spec.SummaryBucket,
-		},
-		corev1.EnvVar{
-			Name:  "SUMMARY_KEY",
-			Value: fmt.Sprintf("runs/%s/gate_summary.json", run.Name),
 		},
 	)
 
@@ -547,6 +515,8 @@ func suiteConfigMapName(suiteName, suiteHash string) string {
 }
 
 func (r *EvalSuiteReconciler) ensureSuiteConfigMap(ctx context.Context, suite *aieval.EvalSuite, suiteHash string) (string, error) {
+	// TODO: rewrite to either delete CM when a Job finished or create CM with a name related to Job name
+	// to avoid multiple CM objects in ETCD
 	name := suiteConfigMapName(suite.Name, suiteHash)
 
 	payload, err := renderSuiteConfigJSON(suite)
@@ -625,7 +595,6 @@ func (r *EvalSuiteReconciler) buildGateReaderPod(run *aieval.EvalRun) *corev1.Po
 
 func (r *EvalSuiteReconciler) fetchGateSummary(ctx context.Context, suite *aieval.EvalSuite, run *aieval.EvalRun) (*aieval.GateSummary, error) {
 	key := fmt.Sprintf("runs/%s/gate_summary.json", run.Name)
-	//key := fmt.Sprintf("runs/%s/gate_summary.json_", run.Name)
 	obj, err := r.Objectstorage.GetObject(run.Spec.SummaryBucket, key)
 	if err != nil {
 		return nil, fmt.Errorf("unable to get gate_summary object: %s", err)

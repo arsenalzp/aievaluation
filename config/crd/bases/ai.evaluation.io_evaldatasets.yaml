@@ -42,10 +42,13 @@ spec:
               format:
                 type: string
               source:
+                description: Source of dataset
                 properties:
                   bucket:
                     type: string
                   objectKey:
+                    type: string
+                  objectStorageEndpoint:
                     type: string
                   versionId:
                     type: string
