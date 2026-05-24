@@ -81,8 +81,8 @@ type suiteConfigJSON struct {
 	} `json:"regressionPolicy,omitempty"`
 
 	Execution struct {
-		Mode           *string `json:"mode,omitempty"`
-		TimeoutSeconds *int64  `json:"timeoutSeconds,omitempty"`
+		Mode           string `json:"mode,omitempty"`
+		TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
 	} `json:"execution,omitempty"`
 }
 
@@ -338,7 +338,7 @@ func buildEvalJob(
 	}
 
 	backoff := int32(0)
-	runnerImage := ptr.Deref(suite.Spec.Execution.RunnerImage, "")
+	runnerImage := suite.Spec.Execution.RunnerImage
 
 	runPrefix := fmt.Sprintf("runs/%s", run.Name)
 	baselineKey := fmt.Sprintf("baselines/%s.json", suite.Name)
@@ -419,8 +419,8 @@ func buildEvalJob(
 	}
 
 	mode := ""
-	if suite.Spec.Execution.Mode != nil {
-		mode = *suite.Spec.Execution.Mode
+	if suite.Spec.Execution.Mode != "" {
+		mode = suite.Spec.Execution.Mode
 	}
 
 	if mode == "dummy" {

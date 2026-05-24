@@ -42,9 +42,9 @@ type RegressionPolicy struct {
 }
 
 type Execution struct {
-	Mode           *string `json:"mode,omitempty"`
-	RunnerImage    *string `json:"runnerImage,omitempty"`
-	TimeoutSeconds *int64  `json:"timeoutSeconds,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	RunnerImage    string `json:"runnerImage,omitempty"`
+	TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
 }
 
 // EvalSuiteSpec defines the desired state of EvalSuite.
