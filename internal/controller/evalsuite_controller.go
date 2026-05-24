@@ -377,6 +377,7 @@ func buildEvalJob(
 		{Name: "DETAILS_KEY", Value: fmt.Sprintf("%s/details.jsonl", runPrefix)},
 		{Name: "S3_SUMMARY_BUCKET", Value: run.Spec.SummaryBucket},
 		{Name: "S3_SUMMARY_KEY", Value: fmt.Sprintf("runs/%s/gate_summary.json", run.Name)},
+		{Name: "TARGET_ENDPOINT", Value: run.Spec.TargetEndpoint},
 	}
 
 	// shared S3 credentials/config from Secret

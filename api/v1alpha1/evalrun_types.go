@@ -43,9 +43,15 @@ type RootCause struct {
 
 // EvalRunSpec defines the desired state of EvalRun.
 type EvalRunSpec struct {
-	SuiteRef      *v1.LocalObjectReference `json:"suiteRef,omitempty"`
-	Revision      `json:"revision,omitempty"`
+	// +kubebuilder:validation:Required
+	SuiteRef *v1.LocalObjectReference `json:"suiteRef,omitempty"`
+	// +kubebuilder:validation:Required
+	Revision `json:"revision,omitempty"`
+	// +kubebuilder:validation:Required
 	SummaryBucket string `json:"summaryBucket,omitempty"`
+	// RAG endpoint
+	// +kubebuilder:validation:Required
+	TargetEndpoint string `json:"targetEndpoint,omitempty"`
 }
 
 type ExecutionFailure struct {

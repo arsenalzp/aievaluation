@@ -49,10 +49,8 @@ type Execution struct {
 
 // EvalSuiteSpec defines the desired state of EvalSuite.
 type EvalSuiteSpec struct {
-	TargetRef *v1.LocalObjectReference `json:"targetRef,omitempty"`
 	// DatasetRef references EvalDataset resource (not ConfigMap).
 	DatasetRef       *v1.LocalObjectReference `json:"datasetRef,omitempty"`
-	BaselineRef      *v1.LocalObjectReference `json:"baselineRef,omitempty"`
 	Metrics          `json:"metrics,omitempty"`
 	RegressionPolicy `json:"regressionPolicy,omitempty"`
 	Execution        `json:"execution,omitempty"`
