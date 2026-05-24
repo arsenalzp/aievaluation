@@ -1,0 +1,6 @@
+requests==2.32.2
+datasets==4.4.0
+pandas==2.3.3
+ragas==0.1.21
+openai==1.30.0
+langchain-community==0.2.19
