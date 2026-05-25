@@ -3,6 +3,8 @@ import os
 import sys
 import time
 import traceback
+import asyncio
+from pydantic import BaseModel
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,13 +12,19 @@ import requests
 
 from datasets import Dataset
 
-from ragas import evaluate
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from openai import AsyncOpenAI
+from ragas.metrics.collections import Faithfulness, AnswerRelevancy
+from ragas.run_config import RunConfig
 from ragas.metrics import (
     faithfulness,
     answer_relevancy,
     context_precision,
     context_recall,
 )
+from ragas.llms import llm_factory
+from ragas.embeddings import embedding_factory
+from ragas import experiment, EvaluationDataset, SingleTurnSample
 
 # answer_correctness may not exist in some ragas versions
 try:
@@ -28,6 +36,12 @@ except Exception:
 # ============================================================
 # Data models
 # ============================================================
+
+# Define experiment result structure
+class ExperimentResult(BaseModel):
+  faithfulness: float  
+  answer_relevancy: float
+
 
 @dataclass
 class DatasetCase:
@@ -180,6 +194,10 @@ class RunnerConfig:
     scores_key: str
     details_key: str
 
+    llm_model: str
+    llm_embedder: str
+    llm_api_key: str
+
     thresholds: ThresholdConfig
     regression_max_drop: Optional[float] = None
 
@@ -240,6 +258,10 @@ def build_runner_config() -> RunnerConfig:
 
         thresholds=thresholds,
         regression_max_drop=safe_float(regression.get("maxDrop")),
+
+        llm_model=getenv_required("OPENAI_MODEL"),
+        llm_embedder=getenv_required("OPENAI_EMBEDDER"),
+        llm_api_key=getenv_required("OPENAI_API_KEY")
     )
 
 
@@ -276,16 +298,25 @@ def load_optional_baseline(cfg: RunnerConfig) -> Optional[Dict[str, Any]]:
     return resp.json()
 
 def upload_json(cfg: RunnerConfig, key: str, payload: Dict[str, Any]) -> None:
-    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    def safe_serialize(obj):
+        if isinstance(obj, bytes):
+            return obj.decode('utf-8', errors='ignore')
+        if isinstance(obj, float) and (obj != obj or obj == float('inf') or obj == float('-inf')):
+            return None # NaN и Inf в null
+        raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+    
+    body = json.dumps(payload, ensure_ascii=False, indent=2, default=safe_serialize).encode("utf-8")
+    
     resp = requests.put(
         f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{key}", 
-        json=body
+        data=body,
+        headers={"Content-Type": "application/json"}
     )
 
     try:
         resp.raise_for_status()
-    except:
-        print(f"Unable to do POST request to {cfg.s3_endpoint} during uploading a json content")
+    except Exception:
+        print(f"Unable to do PUT request to {cfg.s3_endpoint} during uploading a json content")
         raise
     return resp.json()
 
@@ -409,9 +440,12 @@ class RagasAdapter:
     Adapter layer around ragas so runner core stays stable.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model_name, embedder_name, api_key) -> None:
+        self._model_name = model_name
+        self._embedder_name = embedder_name
+        self._openai_api_key = api_key
         pass
-
+      
     @staticmethod
     def _build_hf_dataset(records: List[EvalRecord]) -> Dataset:
         """
@@ -440,7 +474,20 @@ class RagasAdapter:
             rows["contexts"].append([ctx.text for ctx in record.contexts])
             rows["ground_truth"].append(record.ground_truth or "")
 
-        return Dataset.from_dict(rows)
+        '''
+        Use ragas v0.4 dataset
+        '''
+        samples = []
+        for record in records:
+            samples.append(
+                SingleTurnSample(
+                    user_input=record.question,
+                    response=record.answer,
+                    retrieved_contexts = [context.text for context in record.contexts]
+                )
+            )
+        return EvaluationDataset(samples=samples)
+        #return Dataset.from_dict(rows)
 
     @staticmethod
     def _choose_metrics(records: List[EvalRecord]) -> Tuple[List[Any], List[str]]:
@@ -461,42 +508,75 @@ class RagasAdapter:
         metric_names = [n for n, _ in metric_defs]
         return metrics, metric_names
 
-    def score_records(self, records: List[EvalRecord]) -> Tuple[List[PerCaseScore], Dict[str, Any]]:
+    async def score_records(self, records: List[EvalRecord]) -> Tuple[List[PerCaseScore], Dict[str, Any]]:
+        metric_names = ["faithfulness", "answer_relevancy"]
+        generation_config = {
+          "max_completion_tokens": 8192, 
+          "max_tokens": 8192
+        }
+        openai_async_client = AsyncOpenAI(api_key=self._openai_api_key)
+        ragas_llm = llm_factory(
+          model=self._model_name,
+          client=openai_async_client,
+          **generation_config
+        )
+
+        embedder = embedding_factory(
+            "openai",
+            model=self._embedder_name,
+            client=openai_async_client,
+            interface='modern'
+        )
+
+        @experiment(ExperimentResult, backend="inmemory")
+        async def run_evaluation(row):
+          faithfulness = Faithfulness(llm=ragas_llm)
+          answer_relevancy = AnswerRelevancy(llm=ragas_llm, embeddings=embedder)
+          faith_result = await faithfulness.ascore(       
+            response=row.response,
+            retrieved_contexts=row.retrieved_contexts,
+            user_input=row.user_input
+          )
+          relevancy_result = await answer_relevancy.ascore(       
+            user_input=row.user_input,
+            response=row.response
+          )
+          return ExperimentResult(
+            faithfulness=faith_result.value,
+            answer_relevancy=relevancy_result.value
+          )
+        
         if not records:
-            return [], {"metricNames": []}
+          return [], {"metricNames": []}
 
         dataset = self._build_hf_dataset(records)
-        metrics, metric_names = self._choose_metrics(records)
+        result = await run_evaluation.arun(dataset)
 
-        # If you later want BYO judge model, you can pass llm=... here.
-        result = evaluate(dataset=dataset, metrics=metrics)
-
-        # Ragas Result usually supports to_pandas() in 0.1.x flows.
         df = result.to_pandas()
 
         per_case_scores: List[PerCaseScore] = []
 
         for idx, row in df.iterrows():
-            case_id = row.get("case_id") or records[idx].case_id
-            latency_ms = safe_float(records[idx].metadata.get("latencyMs"))
+          case_id = row.get("case_id") or records[idx].case_id
+          latency_ms = safe_float(records[idx].metadata.get("latencyMs"))
 
-            pcs = PerCaseScore(
-                case_id=case_id,
-                faithfulness=safe_float(row.get("faithfulness")),
-                answer_relevancy=safe_float(row.get("answer_relevancy")),
-                answer_correctness=safe_float(row.get("answer_correctness")) if "answer_correctness" in row else None,
-                context_precision=safe_float(row.get("context_precision")) if "context_precision" in row else None,
-                context_recall=safe_float(row.get("context_recall")) if "context_recall" in row else None,
-                latency_ms=latency_ms,
-                passed=False,
-                notes=[],
-            )
+          pcs = PerCaseScore(
+            case_id=case_id,
+            faithfulness=safe_float(row.get("faithfulness")),
+            answer_relevancy=safe_float(row.get("answer_relevancy")),
+            answer_correctness=safe_float(row.get("answer_correctness")) if "answer_correctness" in row else None,
+            context_precision=safe_float(row.get("context_precision")) if "context_precision" in row else None,
+            context_recall=safe_float(row.get("context_recall")) if "context_recall" in row else None,
+            latency_ms=latency_ms,
+            passed=False,
+            notes=[],
+          )
 
-            per_case_scores.append(pcs)
+          per_case_scores.append(pcs)
 
-        return per_case_scores, {
-            "metricNames": metric_names,
-        }
+          return per_case_scores, {
+              "metricNames": metric_names,
+          }
 
 
 # ============================================================
@@ -781,7 +861,7 @@ def publish_gate_summary(cfg: RunnerConfig, gate: GateSummary) -> None:
 # Main
 # ============================================================
 
-def main() -> int:
+async def main() -> int:
     try:
         cfg = build_runner_config()
         ensure_dir(cfg.work_dir)
@@ -804,8 +884,12 @@ def main() -> int:
             records.append(record)
 
         # 5) Evaluate with Ragas
-        ragas_adapter = RagasAdapter()
-        per_case_scores, ragas_meta = ragas_adapter.score_records(records)
+        ragas_adapter = RagasAdapter(
+            model_name=cfg.llm_model, 
+            embedder_name=cfg.llm_embedder, 
+            api_key=cfg.llm_api_key
+        )
+        per_case_scores, ragas_meta = await ragas_adapter.score_records(records)
 
         # 6) Per-case pass/fail markers
         mark_per_case_pass_fail(cfg, per_case_scores)
@@ -865,4 +949,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(asyncio.run(main()))
