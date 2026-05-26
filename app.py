@@ -23,7 +23,6 @@ from ragas.metrics import (
     context_recall,
 )
 from ragas.llms import llm_factory
-from ragas.embeddings import embedding_factory
 from ragas.embeddings import OpenAIEmbeddings
 from ragas import experiment, EvaluationDataset, SingleTurnSample
 
@@ -488,7 +487,6 @@ class RagasAdapter:
                 )
             )
         return EvaluationDataset(samples=samples)
-        #return Dataset.from_dict(rows)
 
     @staticmethod
     def _choose_metrics(records: List[EvalRecord]) -> Tuple[List[Any], List[str]]:
