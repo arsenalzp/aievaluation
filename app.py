@@ -24,6 +24,7 @@ from ragas.metrics import (
 )
 from ragas.llms import llm_factory
 from ragas.embeddings import embedding_factory
+from ragas.embeddings import OpenAIEmbeddings
 from ragas import experiment, EvaluationDataset, SingleTurnSample
 
 # answer_correctness may not exist in some ragas versions
@@ -520,12 +521,10 @@ class RagasAdapter:
           client=openai_async_client,
           **generation_config
         )
-
-        embedder = embedding_factory(
-            "openai",
-            model=self._embedder_name,
+        
+        embedder = OpenAIEmbeddings(
             client=openai_async_client,
-            interface='modern'
+            model=self._embedder_name,
         )
 
         @experiment(ExperimentResult, backend="inmemory")
@@ -574,9 +573,9 @@ class RagasAdapter:
 
           per_case_scores.append(pcs)
 
-          return per_case_scores, {
-              "metricNames": metric_names,
-          }
+        return per_case_scores, {
+          "metricNames": metric_names,
+        }
 
 
 # ============================================================
