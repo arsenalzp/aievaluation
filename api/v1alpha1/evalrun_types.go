@@ -52,6 +52,12 @@ type EvalRunSpec struct {
 	// RAG endpoint
 	// +kubebuilder:validation:Required
 	TargetEndpoint string `json:"targetEndpoint,omitempty"`
+	// LLM Model name
+	// +kubebuilder:validation:Required
+	Model string `json:"model,omitempty"`
+	// Embedder model name
+	// +kubebuilder:validation:Required
+	Embedder string `json:"embedder,omitempty"`
 }
 
 type ExecutionFailure struct {

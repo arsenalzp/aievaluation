@@ -39,6 +39,12 @@ spec:
           spec:
             description: EvalRunSpec defines the desired state of EvalRun.
             properties:
+              embedder:
+                description: Embedder model name
+                type: string
+              model:
+                description: LLM Model name
+                type: string
               revision:
                 description: |-
                   EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -68,6 +74,16 @@ spec:
                 x-kubernetes-map-type: atomic
               summaryBucket:
                 type: string
+              targetEndpoint:
+                description: RAG endpoint
+                type: string
+            required:
+            - embedder
+            - model
+            - revision
+            - suiteRef
+            - summaryBucket
+            - targetEndpoint
             type: object
           status:
             description: EvalRunStatus defines the observed state of EvalRun.

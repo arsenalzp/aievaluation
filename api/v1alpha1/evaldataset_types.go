@@ -22,10 +22,13 @@ import (
 
 // Source of dataset
 type DatasetObjectSource struct {
+	// +kubebuilder:validation:Required
 	ObjectStorageEndpoint string `json:"objectStorageEndpoint,omitempty"`
-	Bucket                string `json:"bucket,omitempty"`
-	ObjectKey             string `json:"objectKey,omitempty"`
-	VersionId             string `json:"versionId,omitempty"`
+	// +kubebuilder:validation:Required
+	Bucket string `json:"bucket,omitempty"`
+	// +kubebuilder:validation:Required
+	ObjectKey string `json:"objectKey,omitempty"`
+	VersionId string `json:"versionId,omitempty"`
 }
 
 // EvalDatasetSpec defines the desired state of EvalDataset.

@@ -52,6 +52,10 @@ spec:
                     type: string
                   versionId:
                     type: string
+                required:
+                - bucket
+                - objectKey
+                - objectStorageEndpoint
                 type: object
             type: object
           status:

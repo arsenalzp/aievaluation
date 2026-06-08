@@ -145,7 +145,7 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	if dataset.Spec.Source.ObjectKey == "" || dataset.Spec.Source.ObjectKey == "" {
+	if dataset.Spec.Source.ObjectKey == "" {
 		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "DatasetObjectKeyMissing", "Pending", fmt.Sprintf("EvalDataset %s: spec.source.objectKey must be set", dataset.Name), 30*time.Second)
 	}
 
@@ -378,6 +378,8 @@ func buildEvalJob(
 		{Name: "S3_SUMMARY_BUCKET", Value: run.Spec.SummaryBucket},
 		{Name: "S3_SUMMARY_KEY", Value: fmt.Sprintf("runs/%s/gate_summary.json", run.Name)},
 		{Name: "TARGET_ENDPOINT", Value: run.Spec.TargetEndpoint},
+		{Name: "OPENAI_MODEL", Value: run.Spec.Model},
+		{Name: "OPENAI_EMBEDDER", Value: run.Spec.Embedder},
 	}
 
 	// shared S3 credentials/config from Secret
@@ -397,6 +399,15 @@ func buildEvalJob(
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: "eval-s3-credentials"},
 					Key:                  "secretKey",
+				},
+			},
+		},
+		corev1.EnvVar{
+			Name: "OPENAI_API_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "openai-credentials"},
+					Key:                  "apiKey",
 				},
 			},
 		},
