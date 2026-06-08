@@ -87,6 +87,11 @@ type EvalRunStatus struct {
 	ExecutionFailure *ExecutionFailure `json:"executionFailure,omitempty"`
 }
 
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Verdict",type=string,JSONPath=`.status.verdict`
+// +kubebuilder:printcolumn:name="gitSHA",type=string,JSONPath=`.spec.revision.gitSHA`
+// +kubebuilder:printcolumn:name="prNumber",type=string,JSONPath=`.spec.revision.prNumber`
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 

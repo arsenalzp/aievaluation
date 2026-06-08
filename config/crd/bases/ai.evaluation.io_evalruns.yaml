@@ -14,7 +14,23 @@ spec:
     singular: evalrun
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.verdict
+      name: Verdict
+      type: string
+    - jsonPath: .spec.revision.gitSHA
+      name: gitSHA
+      type: string
+    - jsonPath: .spec.revision.prNumber
+      name: prNumber
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: EvalRun is the Schema for the evalruns API.
