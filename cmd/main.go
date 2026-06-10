@@ -203,7 +203,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.EvalSuiteReconciler{
+	if err := (&controller.EvalRunReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 

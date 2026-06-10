@@ -87,7 +87,7 @@ type suiteConfigJSON struct {
 }
 
 // EvalSuiteReconciler reconciles a EvalSuite object
-type EvalSuiteReconciler struct {
+type EvalRunReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
@@ -105,7 +105,7 @@ type EvalSuiteReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
-func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *EvalRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx).WithValues("evalrun", req.NamespacedName)
 
 	// 1) Fetch EvalRun
@@ -255,7 +255,7 @@ func (r *EvalSuiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *EvalSuiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *EvalRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&aieval.EvalRun{}).
 		Owns(&batchv1.Job{}).
@@ -263,7 +263,7 @@ func (r *EvalSuiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *EvalSuiteReconciler) completeEvalRun(ctx context.Context, run *aieval.EvalRun, phase aieval.Phase, gate *aieval.GateSummary) error {
+func (r *EvalRunReconciler) completeEvalRun(ctx context.Context, run *aieval.EvalRun, phase aieval.Phase, gate *aieval.GateSummary) error {
 	run.Status.Phase = phase
 	run.Status.CompletedAt = metav1.Now()
 	run.Status.Verdict = gate.Verdict
@@ -273,7 +273,7 @@ func (r *EvalSuiteReconciler) completeEvalRun(ctx context.Context, run *aieval.E
 	return r.Status().Update(ctx, run)
 }
 
-func (r *EvalSuiteReconciler) setStatusAndRequeue(ctx context.Context, run *aieval.EvalRun, phase aieval.Phase, condType, reason, msg string, after time.Duration) (ctrl.Result, error) {
+func (r *EvalRunReconciler) setStatusAndRequeue(ctx context.Context, run *aieval.EvalRun, phase aieval.Phase, condType, reason, msg string, after time.Duration) (ctrl.Result, error) {
 	patch := client.MergeFrom(run.DeepCopy())
 	run.Status.Phase = phase
 	run.Status.Summary = msg
@@ -287,7 +287,7 @@ func (r *EvalSuiteReconciler) setStatusAndRequeue(ctx context.Context, run *aiev
 	return ctrl.Result{RequeueAfter: after}, nil
 }
 
-func (r *EvalSuiteReconciler) setCondition(ctx context.Context, run *aieval.EvalRun, condType string, status metav1.ConditionStatus, reason, msg string) error {
+func (r *EvalRunReconciler) setCondition(ctx context.Context, run *aieval.EvalRun, condType string, status metav1.ConditionStatus, reason, msg string) error {
 	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             status,
@@ -526,7 +526,7 @@ func suiteConfigMapName(suiteName, suiteHash string) string {
 	return fmt.Sprintf("evalsuite-%s-%s-cfg", suiteName, short)
 }
 
-func (r *EvalSuiteReconciler) ensureSuiteConfigMap(ctx context.Context, suite *aieval.EvalSuite, suiteHash string) (string, error) {
+func (r *EvalRunReconciler) ensureSuiteConfigMap(ctx context.Context, suite *aieval.EvalSuite, suiteHash string) (string, error) {
 	// TODO: rewrite to either delete CM when a Job finished or create CM with a name related to Job name
 	// to avoid multiple CM objects in ETCD
 	name := suiteConfigMapName(suite.Name, suiteHash)
@@ -563,7 +563,7 @@ func (r *EvalSuiteReconciler) ensureSuiteConfigMap(ctx context.Context, suite *a
 	return name, nil
 }
 
-func (r *EvalSuiteReconciler) buildGateReaderPod(run *aieval.EvalRun) *corev1.Pod {
+func (r *EvalRunReconciler) buildGateReaderPod(run *aieval.EvalRun) *corev1.Pod {
 	podName := fmt.Sprintf("gate-reader-%s", run.Name)
 
 	gatePath := fmt.Sprintf("%s/runs/%s/gate_summary.json", artifactsMount, run.Name)
@@ -605,7 +605,7 @@ func (r *EvalSuiteReconciler) buildGateReaderPod(run *aieval.EvalRun) *corev1.Po
 	}
 }
 
-func (r *EvalSuiteReconciler) fetchGateSummary(ctx context.Context, suite *aieval.EvalSuite, run *aieval.EvalRun) (*aieval.GateSummary, error) {
+func (r *EvalRunReconciler) fetchGateSummary(ctx context.Context, suite *aieval.EvalSuite, run *aieval.EvalRun) (*aieval.GateSummary, error) {
 	key := fmt.Sprintf("runs/%s/gate_summary.json", run.Name)
 	obj, err := r.Objectstorage.GetObject(run.Spec.SummaryBucket, key)
 	if err != nil {
