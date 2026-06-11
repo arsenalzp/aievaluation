@@ -30,6 +30,20 @@ Instead of embedding all evaluation logic directly into CI pipelines, the evalua
 
 ---
 
+## Getting Started
+
+### Prerequisites
+
+- Go v1.24.0+
+- Docker or another compatible container tool
+- kubectl
+- Access to a Kubernetes cluster
+- Access to S3-compatible object storage
+- Python 3.12+ for runner development
+- OpenAI API key if using the current OpenAI/Ragas-based runner
+
+---
+
 ## Architecture
 
 `ai-eval` currently consists of two runtime components:
@@ -436,20 +450,6 @@ spec:
 
 ---
 
-## Getting Started
-
-### Prerequisites
-
-- Go v1.24.0+
-- Docker or another compatible container tool
-- kubectl
-- Access to a Kubernetes cluster
-- Access to S3-compatible object storage
-- Python 3.11+ for runner development
-- OpenAI API key if using the current OpenAI/Ragas-based runner
-
----
-
 ## Build Images
 
 Build both operator and runner images:
@@ -490,6 +490,32 @@ Build and push both images:
 make images \
   IMG=ghcr.io/arsenalzp/evalrun-operator:dev \
   RUNNER_IMG=ghcr.io/arsenalzp/evalrun-runner:dev
+```
+
+---
+
+## Run standalone Runner processor
+
+```sh
+docker run --network isolated_network --rm --name runner -v ./test-suite:/test-suite \ 
+-e EVALRUN_NAME=local-run \
+-e EVALSUITE_NAME=local-evalsuite \
+-e GIT_SHA=31kdf -e PR_NUMBER=09 \
+-e TARGET_ENDPOINT=https://rag-endpoint/rag/query?debug=true \
+-e S3_ENDPOINT=https://object-storage-endpoint:9876 \
+-e DATASET_S3_BUCKET=eval-artifacts \
+-e DATASET_S3_KEY=dataset.json \
+-e GATE_SUMMARY_KEY=summary-test.json \
+-e SCORES_KEY=scores-test.json \
+-e DETAILS_KEY=details_key.json \
+-e SUITE_CONFIG=/test-suite/suite.json \
+-e S3_ACCESS_KEY="test-access" \
+-e S3_SECRET_KEY="test-secret" \
+-e S3_BASELINE_KEY="baseline.json" \
+-e OPENAI_API_KEY="KEY" \
+-e OPENAI_MODEL="gpt-5-mini" \
+-e OPENAI_EMBEDDER="text-embedding-3-small" \
+docker-images-repository:5000/runner:0.2
 ```
 
 ---
