@@ -1,0 +1,11 @@
+apiVersion: ai.evaluation.io/v1alpha1
+kind: EvalDataset
+metadata:
+  name: demo-dataset
+spec:
+  source:
+    objectStorageEndpoint: "https://object-storage-endpoint.svc.cluster:9876"
+    bucket: "eval-artifacts"
+    objectKey: "dataset.json"
+    versionId: "3Lg7"   # optional
+  format: "json"

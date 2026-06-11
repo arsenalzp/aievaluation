@@ -1,0 +1,14 @@
+apiVersion: ai.evaluation.io/v1alpha1
+kind: EvalRun
+metadata:
+  name: demo-run-1
+spec:
+  model: "gpt-5-mini"
+  embedder: "text-embedding-3-small"
+  summaryBucket: "eval-artifacts"
+  suiteRef:
+    name: demo-suite
+  revision:
+    gitSHA: "abc123"
+    prNumber: 1
+  targetEndpoint: "https://rag-system.svc.cluster:8080/rag/query?debug=true"
