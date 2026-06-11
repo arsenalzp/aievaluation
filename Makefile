@@ -360,3 +360,53 @@ catalog-build: opm ## Build a catalog image.
 .PHONY: catalog-push
 catalog-push: ## Push a catalog image.
 	$(MAKE) docker-push IMG=$(CATALOG_IMG)
+
+
+##@ EvalRun Combined Workflow
+
+# Image URL to use for the runner image.
+# The runner image is referenced from EvalSuite.spec.execution.runnerImage.
+RUNNER_IMG ?= runner:latest
+
+# Directory containing the runner Dockerfile and Python sources.
+RUNNER_DIR ?= runner
+
+# Use ">" as recipe prefix for targets below.
+# This avoids TAB/space issues when copying this block.
+.RECIPEPREFIX := >
+
+.PHONY: controller-build
+controller-build: ## Build controller/operator image.
+>$(CONTAINER_TOOL) build -t ${IMG} .
+
+.PHONY: controller-push
+controller-push: ## Push controller/operator image.
+>$(CONTAINER_TOOL) push ${IMG}
+
+.PHONY: runner-build
+runner-build: ## Build runner image.
+>$(CONTAINER_TOOL) build -t ${RUNNER_IMG} -f $(RUNNER_DIR)/Dockerfile $(RUNNER_DIR)
+
+.PHONY: runner-push
+runner-push: ## Push runner image.
+>$(CONTAINER_TOOL) push ${RUNNER_IMG}
+
+.PHONY: images-build
+images-build: controller-build runner-build ## Build controller and runner images.
+
+.PHONY: images-push
+images-push: controller-push runner-push ## Push controller and runner images.
+
+.PHONY: images
+images: images-build images-push ## Build and push controller and runner images.
+
+.PHONY: runner-install-dev
+runner-install-dev: ## Install runner Python development dependencies.
+>cd $(RUNNER_DIR) && python -m pip install -r requirements.txt -r requirements-dev.txt
+
+.PHONY: runner-test
+runner-test: ## Run runner Python tests.
+>cd $(RUNNER_DIR) && pytest
+
+.PHONY: test-all
+test-all: test runner-test ## Run controller and runner tests.
