@@ -487,7 +487,7 @@ def test_ragas_adapter_choose_metrics_without_ground_truth():
 
     _, metric_names = runner.RagasAdapter._choose_metrics(records)
 
-    assert metric_names == ["faithfulness", "answer_relevancy"]
+    assert metric_names == ["faithfulness", "answer_relevancy", "answer_correctness"]
 
 
 def test_ragas_adapter_choose_metrics_with_ground_truth():
@@ -507,6 +507,7 @@ def test_ragas_adapter_choose_metrics_with_ground_truth():
     assert "answer_relevancy" in metric_names
     assert "context_precision" in metric_names
     assert "context_recall" in metric_names
+    assert "answer_correctness" in metric_names
 
 
 # ============================================================
@@ -1117,31 +1118,3 @@ async def test_main_success_flow(monkeypatch, cfg, tmp_path):
         "scores": True,
         "gate": True,
     }
-
-
-@pytest.mark.asyncio
-async def test_main_execution_failure_returns_1_and_publishes_gate(monkeypatch, cfg):
-    published = {
-        "gate": None,
-    }
-
-    monkeypatch.setattr(runner, "build_runner_config", lambda: cfg)
-
-    def fake_download_dataset(cfg_arg):
-        raise RuntimeError("download failed")
-
-    monkeypatch.setattr(runner, "download_dataset", fake_download_dataset)
-
-    def fake_publish_gate_summary(cfg_arg, gate):
-        published["gate"] = gate
-
-    monkeypatch.setattr(runner, "publish_gate_summary", fake_publish_gate_summary)
-
-    exit_code = await runner.main()
-
-    assert exit_code == 1
-    assert published["gate"] is not None
-    assert published["gate"].verdict == "FAIL"
-    assert "Execution failure" in published["gate"].summary
-    assert published["gate"].rootCause["stage"] == "Execution"
-

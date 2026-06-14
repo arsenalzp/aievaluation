@@ -10,37 +10,41 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from datasets import Dataset
-
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from openai import AsyncOpenAI
-from ragas.metrics.collections import Faithfulness, AnswerRelevancy
-from ragas.run_config import RunConfig
+from ragas.metrics.collections import Faithfulness, AnswerRelevancy, AnswerCorrectness
 from ragas.metrics import (
     faithfulness,
     answer_relevancy,
+    answer_correctness,
     context_precision,
     context_recall,
 )
 from ragas.llms import llm_factory
 from ragas.embeddings import OpenAIEmbeddings
 from ragas import experiment, EvaluationDataset, SingleTurnSample
+from sqlalchemy.engine import row
 
 # answer_correctness may not exist in some ragas versions
-try:
-    from ragas.metrics import answer_correctness
-except Exception:
-    answer_correctness = None
+# try:
+#     from ragas.metrics import answer_correctness
+# except Exception:
+#     answer_correctness = None
 
 
 # ============================================================
 # Data models
 # ============================================================
 
+class SingleTurnExtension(SingleTurnSample):
+  case_id: str
+  ground_truth: str
+  
 # Define experiment result structure
 class ExperimentResult(BaseModel):
+  case_id: str
   faithfulness: float  
   answer_relevancy: float
+  answer_correctness: float
 
 
 @dataclass
@@ -277,7 +281,7 @@ def download_dataset(cfg: RunnerConfig) -> str:
     resp = requests.get(f"{cfg.s3_endpoint}/buckets/{bucket}/objects/{key}")
     try:
         resp.raise_for_status()
-    except Exception as e:
+    except Exception:
         print(f"Unable to call GET request to {cfg.s3_endpoint} during downloading a dataset")
         raise
     
@@ -447,7 +451,7 @@ class RagasAdapter:
         pass
       
     @staticmethod
-    def _build_hf_dataset(records: List[EvalRecord]) -> Dataset:
+    def _build_hf_dataset(records: List[EvalRecord]) -> EvaluationDataset:
         """
         Build dataset in a format that ragas expects.
 
@@ -459,31 +463,19 @@ class RagasAdapter:
 
         We keep ground_truth singular here for the common 0.1.x path.
         """
-        rows: Dict[str, List[Any]] = {
-            "case_id": [],
-            "question": [],
-            "answer": [],
-            "contexts": [],
-            "ground_truth": [],
-        }
-
-        for record in records:
-            rows["case_id"].append(record.case_id)
-            rows["question"].append(record.question)
-            rows["answer"].append(record.answer)
-            rows["contexts"].append([ctx.text for ctx in record.contexts])
-            rows["ground_truth"].append(record.ground_truth or "")
-
+        
         '''
         Use ragas v0.4 dataset
         '''
         samples = []
         for record in records:
             samples.append(
-                SingleTurnSample(
+                SingleTurnExtension(
+                    case_id=record.case_id,
                     user_input=record.question,
                     response=record.answer,
-                    retrieved_contexts = [context.text for context in record.contexts]
+                    retrieved_contexts = [context.text for context in record.contexts],
+                    ground_truth=record.ground_truth
                 )
             )
         return EvaluationDataset(samples=samples)
@@ -495,20 +487,19 @@ class RagasAdapter:
         metric_defs: List[Tuple[str, Any]] = [
             ("faithfulness", faithfulness),
             ("answer_relevancy", answer_relevancy),
+            ("answer_correctness", answer_correctness)
         ]
 
         if has_ground_truth:
             metric_defs.append(("context_precision", context_precision))
             metric_defs.append(("context_recall", context_recall))
-            if answer_correctness is not None:
-                metric_defs.append(("answer_correctness", answer_correctness))
 
         metrics = [m for _, m in metric_defs]
         metric_names = [n for n, _ in metric_defs]
         return metrics, metric_names
 
     async def score_records(self, records: List[EvalRecord]) -> Tuple[List[PerCaseScore], Dict[str, Any]]:
-        metric_names = ["faithfulness", "answer_relevancy"]
+        metric_names = ["faithfulness", "answer_relevancy", "answer_correctness"]
         generation_config = {
           "max_completion_tokens": 8192, 
           "max_tokens": 8192
@@ -527,8 +518,15 @@ class RagasAdapter:
 
         @experiment(ExperimentResult, backend="inmemory")
         async def run_evaluation(row):
+          answer_correctness = AnswerCorrectness(llm=ragas_llm, embeddings=embedder)
           faithfulness = Faithfulness(llm=ragas_llm)
           answer_relevancy = AnswerRelevancy(llm=ragas_llm, embeddings=embedder)
+          
+          correctness_result = await answer_correctness.ascore(
+            user_input=row.user_input,
+            response=row.response,
+            reference=row.ground_truth
+          )
           faith_result = await faithfulness.ascore(       
             response=row.response,
             retrieved_contexts=row.retrieved_contexts,
@@ -538,9 +536,12 @@ class RagasAdapter:
             user_input=row.user_input,
             response=row.response
           )
+          
           return ExperimentResult(
+            case_id=row.case_id,
             faithfulness=faith_result.value,
-            answer_relevancy=relevancy_result.value
+            answer_relevancy=relevancy_result.value,
+            answer_correctness=correctness_result.value
           )
         
         if not records:
@@ -548,17 +549,15 @@ class RagasAdapter:
 
         dataset = self._build_hf_dataset(records)
         result = await run_evaluation.arun(dataset)
-
+        
         df = result.to_pandas()
-
         per_case_scores: List[PerCaseScore] = []
 
         for idx, row in df.iterrows():
-          case_id = row.get("case_id") or records[idx].case_id
           latency_ms = safe_float(records[idx].metadata.get("latencyMs"))
 
           pcs = PerCaseScore(
-            case_id=case_id,
+            case_id=row.get("case_id"),
             faithfulness=safe_float(row.get("faithfulness")),
             answer_relevancy=safe_float(row.get("answer_relevancy")),
             answer_correctness=safe_float(row.get("answer_correctness")) if "answer_correctness" in row else None,
