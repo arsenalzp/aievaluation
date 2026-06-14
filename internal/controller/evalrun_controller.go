@@ -90,10 +90,7 @@ type suiteConfigJSON struct {
 type EvalRunReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-
-	Objectstorage *objectstorage.Client
-	ObjectBuket   string
-	Queue         workqueue.TypedRateLimitingInterface[string]
+	Queue  workqueue.TypedRateLimitingInterface[string]
 }
 
 // +kubebuilder:rbac:groups=ai.evaluation.io,resources=evalruns,verbs=get;list;watch;update;patch
@@ -224,7 +221,7 @@ func (r *EvalRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 
 		if run.Status.Phase == aieval.PhaseRunning {
-			gate, err := r.fetchGateSummary(ctx, &suite, &run)
+			gate, err := r.fetchGateSummary(ctx, &suite, &run, dataset.Spec.Source.ObjectStorageEndpoint)
 			if err != nil {
 				r.Queue.AddRateLimited(run.Name)
 				return r.setStatusAndRequeue(ctx, &run, aieval.PhaseRunning, "ArtifactMissing", "Running", fmt.Sprintf("Job succeeded but gate_summary not found: %v", err), 10*time.Second)
@@ -605,9 +602,10 @@ func (r *EvalRunReconciler) buildGateReaderPod(run *aieval.EvalRun) *corev1.Pod 
 	}
 }
 
-func (r *EvalRunReconciler) fetchGateSummary(ctx context.Context, suite *aieval.EvalSuite, run *aieval.EvalRun) (*aieval.GateSummary, error) {
+func (r *EvalRunReconciler) fetchGateSummary(ctx context.Context, suite *aieval.EvalSuite, run *aieval.EvalRun, bucketEndpoint string) (*aieval.GateSummary, error) {
 	key := fmt.Sprintf("runs/%s/gate_summary.json", run.Name)
-	obj, err := r.Objectstorage.GetObject(run.Spec.SummaryBucket, key)
+	objectStorClnt := objectstorage.NewClient(bucketEndpoint)
+	obj, err := objectStorClnt.GetObject(run.Spec.SummaryBucket, key)
 	if err != nil {
 		return nil, fmt.Errorf("unable to get gate_summary object: %s", err)
 	}

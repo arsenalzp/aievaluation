@@ -24,7 +24,7 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
-	objectstorage "github.com/metorial/object-storage/clients/go"
+
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	cachev1alpha1 "github.com/arsenalzp/aievaluation/api/v1alpha1"
@@ -207,8 +207,6 @@ func main() {
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 
-		Objectstorage: objectstorage.NewClient("http://k8s:9876"),
-		ObjectBuket:   "summary",
 		Queue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{},
