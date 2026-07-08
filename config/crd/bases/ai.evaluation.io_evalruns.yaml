@@ -105,7 +105,14 @@ spec:
             description: EvalRunStatus defines the observed state of EvalRun.
             properties:
               artifacts:
-                type: string
+                properties:
+                  detailsUri:
+                    type: string
+                  gateSummaryUri:
+                    type: string
+                  scoresUri:
+                    type: string
+                type: object
               completedAt:
                 format: date-time
                 type: string

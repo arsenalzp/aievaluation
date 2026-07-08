@@ -1,14 +1,21 @@
 import json
 import os
 import sys
-import time
 import traceback
 import asyncio
+import time
+import pandas as pd
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
-
+from phoenix.evals import evaluate_dataframe
+from phoenix.evals.metrics import (
+  ToolInvocationEvaluator, 
+  ToolSelectionEvaluator, 
+  CorrectnessEvaluator,
+  HallucinationEvaluator
+)
 import requests
-
+from llm import base_llm
 
 # ============================================================
 # Data models
@@ -74,7 +81,10 @@ class AgentPerCaseScore:
     latency_ms: Optional[float] = None
     passed: bool = False
     notes: List[str] = field(default_factory=list)
-
+    
+    tool_selection: Optional[float] = None
+    tool_invocation: Optional[float] = None
+    tool_execution: Optional[float] = None
 
 @dataclass
 class AgentAggregatedScores:
@@ -295,6 +305,7 @@ def build_runner_config() -> RunnerConfig:
 # ============================================================
 
 def download_dataset(cfg: RunnerConfig) -> str:
+    print("--downloading dataset--")
     bucket = cfg.dataset_s3_bucket or cfg.s3_bucket
     key = cfg.dataset_s3_key
 
@@ -316,6 +327,7 @@ def download_dataset(cfg: RunnerConfig) -> str:
 
 
 def load_optional_baseline(cfg: RunnerConfig) -> Optional[Dict[str, Any]]:
+    print("--downloading optional dataset--")
     resp = requests.get(f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.s3_baseline_key}")
 
     if getattr(resp, "status_code", None) == 404:
@@ -331,6 +343,7 @@ def load_optional_baseline(cfg: RunnerConfig) -> Optional[Dict[str, Any]]:
 
 
 def upload_json(cfg: RunnerConfig, key: str, payload: Dict[str, Any]) -> Any:
+    print("--uploading JSON--")
     def safe_serialize(obj):
         if isinstance(obj, bytes):
             return obj.decode("utf-8", errors="ignore")
@@ -356,6 +369,7 @@ def upload_json(cfg: RunnerConfig, key: str, payload: Dict[str, Any]) -> Any:
 
 
 def upload_text(cfg: RunnerConfig, key: str, text: str, content_type: str = "text/plain") -> Any:
+    print("--uploading text--")
     headers = {"Content-Type": f"{content_type}; charset=utf-8"}
 
     resp = requests.put(
@@ -389,7 +403,7 @@ def parse_tool(raw: Dict[str, Any]) -> AgentTool:
 
 
 def parse_dataset_jsonl(path: str) -> Listcases:
-    List[AgentDatasetCase] = []
+    cases: List[AgentDatasetCase] = []
 
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
@@ -437,6 +451,7 @@ def parse_dataset_jsonl(path: str) -> Listcases:
 # ============================================================
 
 def parse_tool_call(raw: Dict[str, Any]) -> AgentToolCall:
+    print("--parsing tool call--")
     name = raw.get("name") or raw.get("tool")
     if not name:
         raise ValueError("tool call is missing name")
@@ -523,6 +538,7 @@ def resolve_agent_trace(data: Dict[str, Any]) -> AgentTrace:
 # ============================================================
 
 def call_agent_endpoint_raw(cfg: RunnerConfig, case: AgentDatasetCase) -> Dict[str, Any]:
+    print("--calling an agent endpoint--")
     headers = {"Content-Type": "application/json"}
 
     payload = {
@@ -592,6 +608,579 @@ def call_agent_endpoint(cfg: RunnerConfig, case: AgentDatasetCase) -> AgentEvalR
     response_data = call_agent_endpoint_raw(cfg, case)
     return build_agent_eval_record(case, response_data)
 
+# ============================================================
+# Phoenix adapter
+# ============================================================
+
+class PhoenixAgentAdapter:
+    """
+    Adapter around Arize Phoenix agent metrics.
+
+    The runner core stays stable:
+
+        AgentEvalRecord -> AgentPerCaseScore
+
+    MVP evaluation model:
+
+    - tool_selection:
+        Phoenix ToolSelectionEvaluator.
+        Checks whether the agent selected the right tool.
+
+    - tool_invocation:
+        Phoenix ToolInvocationEvaluator.
+        Checks whether selected tools were invoked with correct arguments.
+
+    - tool_execution:
+        Deterministic runtime check based on status/error.
+
+    tool_response_handling is intentionally skipped in MVP.
+    """
+
+    def __init__(self, model: str, llm: LLM) -> None:
+        self._model = model
+        self._llm = llm
+        self._tool_selection_evaluator = None
+        self._tool_invocation_evaluator = None
+
+    # ------------------------------------------------------------
+    # Phoenix lazy imports
+    # ------------------------------------------------------------
+
+    def _get_llm(self):
+        return self._llm
+
+    def _get_tool_selection_evaluator(self):
+        if self._tool_selection_evaluator is None:
+            self._tool_selection_evaluator = ToolSelectionEvaluator(
+                llm=self._get_llm()
+            )
+
+        return self._tool_selection_evaluator
+
+    def _get_tool_invocation_evaluator(self):
+        if self._tool_invocation_evaluator is None:
+            self._tool_invocation_evaluator = ToolInvocationEvaluator(
+                llm=self._get_llm()
+            )
+
+        return self._tool_invocation_evaluator
+
+    # ------------------------------------------------------------
+    # Formatting helpers
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _tool_name(tool: AgentTool | AgentToolCall) -> str:
+        return (tool.name or "").strip()
+
+    @staticmethod
+    def _format_tool_call(tool: AgentTool | AgentToolCall) -> str:
+        name = (tool.name or "").strip()
+
+        if not name:
+            return "<unknown_tool>"
+
+        arguments = getattr(tool, "arguments", None) or {}
+
+        if not arguments:
+            return name
+
+        args = ", ".join(
+            f'{key}="{value}"'
+            for key, value in arguments.items()
+        )
+
+        return f"{name}({args})"
+
+    @classmethod
+    def _format_tool_selection(
+        cls,
+        tools: List[AgentTool | AgentToolCall],
+    ) -> str:
+        calls = [
+            cls._format_tool_call(tool)
+            for tool in tools
+            if cls._tool_name(tool)
+        ]
+
+        return "\n".join(calls) if calls else "No tools selected"
+    
+    @classmethod
+    def _format_available_tools_for_selection(
+        cls,
+        record: AgentEvalRecord,
+    ) -> str:
+      """
+      Phoenix ToolSelectionEvaluator should see only tool names/descriptions.
+    
+      It must not see expected argument values, otherwise argument errors
+      can incorrectly affect tool_selection.
+      """
+
+      tool_names: Dict[str, str] = {}
+    
+      for tool in record.expected_tools:
+          name = cls._tool_name(tool)
+    
+          if name:
+              tool_names[name] = f"{name}: Available tool for this task."
+    
+      # Do not add forbiddenTools here.
+      # Forbidden tools are policy constraints, not normal available tools.
+      # They are handled by count_policy_violations(record).
+    
+      for tool in record.tools_called:
+          name = cls._tool_name(tool)
+    
+          if name and name not in tool_names:
+              tool_names[name] = f"{name}: Tool observed in agent trace."
+    
+      if not tool_names:
+          return "No tools available."
+    
+      return "\n".join(tool_names.values())
+    @staticmethod
+    def _infer_type(value: Any) -> str:
+        if isinstance(value, bool):
+            return "boolean"
+
+        if isinstance(value, int) and not isinstance(value, bool):
+            return "integer"
+
+        if isinstance(value, float):
+            return "number"
+
+        if isinstance(value, list):
+            return "array"
+
+        if isinstance(value, dict):
+            return "object"
+
+        return "string"
+    
+    @classmethod
+    def _format_tool_names_only(
+      cls,
+      tools: List[AgentTool | AgentToolCall],
+    ) -> str:
+      """
+      Used only for ToolSelectionEvaluator.
+    
+      Arguments are intentionally omitted.
+      """
+    
+      names = [
+          cls._tool_name(tool)
+          for tool in tools
+          if cls._tool_name(tool)
+      ]
+    
+      return "\n".join(names) if names else "No tools selected"
+    
+    @classmethod
+    def _format_available_tools_for_invocation(
+      cls,
+      record: AgentEvalRecord,
+    ) -> str:
+      """
+      Phoenix ToolInvocationEvaluator needs argument-level contract.
+    
+      Since the current dataset has no separate tool schema, expectedTools.arguments
+      are used as the MVP argument contract.
+      """
+    
+      lines: List[str] = []
+    
+      for tool in record.expected_tools:
+          name = cls._tool_name(tool)
+    
+          if not name:
+              continue
+    
+          arguments = tool.arguments or {}
+    
+          if not arguments:
+              lines.append(f"{name}: Available tool.")
+              continue
+    
+          arg_lines: List[str] = []
+    
+          for arg_name, arg_value in arguments.items():
+              arg_type = cls._infer_type(arg_value)
+    
+              arg_lines.append(
+                  f'  - {arg_name} (required, {arg_type}): '
+                  f'expected value "{arg_value}"'
+              )
+    
+          lines.append(
+              f"{name}: Available tool expected for this task.\n"
+              + "\n".join(arg_lines)
+          )
+    
+      if not lines:
+          return "No tools available."
+    
+      return "\n".join(lines)
+
+    @classmethod
+    def _format_available_tools(cls, record: AgentEvalRecord) -> str:
+        """
+        Builds a Phoenix-compatible human-readable tool list
+        from the existing dataset and actual trace.
+
+        No dataset format change is required.
+
+        Important:
+        - expected_tools provides expected argument names/values;
+        - forbidden_tools are included as available tool names but marked as forbidden;
+        - actual tools are included if they were not present in expected/forbidden
+          so Phoenix can identify hallucinated or unknown selections.
+        """
+
+        tools_by_name: Dict[str, Dict[str, Any]] = {}
+
+        for tool in record.expected_tools:
+            name = cls._tool_name(tool)
+
+            if not name:
+                continue
+
+            tools_by_name[name] = {
+                "name": name,
+                "arguments": tool.arguments or {},
+                "kind": "expected",
+            }
+
+        for tool in record.forbidden_tools:
+            name = cls._tool_name(tool)
+
+            if not name:
+                continue
+
+            tools_by_name.setdefault(
+                name,
+                {
+                    "name": name,
+                    "arguments": tool.arguments or {},
+                    "kind": "forbidden",
+                },
+            )
+
+            tools_by_name[name]["kind"] = "forbidden"
+
+        for tool in record.tools_called:
+            name = cls._tool_name(tool)
+
+            if not name:
+                continue
+
+            tools_by_name.setdefault(
+                name,
+                {
+                    "name": name,
+                    "arguments": tool.arguments or {},
+                    "kind": "observed",
+                },
+            )
+
+        if not tools_by_name:
+            return "No tools available."
+
+        lines: List[str] = []
+
+        for item in tools_by_name.values():
+            name = item["name"]
+            arguments = item.get("arguments") or {}
+            kind = item.get("kind")
+
+            if kind == "forbidden":
+                prefix = f"{name}: Forbidden tool. Must not be used."
+            elif kind == "expected":
+                prefix = f"{name}: Available tool expected for this task."
+            else:
+                prefix = f"{name}: Observed tool from agent trace."
+
+            if not arguments:
+                lines.append(prefix)
+                continue
+
+            arg_lines = []
+
+            for arg_name, arg_value in arguments.items():
+                arg_type = cls._infer_type(arg_value)
+
+                arg_lines.append(
+                    f'  - {arg_name} (required, {arg_type}): expected value "{arg_value}"'
+                )
+
+            lines.append(prefix + "\n" + "\n".join(arg_lines))
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _first_score_value(scores: Any) -> Optional[float]:
+        if not scores:
+            return None
+
+        first = scores[0]
+
+        return safe_float(getattr(first, "score", None))
+
+    @staticmethod
+    def _first_score_label(scores: Any) -> Optional[str]:
+        if not scores:
+            return None
+
+        first = scores[0]
+
+        label = getattr(first, "label", None)
+
+        return str(label) if label is not None else None
+
+    @staticmethod
+    def _first_score_explanation(scores: Any) -> Optional[str]:
+        if not scores:
+            return None
+
+        first = scores[0]
+
+        explanation = getattr(first, "explanation", None)
+
+        return str(explanation) if explanation else None
+
+    # ------------------------------------------------------------
+    # Metric 1: Phoenix Tool Selection
+    # ------------------------------------------------------------
+
+    def _score_tool_selection(
+        self,
+        record: AgentEvalRecord,
+        score: AgentPerCaseScore,
+    ) -> Optional[float]:
+        if not record.expected_tools and not record.forbidden_tools:
+            return None
+
+        evaluator = self._get_tool_selection_evaluator()
+
+        eval_input = {
+          "input": f"User: {record.input}",
+          "available_tools": self._format_available_tools_for_selection(record),
+          "tool_selection": self._format_tool_names_only(record.tools_called),
+        }
+
+        scores = evaluator.evaluate(eval_input)
+
+        value = self._first_score_value(scores)
+        label = self._first_score_label(scores)
+        explanation = self._first_score_explanation(scores)
+
+        score.notes.append(f"phoenix_tool_selection_label={label}")
+
+        if explanation:
+            score.notes.append(
+                f"phoenix_tool_selection_explanation={explanation}"
+            )
+
+        return value
+
+    # ------------------------------------------------------------
+    # Metric 2: Phoenix Tool Invocation
+    # ------------------------------------------------------------
+
+    def _score_tool_invocation(
+        self,
+        record: AgentEvalRecord,
+        score: AgentPerCaseScore,
+    ) -> Optional[float]:
+        if not record.tools_called:
+            return None
+
+        evaluator = self._get_tool_invocation_evaluator()
+
+        # eval_input = {
+        #     "input": f"User: {record.input}",
+        #     "available_tools": self._format_available_tools(record),
+        #     "tool_selection": self._format_tool_selection(record.tools_called),
+        # }
+        eval_input = {
+          "input": f"User: {record.input}",
+          "available_tools": self._format_available_tools_for_invocation(record),
+          "tool_selection": self._format_tool_selection(record.tools_called),
+        }
+        
+        scores = evaluator.evaluate(eval_input)
+
+        value = self._first_score_value(scores)
+        label = self._first_score_label(scores)
+        explanation = self._first_score_explanation(scores)
+
+        score.notes.append(f"phoenix_tool_invocation_label={label}")
+
+        if explanation:
+            score.notes.append(
+                f"phoenix_tool_invocation_explanation={explanation}"
+            )
+
+        return value
+
+    # ------------------------------------------------------------
+    # Metric 3: Tool Execution
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _score_tool_execution(record: AgentEvalRecord) -> Optional[float]:
+        """
+        Runtime execution is not an LLM judge task.
+
+        It is evaluated deterministically from the current agent output:
+
+        - status in OK/SUCCESS/SUCCEEDED
+        - error is empty
+        """
+
+        executable_calls = [
+            tool for tool in record.tools_called
+            if (tool.name or "").strip()
+        ]
+
+        if not executable_calls:
+            return None
+
+        successful = 0
+
+        for tool in executable_calls:
+            status = (tool.status or "").strip().upper()
+            error = tool.error
+
+            if status in {"OK", "SUCCESS", "SUCCEEDED"} and not error:
+                successful += 1
+
+        return successful / len(executable_calls)
+
+    # ------------------------------------------------------------
+    # Notes
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _append_tool_execution_notes(
+        record: AgentEvalRecord,
+        score: AgentPerCaseScore,
+    ) -> None:
+        for tool in record.tools_called:
+            score.notes.append(
+                "tool_execution="
+                f"name={tool.name},"
+                f"status={tool.status},"
+                f"error={tool.error},"
+                f"durationMs={tool.duration_ms}"
+            )
+
+    @staticmethod
+    def _compute_passed(score: AgentPerCaseScore) -> bool:
+        metric_values = [
+            score.tool_selection,
+            score.tool_invocation,
+            score.tool_execution,
+        ]
+
+        available_metric_values = [
+            value for value in metric_values
+            if value is not None
+        ]
+
+        if available_metric_values:
+            return (
+                all(value >= 0.5 for value in available_metric_values)
+                and score.policy_violations == 0
+            )
+
+        return score.policy_violations == 0
+
+    # ------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------
+
+    def score_record(self, record: AgentEvalRecord) -> AgentPerCaseScore:
+        score = AgentPerCaseScore(
+            case_id=record.case_id,
+            latency_ms=safe_float(record.metadata.get("latencyMs")),
+        )
+
+        try:
+            # --------------------------------------------------------
+            # 1. Phoenix Tool Selection
+            # --------------------------------------------------------
+            score.tool_selection = self._score_tool_selection(record, score)
+
+            # Legacy alias.
+            score.tool_correctness = score.tool_selection
+
+            # --------------------------------------------------------
+            # 2. Phoenix Tool Invocation
+            # --------------------------------------------------------
+            score.tool_invocation = self._score_tool_invocation(record, score)
+
+            # Legacy alias.
+            score.argument_correctness = score.tool_invocation
+
+        except Exception as exc:
+            score.notes.append(f"phoenix_evals_failed={repr(exc)}")
+
+            score.tool_selection = None
+            score.tool_invocation = None
+            score.tool_correctness = None
+            score.argument_correctness = None
+
+        # ------------------------------------------------------------
+        # 3. Deterministic Tool Execution
+        # ------------------------------------------------------------
+        score.tool_execution = self._score_tool_execution(record)
+
+        self._append_tool_execution_notes(record, score)
+
+        if score.tool_execution is not None:
+            score.notes.append(f"tool_execution_score={score.tool_execution}")
+
+        # ------------------------------------------------------------
+        # 4. Policy violations
+        # ------------------------------------------------------------
+        score.policy_violations = count_policy_violations(record)
+
+        if score.policy_violations:
+            score.notes.append(f"policy_violations={score.policy_violations}")
+
+        # ------------------------------------------------------------
+        # 5. Task completion intentionally skipped in MVP
+        # ------------------------------------------------------------
+        score.task_completion = None
+        score.notes.append("task_completion_skipped=mvp_no_tool_response_handling")
+
+        # ------------------------------------------------------------
+        # 6. Final pass/fail
+        # ------------------------------------------------------------
+        score.passed = self._compute_passed(score)
+
+        return score
+
+    def score_records(
+        self,
+        records: List[AgentEvalRecord],
+    ) -> Tuple[List[AgentPerCaseScore], Dict[str, Any]]:
+        scores = [self.score_record(record) for record in records]
+
+        return scores, {
+            "metricNames": [
+                "tool_selection",
+                "tool_invocation",
+                "tool_execution",
+                "policy_violations",
+
+                # Legacy compatibility names
+                "tool_correctness",
+                "argument_correctness",
+            ]
+        }
 
 # ============================================================
 # DeepEval adapter
@@ -607,9 +1196,9 @@ class DeepEvalAgentAdapter:
     DeepEval import is lazy so unit tests do not require DeepEval/OpenAI.
     """
 
-    def __init__(self, model_name: str) -> None:
-        self._model_name = model_name
-
+    def __init__(self, model: str, llm: LLM) -> None:
+        self._model = model
+        self.llm = llm
     @staticmethod
     def _fallback_task_completion(record: AgentEvalRecord) -> Optional:
         if not record.expected_output:
@@ -628,75 +1217,102 @@ class DeepEvalAgentAdapter:
 
     @staticmethod
     def _to_deepeval_tool_call(tool: AgentTool | AgentToolCall):
-        from deepeval.test_case import ToolCall
-        return ToolCall(name=tool.name)
+        return ToolCall(name=tool.name, input_parameters=tool.arguments)
 
     def score_record(self, record: AgentEvalRecord) -> AgentPerCaseScore:
+        print("--scoring records--")
         score = AgentPerCaseScore(
             case_id=record.case_id,
             latency_ms=safe_float(record.metadata.get("latencyMs")),
         )
 
         try:
-            from deepeval.test_case import LLMTestCase
-            from deepeval.metrics import ToolCorrectnessMetric, TaskCompletionMetric
-
-            tools_called = [
-                self._to_deepeval_tool_call(x)
-                for x in record.tools_called
-                if x.name
-            ]
-
-            expected_tools = [
-                self._to_deepeval_tool_call(x)
-                for x in record.expected_tools
-                if x.name
-            ]
-
-            test_case = LLMTestCase(
-                input=record.input,
-                actual_output=record.actual_output,
-                expected_output=record.expected_output,
-                tools_called=tools_called,
-                expected_tools=expected_tools,
-            )
-
-            if expected_tools:
-                metric = ToolCorrectnessMetric(
-                    threshold=0.5,
-                    model=self._model_name,
-                    include_reason=True,
-                )
-                metric.measure(test_case)
-                score.tool_correctness = safe_float(metric.score)
-
-                if getattr(metric, "reason", None):
-                    score.notes.append(f"tool_correctness_reason={metric.reason}")
-
-            try:
-                task_metric = TaskCompletionMetric(
-                    threshold=0.5,
-                    model=self._model_name,
-                    include_reason=True,
-                )
-                task_metric.measure(test_case)
-                score.task_completion = safe_float(task_metric.score)
-
-                if getattr(task_metric, "reason", None):
-                    score.notes.append(f"task_completion_reason={task_metric.reason}")
-
-            except Exception as exc:
-                score.task_completion = self._fallback_task_completion(record)
-                score.notes.append(f"task_completion_fallback={repr(exc)}")
-
-        except Exception as exc:
-            score.tool_correctness = None
+          steps = record.trace.get("steps", [])
+          trajectory_lines = []
+          for step in steps:
+            node_name = step.get("node", "unknown")
+            desc = step.get("description", "")
+            out = step.get("output", "")
+            trajectory_lines.append(f"[{node_name.upper()}]: {desc} -> Result: {out}")
+        
+          full_trajectory = "\n".join(trajectory_lines)
+          tools_called_str = ", ".join([f"{t.name}({t.arguments})" for t in record.tools_called if t.name])
+          expected_tools_str = ", ".join([f"{t.name}({t.arguments})" for t in record.expected_tools if t.name])
+          
+          eval_model = self.llm
+          
+          if record.expected_tools:
+            tool_evaluator = CorrectnessEvaluator(llm=eval_model)
+            
+            tool_df = pd.DataFrame([{
+                "input": f"Expected tools to call: {expected_tools_str}",
+                "output": tools_called_str,
+                "reference": expected_tools_str
+            }])
+            
+            tool_results = evaluate_dataframe(tool_df, [tool_evaluator])
+            res_row = tool_results.iloc[0]
+            
+            is_correct = res_row.correctness_score['label'] == 'correct'
+            score.tool_correctness = 1.0 if is_correct else 0.0
+            if 'explanation' in res_row and res_row['explanation']:
+                score.notes.append(f"tool_correctness_reason={res_row['explanation']}")
+          
+          try:
+            task_evaluator = CorrectnessEvaluator(llm=eval_model)
+            task_df = pd.DataFrame([{
+                "input": f"User task: {record.input}\n\nExecution Trajectory:\n{full_trajectory}",
+                "output": record.actual_output,
+                "reference": record.expected_output or ""
+            }])
+            
+            task_results = evaluate_dataframe(task_df, [task_evaluator])
+            task_row = task_results.iloc[0]
+            
+            is_task_done = task_row.correctness_score['label'] == 'correct'
+            score.task_completion = 1.0 if is_task_done else 0.0
+            if 'explanation' in task_row and task_row['explanation']:
+                score.notes.append(f"task_completion_reason={task_row['explanation']}")
+          except Exception as exc:
             score.task_completion = self._fallback_task_completion(record)
-            score.notes.append(f"deepeval_unavailable_or_failed={repr(exc)}")
-
-        score.argument_correctness = compute_argument_correctness(record)
+            score.notes.append(f"task_completion_fallback={repr(exc)}")
+          
+          try:
+            hallucination_evaluator = HallucinationEvaluator(llm=eval_model)
+            actual_tools_with_args = json.dumps([
+              {"tool": t.name, "arguments": t.arguments} 
+              for t in record.tools_called if t.name
+            ], ensure_ascii=False)
+            arg_df = pd.DataFrame([{
+              "input": record.input,
+              "context": f"User Request: {record.input}\nExecution context: {full_trajectory}",
+              "output": actual_tools_with_args
+            }])
+            arg_results = evaluate_dataframe(arg_df, [hallucination_evaluator])
+            res_row = arg_results.iloc[0]
+            
+            is_factual = res_row.hallucination_score['label'] == 'factual'
+            score.argument_correctness = 1.0 if is_factual else 0.0
+            if 'explanation' in res_row and res_row['explanation']:
+              score.notes.append(f"argument_analysis={res_row['explanation']}")
+          except Exception as exc:
+            score.argument_correctness = self._fallback_task_completion(record)
+            score.notes.append(f"argument_correctness_fallback={repr(exc)}")
+          #score.argument_correctness = compute_argument_correctness(record)
+          
+        except Exception as exc:
+          score.tool_correctness = None
+          score.task_completion = self._fallback_task_completion(record)
+          score.notes.append(f"phoenix_eval_failed={repr(exc)}")  
+            
         score.policy_violations = count_policy_violations(record)
-
+        
+        score.passed = (
+          (score.tool_correctness is None or score.tool_correctness >= 0.5) and 
+          (score.task_completion is None or score.task_completion >= 0.5) and
+          score.policy_violations == 0
+        )
+            
         return score
 
     def score_records(self, records: List[AgentEvalRecord]) -> Tuple[List[AgentPerCaseScore], Dict[str, Any]]:
@@ -992,6 +1608,7 @@ def publish_details_jsonl(
     records: List[AgentEvalRecord],
     scores: List[AgentPerCaseScore],
 ) -> None:
+    print("--publishing details jsonl--")
     score_by_case = {x.case_id: x for x in scores}
     lines: List[str] = []
 
@@ -1025,6 +1642,7 @@ def publish_scores_json(
     per_case: List[AgentPerCaseScore],
     deepeval_meta: Dict[str, Any],
 ) -> None:
+    print("--publishing scores jsonl--")
     payload = {
         "schemaVersion": "evalrun.scores/v1",
         "evaluationType": "agent",
@@ -1047,6 +1665,7 @@ def publish_scores_json(
 
 
 def publish_gate_summary(cfg: RunnerConfig, gate: GateSummary) -> None:
+    print("--publishing gate summary--")
     upload_json(cfg, cfg.gate_summary_key, asdict(gate))
 
 
@@ -1071,8 +1690,9 @@ async def main() -> int:
         for case in cases:
             record = call_agent_endpoint(cfg, case)
             records.append(record)
-
-        adapter = DeepEvalAgentAdapter(model_name=cfg.llm_model)
+        
+        #adapter = DeepEvalAgentAdapter(model=cfg.llm_model, llm=base_llm)
+        adapter = PhoenixAgentAdapter(model=cfg.llm_model, llm=base_llm)
         per_case_scores, deepeval_meta = adapter.score_records(records)
 
         mark_per_case_pass_fail(cfg, per_case_scores)

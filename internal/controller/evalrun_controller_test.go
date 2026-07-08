@@ -123,17 +123,19 @@ func testEvalSuite(name string) *aieval.EvalSuite {
 				Name: "dataset-1",
 			},
 			Metrics: aieval.Metrics{
-				Retrieval: aieval.Retrieval{
-					MinContextRecall:    &minRecall,
-					MinContextPrecision: &minPrecision,
-				},
-				Generation: aieval.Generation{
-					MinFaithfulness: &minFaithfulness,
-					MinCorrectness:  &minCorrectness,
-				},
-				Trustworthiness: aieval.Trustworthiness{
-					MaxStaleChunkRatio:   &maxStaleChunkRatio,
-					MaxUnknownOwnerRatio: &maxUnknownOwnerRatio,
+				Rag: aieval.Rag{
+					Retrieval: aieval.Retrieval{
+						MinContextRecall:    &minRecall,
+						MinContextPrecision: &minPrecision,
+					},
+					Generation: aieval.Generation{
+						MinFaithfulness: &minFaithfulness,
+						MinCorrectness:  &minCorrectness,
+					},
+					Trustworthiness: aieval.Trustworthiness{
+						MaxStaleChunkRatio:   &maxStaleChunkRatio,
+						MaxUnknownOwnerRatio: &maxUnknownOwnerRatio,
+					},
 				},
 			},
 			RegressionPolicy: aieval.RegressionPolicy{

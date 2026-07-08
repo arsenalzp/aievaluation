@@ -65,11 +65,17 @@ type ExecutionFailure struct {
 	Message string `json:"message,omitempty"`
 }
 
+type Artifacts struct {
+	GateSummaryUri string `json:"gateSummaryUri,omitempty"`
+	ScoresUri      string `json:"scoresUri,omitempty"`
+	DetailsUri     string `json:"detailsUri,omitempty"`
+}
+
 type GateSummary struct {
 	Verdict   string    `json:"verdict,omitempty"`
 	Summary   string    `json:"summary,omitempty"`
 	RootCause RootCause `json:"rootCause,omitempty"`
-	Artifacts string    `json:"artifacts,omitempty"`
+	Artifacts `json:"artifacts,omitempty"`
 }
 
 // EvalRunStatus defines the observed state of EvalRun.
@@ -83,7 +89,7 @@ type EvalRunStatus struct {
 	JobRef           v1.LocalObjectReference `json:"jobRef,omitempty"`
 	SuiteSpecHash    string                  `json:"suiteSpecHash,omitempty"`
 	RootCause        `json:"rootCause,omitempty"`
-	Artifacts        string            `json:"artifacts,omitempty"`
+	Artifacts        `json:"artifacts,omitempty"`
 	ExecutionFailure *ExecutionFailure `json:"executionFailure,omitempty"`
 }
 

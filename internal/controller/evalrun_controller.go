@@ -60,7 +60,25 @@ type gateSummaryJSON struct {
 	Artifacts any `json:"artifacts,omitempty"`
 }
 
+type suiteAgentConfigJSON struct {
+	Type    string `json:"type,omitempty"`
+	Metrics struct {
+		MinToolCorrectness     *float32 `json:"minToolCorrectness,omitempty"`
+		MinTaskCompletion      *float32 `json:"minTaskCompletion,omitempty"`
+		MinArgumentCorrectness *float32 `json:"minArgumentCorrectness,omitempty"`
+		MaxPolicyViolations    *float32 `json:"MaxPolicyViolations,omitempty"`
+	} `json:"metrics,omitempty"`
+	RegressionPolicy struct {
+		MaxDrop *float32 `json:"maxDrop,omitempty"`
+	} `json:"regressionPolicy,omitempty"`
+	Execution struct {
+		Mode           string `json:"mode,omitempty"`
+		TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
+	} `json:"execution,omitempty"`
+}
+
 type suiteConfigJSON struct {
+	Type    string `json:"type,omitempty"`
 	Metrics struct {
 		Retrieval struct {
 			MinContextRecall    *float32 `json:"minContextRecall,omitempty"`
@@ -444,7 +462,10 @@ func buildEvalJob(
 "rootCause": {
   "stage": "None"
 },
-"artifacts": "{\"gateSummaryUri\":\"s3://${SUMMARY_BUCKET}/${SUMMARY_KEY}\",\"scoresUri\":\"s3://${SUMMARY_BUCKET}/${SCORES_KEY}\"}"
+"artifacts": {
+	"gateSummaryUri":"s3://${SUMMARY_BUCKET}/${SUMMARY_KEY}",
+	"scoresUri":"s3://${SUMMARY_BUCKET}/${SCORES_KEY}"
+ }
 }'`,
 		}
 	}
@@ -493,9 +514,28 @@ func buildEvalJob(
 
 // A render from EvalSuite.Spec to suite.json
 func renderSuiteConfigJSON(suite *aieval.EvalSuite) ([]byte, error) {
-	var cfg suiteConfigJSON
+	if suite.Spec.Mode == "agent" {
+		var cfg suiteAgentConfigJSON
+		cfg.Type = "agent"
+		// Agent metrics
+		cfg.Metrics.MaxPolicyViolations = suite.Spec.MaxPolicyViolations
+		cfg.Metrics.MinArgumentCorrectness = suite.Spec.MinArgumentCorrectness
+		cfg.Metrics.MinTaskCompletion = suite.Spec.MinTaskCompletion
+		cfg.Metrics.MaxPolicyViolations = suite.Spec.MaxPolicyViolations
 
+		// RegressionPolicy
+		cfg.RegressionPolicy.MaxDrop = suite.Spec.RegressionPolicy.MaxDrop
+
+		// Execution
+		cfg.Execution.Mode = suite.Spec.Execution.Mode
+		cfg.Execution.TimeoutSeconds = suite.Spec.Execution.TimeoutSeconds
+
+		return json.MarshalIndent(cfg, "", "  ")
+	}
+
+	var cfg suiteConfigJSON
 	// Metrics
+	cfg.Type = "rag"
 	cfg.Metrics.Retrieval.MinContextRecall = suite.Spec.Metrics.MinContextRecall
 	cfg.Metrics.Retrieval.MinContextPrecision = suite.Spec.Metrics.MinContextPrecision
 

@@ -114,7 +114,7 @@ class GateSummary:
     verdict: str
     summary: str
     rootCause: Dict[str, Any]
-    artifacts: str
+    artifacts: Dict[str, str]
 
 
 # ============================================================
@@ -294,6 +294,10 @@ def download_dataset(cfg: RunnerConfig) -> str:
 
 def load_optional_baseline(cfg: RunnerConfig) -> Optional[Dict[str, Any]]:
     resp = requests.get(f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.s3_baseline_key}")
+    
+    if getattr(resp, "status_code", None) == 404:
+        return None
+      
     try:
         resp.raise_for_status()
     except:
@@ -794,7 +798,7 @@ def build_gate_summary(
         verdict=verdict,
         summary="; ".join(summary_parts),
         rootCause=root_cause,
-        artifacts=json.dumps(artifacts, ensure_ascii=False),
+        artifacts=artifacts
     )
 
 
@@ -929,11 +933,11 @@ async def main() -> int:
                     "stage": "Execution",
                     "details": traceback.format_exc()[-3000:],
                 },
-                artifacts=json.dumps({
+                artifacts={
                     "gateSummaryUri": f"s3://{cfg.s3_bucket}/{cfg.gate_summary_key}",
                     "scoresUri": f"s3://{cfg.s3_bucket}/{cfg.scores_key}",
                     "detailsUri": f"s3://{cfg.s3_bucket}/{cfg.details_key}",
-                }, ensure_ascii=False),
+                },
             )
             publish_gate_summary(cfg, gate)
         except Exception:

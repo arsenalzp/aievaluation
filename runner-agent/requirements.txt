@@ -1,1 +1,2 @@
-deepeval==4.0.0
+arize-phoenix-evals==3.1.0
+openai==2.44.0

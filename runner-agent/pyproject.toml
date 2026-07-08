@@ -5,6 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "deepeval==4.0.0",
+    "arize-phoenix-evals==3.1.0",
+    "dotenv>=0.9.9",
+    "openai>=2.44.0",
     "pip>=26.1.2",
+    "requests>=2.34.2",
 ]

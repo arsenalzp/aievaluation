@@ -7,8 +7,6 @@ import (
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-//
-
 type Trustworthiness struct {
 	// +kubebuilder:validation:Optional
 	MaxStaleChunkRatio *float32 `json:"maxStaleChunkRatio,omitempty"`
@@ -30,10 +28,24 @@ type Retrieval struct {
 	MinContextPrecision *float32 `json:"minContextPrecision,omitempty"`
 }
 
-type Metrics struct {
+type Agent struct {
+	MinToolCorrectness     *float32 `json:"minToolCorrectness,omitempty"`
+	MinTaskCompletion      *float32 `json:"minTaskCompletion,omitempty"`
+	MinArgumentCorrectness *float32 `json:"minArgumentCorrectness,omitempty"`
+	MaxPolicyViolations    *float32 `json:"MaxPolicyViolations,omitempty"`
+}
+
+type Rag struct {
 	Retrieval       `json:"retrieval,omitempty"`
 	Generation      `json:"generation,omitempty"`
 	Trustworthiness `json:"trustworthiness,omitempty"`
+}
+
+type Metrics struct {
+	// +kubebuilder:validation:Optional
+	Agent `json:"agent,omitempty"`
+	// +kubebuilder:validation:Optional
+	Rag `json:"rag,omitempty"`
 }
 
 type RegressionPolicy struct {
@@ -42,6 +54,7 @@ type RegressionPolicy struct {
 }
 
 type Execution struct {
+	// +kubebuilder:validation:Enum=agent;rag;dummy
 	Mode           string `json:"mode,omitempty"`
 	RunnerImage    string `json:"runnerImage,omitempty"`
 	TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
