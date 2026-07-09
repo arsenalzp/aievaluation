@@ -63,10 +63,10 @@ type gateSummaryJSON struct {
 type suiteAgentConfigJSON struct {
 	Type    string `json:"type,omitempty"`
 	Metrics struct {
-		MinToolCorrectness     *float32 `json:"minToolCorrectness,omitempty"`
-		MinTaskCompletion      *float32 `json:"minTaskCompletion,omitempty"`
-		MinArgumentCorrectness *float32 `json:"minArgumentCorrectness,omitempty"`
-		MaxPolicyViolations    *float32 `json:"MaxPolicyViolations,omitempty"`
+		MinToolSelection    *float32 `json:"minToolSelection,omitempty"`
+		MinToolInvocation   *float32 `json:"minToolInvocation,omitempty"`
+		MinToolExecution    *float32 `json:"minToolExecution,omitempty"`
+		MaxPolicyViolations *int32   `json:"maxPolicyViolations,omitempty"`
 	} `json:"metrics,omitempty"`
 	RegressionPolicy struct {
 		MaxDrop *float32 `json:"maxDrop,omitempty"`
@@ -519,9 +519,9 @@ func renderSuiteConfigJSON(suite *aieval.EvalSuite) ([]byte, error) {
 		cfg.Type = "agent"
 		// Agent metrics
 		cfg.Metrics.MaxPolicyViolations = suite.Spec.MaxPolicyViolations
-		cfg.Metrics.MinArgumentCorrectness = suite.Spec.MinArgumentCorrectness
-		cfg.Metrics.MinTaskCompletion = suite.Spec.MinTaskCompletion
-		cfg.Metrics.MaxPolicyViolations = suite.Spec.MaxPolicyViolations
+		cfg.Metrics.MinToolSelection = suite.Spec.MinToolSelection
+		cfg.Metrics.MinToolInvocation = suite.Spec.MinToolInvocation
+		cfg.Metrics.MinToolExecution = suite.Spec.MinToolExecution
 
 		// RegressionPolicy
 		cfg.RegressionPolicy.MaxDrop = suite.Spec.RegressionPolicy.MaxDrop

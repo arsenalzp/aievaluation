@@ -10,6 +10,7 @@ import (
 type Trustworthiness struct {
 	// +kubebuilder:validation:Optional
 	MaxStaleChunkRatio *float32 `json:"maxStaleChunkRatio,omitempty"`
+
 	// +kubebuilder:validation:Optional
 	MaxUnknownOwnerRatio *float32 `json:"maxUnknownOwnerRatio,omitempty"`
 }
@@ -17,6 +18,7 @@ type Trustworthiness struct {
 type Generation struct {
 	// +kubebuilder:validation:Optional
 	MinFaithfulness *float32 `json:"minFaithfulness,omitempty"`
+
 	// +kubebuilder:validation:Optional
 	MinCorrectness *float32 `json:"minCorrectness,omitempty"`
 }
@@ -24,20 +26,40 @@ type Generation struct {
 type Retrieval struct {
 	// +kubebuilder:validation:Optional
 	MinContextRecall *float32 `json:"minContextRecall,omitempty"`
+
 	// +kubebuilder:validation:Optional
 	MinContextPrecision *float32 `json:"minContextPrecision,omitempty"`
 }
 
 type Agent struct {
-	MinToolCorrectness     *float32 `json:"minToolCorrectness,omitempty"`
-	MinTaskCompletion      *float32 `json:"minTaskCompletion,omitempty"`
-	MinArgumentCorrectness *float32 `json:"minArgumentCorrectness,omitempty"`
-	MaxPolicyViolations    *float32 `json:"MaxPolicyViolations,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinToolSelection *float32 `json:"minToolSelection,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinToolInvocation *float32 `json:"minToolInvocation,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinToolExecution *float32 `json:"minToolExecution,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	MaxPolicyViolations *int32 `json:"maxPolicyViolations,omitempty"`
 }
 
 type Rag struct {
-	Retrieval       `json:"retrieval,omitempty"`
-	Generation      `json:"generation,omitempty"`
+	// +kubebuilder:validation:Optional
+	Retrieval `json:"retrieval,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	Generation `json:"generation,omitempty"`
+
+	// +kubebuilder:validation:Optional
 	Trustworthiness `json:"trustworthiness,omitempty"`
 }
 
