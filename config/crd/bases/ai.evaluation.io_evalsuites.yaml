@@ -96,6 +96,8 @@ spec:
                             type: number
                           minFaithfulness:
                             type: number
+                          minRelevancy:
+                            type: number
                         type: object
                       retrieval:
                         properties:

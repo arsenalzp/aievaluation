@@ -87,6 +87,7 @@ type suiteConfigJSON struct {
 		Generation struct {
 			MinFaithfulness *float32 `json:"minFaithfulness,omitempty"`
 			MinCorrectness  *float32 `json:"minCorrectness,omitempty"`
+			MinRelevancy    *float32 `json:"minRelevancy,omitempty"`
 		} `json:"generation,omitempty"`
 		Trustworthiness struct {
 			MaxStaleChunkRatio   *float32 `json:"maxStaleChunkRatio,omitempty"`
@@ -541,6 +542,7 @@ func renderSuiteConfigJSON(suite *aieval.EvalSuite) ([]byte, error) {
 
 	cfg.Metrics.Generation.MinFaithfulness = suite.Spec.Metrics.MinFaithfulness
 	cfg.Metrics.Generation.MinCorrectness = suite.Spec.Metrics.MinCorrectness
+	cfg.Metrics.Generation.MinRelevancy = suite.Spec.Metrics.MinRelevancy
 
 	cfg.Metrics.Trustworthiness.MaxStaleChunkRatio = suite.Spec.Metrics.MaxStaleChunkRatio
 	cfg.Metrics.Trustworthiness.MaxUnknownOwnerRatio = suite.Spec.Metrics.MaxUnknownOwnerRatio

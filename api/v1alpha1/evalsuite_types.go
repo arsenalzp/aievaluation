@@ -21,6 +21,9 @@ type Generation struct {
 
 	// +kubebuilder:validation:Optional
 	MinCorrectness *float32 `json:"minCorrectness,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	MinRelevancy *float32 `json:"minRelevancy,omitempty"`
 }
 
 type Retrieval struct {

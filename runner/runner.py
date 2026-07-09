@@ -23,6 +23,7 @@ from ragas.llms import llm_factory
 from ragas.embeddings import OpenAIEmbeddings
 from ragas import experiment, EvaluationDataset, SingleTurnSample
 from sqlalchemy.engine import row
+from pickle import TRUE
 
 # answer_correctness may not exist in some ragas versions
 # try:
@@ -165,6 +166,7 @@ class ThresholdConfig:
     min_context_recall: Optional[float] = None
     min_context_precision: Optional[float] = None
     min_faithfulness: Optional[float] = None
+    min_relevancy: Optional[float] = None
     min_correctness: Optional[float] = None
     max_stale_chunk_ratio: Optional[float] = None
     max_unknown_owner_ratio: Optional[float] = None
@@ -223,12 +225,13 @@ def build_runner_config() -> RunnerConfig:
     execution = suite.get("execution", {})
 
     thresholds = ThresholdConfig(
-        min_context_recall=safe_float(retrieval.get("minContextRecall")),
-        min_context_precision=safe_float(retrieval.get("minContextPrecision")),
-        min_faithfulness=safe_float(generation.get("minFaithfulness")),
-        min_correctness=safe_float(generation.get("minCorrectness")),
-        max_stale_chunk_ratio=safe_float(trust.get("maxStaleChunkRatio")),
-        max_unknown_owner_ratio=safe_float(trust.get("maxUnknownOwnerRatio")),
+        min_context_recall=safe_float(retrieval.get("minContextRecall", None)),
+        min_context_precision=safe_float(retrieval.get("minContextPrecision", None)),
+        min_faithfulness=safe_float(generation.get("minFaithfulness", None)),
+        min_relevancy = safe_float(generation.get("minRelevancy", None)),
+        min_correctness=safe_float(generation.get("minCorrectness", None)),
+        max_stale_chunk_ratio=safe_float(trust.get("maxStaleChunkRatio", None)),
+        max_unknown_owner_ratio=safe_float(trust.get("maxUnknownOwnerRatio", None)),
     )
 
     timeout_s = int(execution.get("timeoutSeconds", 60))
@@ -620,14 +623,21 @@ def mark_per_case_pass_fail(cfg: RunnerConfig, per_case: List[PerCaseScore]) -> 
         if effective_correctness is None:
             effective_correctness = score.answer_relevancy
             correctness_metric_name = "answer_relevancy"
-
+        
         if cfg.thresholds.min_correctness is not None and effective_correctness is not None:
             if effective_correctness < cfg.thresholds.min_correctness:
                 passed = False
                 notes.append(
                     f"{correctness_metric_name}={effective_correctness:.4f} < minCorrectness={cfg.thresholds.min_correctness:.4f}"
                 )
-
+                
+        if cfg.thresholds.min_relevancy is not None and score.answer_relevancy is not None:
+          if score.answer_relevancy < cfg.thresholds.min_relevancy:
+            passed = False
+            notes.append(
+                    f"answer_relevancy={score.answer_relevancy:.4f} < minRelevancy={cfg.thresholds.min_relevancy:.4f}"
+                )
+          
         if cfg.thresholds.min_context_precision is not None and score.context_precision is not None:
             if score.context_precision < cfg.thresholds.min_context_precision:
                 passed = False
@@ -698,6 +708,15 @@ def apply_threshold_policy(cfg: RunnerConfig, agg: AggregatedScores) -> Tuple[bo
                 "details": f"{correctness_metric_name}={effective_correctness_avg:.4f} < minCorrectness={cfg.thresholds.min_correctness:.4f}",
             }
             notes.append(root_cause["details"])
+      
+    if not failed and cfg.thresholds.min_relevancy is not None and agg.answer_relevancy_avg is not None:
+      if agg.answer_relevancy_avg < cfg.thresholds.min_relevancy:
+        failed = True
+        root_cause = {
+          "stage": "Generation",
+          "metric": "relevancy",
+          "details": f"faithfulness_avg={agg.answer_relevancy_avg:.4f} < minFaithfulness={cfg.thresholds.min_relevancy:.4f}",
+        }
 
     return failed, root_cause, notes
 
