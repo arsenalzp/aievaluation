@@ -74,9 +74,6 @@ class AgentEvalRecord:
 @dataclass
 class AgentPerCaseScore:
     case_id: str
-    tool_correctness: Optional[float] = None
-    task_completion: Optional[float] = None
-    argument_correctness: Optional[float] = None
     policy_violations: int = 0
     latency_ms: Optional[float] = None
     passed: bool = False
@@ -91,9 +88,9 @@ class AgentAggregatedScores:
     total_cases: int
     passed_cases: int
 
-    tool_correctness_avg: Optional[float]
-    task_completion_avg: Optional[float]
-    argument_correctness_avg: Optional[float]
+    tool_selection_avg: Optional[float]
+    tool_invocation_avg: Optional[float]
+    tool_execution_avg: Optional[float]
 
     policy_violations_total: int
     latency_ms_avg: Optional[float]
@@ -184,9 +181,9 @@ def tool_key(tool: AgentTool | AgentToolCall) -> str:
 
 @dataclass
 class AgentThresholdConfig:
-    min_tool_correctness: Optional[float] = None
-    min_task_completion: Optional[float] = None
-    min_argument_correctness: Optional[float] = None
+    min_tool_selection: Optional[float] = None
+    min_tool_execution: Optional[float] = None
+    min_tool_invocation: Optional[float] = None
     max_policy_violations: Optional[int] = 0
 
 
@@ -250,9 +247,9 @@ def build_runner_config() -> RunnerConfig:
     trace_cfg = suite.get("trace", {})
 
     thresholds = AgentThresholdConfig(
-        min_tool_correctness=safe_float(agent_metrics.get("minToolCorrectness")),
-        min_task_completion=safe_float(agent_metrics.get("minTaskCompletion")),
-        min_argument_correctness=safe_float(agent_metrics.get("minArgumentCorrectness")),
+        min_tool_selection=safe_float(agent_metrics.get("minToolSelection")),
+        min_tool_execution=safe_float(agent_metrics.get("minToolExecution")),
+        min_tool_invocation=safe_float(agent_metrics.get("minToolInvocation")),
         max_policy_violations=safe_int(policy_metrics.get("maxPolicyViolations"), default=0),
     )
 
@@ -975,8 +972,6 @@ class PhoenixAgentAdapter:
         label = self._first_score_label(scores)
         explanation = self._first_score_explanation(scores)
 
-        score.notes.append(f"phoenix_tool_selection_label={label}")
-
         if explanation:
             score.notes.append(
                 f"phoenix_tool_selection_explanation={explanation}"
@@ -1014,8 +1009,6 @@ class PhoenixAgentAdapter:
         value = self._first_score_value(scores)
         label = self._first_score_label(scores)
         explanation = self._first_score_explanation(scores)
-
-        score.notes.append(f"phoenix_tool_invocation_label={label}")
 
         if explanation:
             score.notes.append(
@@ -1113,16 +1106,11 @@ class PhoenixAgentAdapter:
             # --------------------------------------------------------
             score.tool_selection = self._score_tool_selection(record, score)
 
-            # Legacy alias.
-            score.tool_correctness = score.tool_selection
-
             # --------------------------------------------------------
             # 2. Phoenix Tool Invocation
             # --------------------------------------------------------
             score.tool_invocation = self._score_tool_invocation(record, score)
 
-            # Legacy alias.
-            score.argument_correctness = score.tool_invocation
 
         except Exception as exc:
             score.notes.append(f"phoenix_evals_failed={repr(exc)}")
@@ -1139,16 +1127,10 @@ class PhoenixAgentAdapter:
 
         self._append_tool_execution_notes(record, score)
 
-        if score.tool_execution is not None:
-            score.notes.append(f"tool_execution_score={score.tool_execution}")
-
         # ------------------------------------------------------------
         # 4. Policy violations
         # ------------------------------------------------------------
         score.policy_violations = count_policy_violations(record)
-
-        if score.policy_violations:
-            score.notes.append(f"policy_violations={score.policy_violations}")
 
         # ------------------------------------------------------------
         # 5. Task completion intentionally skipped in MVP
@@ -1174,155 +1156,6 @@ class PhoenixAgentAdapter:
                 "tool_selection",
                 "tool_invocation",
                 "tool_execution",
-                "policy_violations",
-
-                # Legacy compatibility names
-                "tool_correctness",
-                "argument_correctness",
-            ]
-        }
-
-# ============================================================
-# DeepEval adapter
-# ============================================================
-
-class DeepEvalAgentAdapter:
-    """
-    Adapter around DeepEval agent metrics.
-
-    The runner core stays stable:
-    AgentEvalRecord -> AgentPerCaseScore
-
-    DeepEval import is lazy so unit tests do not require DeepEval/OpenAI.
-    """
-
-    def __init__(self, model: str, llm: LLM) -> None:
-        self._model = model
-        self.llm = llm
-    @staticmethod
-    def _fallback_task_completion(record: AgentEvalRecord) -> Optional:
-        if not record.expected_output:
-            return None
-
-        actual = record.actual_output.strip().lower()
-        expected = record.expected_output.strip().lower()
-
-        if actual == expected:
-            return 1.0
-
-        if expected and expected in actual:
-            return 0.8
-
-        return 0.0
-
-    @staticmethod
-    def _to_deepeval_tool_call(tool: AgentTool | AgentToolCall):
-        return ToolCall(name=tool.name, input_parameters=tool.arguments)
-
-    def score_record(self, record: AgentEvalRecord) -> AgentPerCaseScore:
-        print("--scoring records--")
-        score = AgentPerCaseScore(
-            case_id=record.case_id,
-            latency_ms=safe_float(record.metadata.get("latencyMs")),
-        )
-
-        try:
-          steps = record.trace.get("steps", [])
-          trajectory_lines = []
-          for step in steps:
-            node_name = step.get("node", "unknown")
-            desc = step.get("description", "")
-            out = step.get("output", "")
-            trajectory_lines.append(f"[{node_name.upper()}]: {desc} -> Result: {out}")
-        
-          full_trajectory = "\n".join(trajectory_lines)
-          tools_called_str = ", ".join([f"{t.name}({t.arguments})" for t in record.tools_called if t.name])
-          expected_tools_str = ", ".join([f"{t.name}({t.arguments})" for t in record.expected_tools if t.name])
-          
-          eval_model = self.llm
-          
-          if record.expected_tools:
-            tool_evaluator = CorrectnessEvaluator(llm=eval_model)
-            
-            tool_df = pd.DataFrame([{
-                "input": f"Expected tools to call: {expected_tools_str}",
-                "output": tools_called_str,
-                "reference": expected_tools_str
-            }])
-            
-            tool_results = evaluate_dataframe(tool_df, [tool_evaluator])
-            res_row = tool_results.iloc[0]
-            
-            is_correct = res_row.correctness_score['label'] == 'correct'
-            score.tool_correctness = 1.0 if is_correct else 0.0
-            if 'explanation' in res_row and res_row['explanation']:
-                score.notes.append(f"tool_correctness_reason={res_row['explanation']}")
-          
-          try:
-            task_evaluator = CorrectnessEvaluator(llm=eval_model)
-            task_df = pd.DataFrame([{
-                "input": f"User task: {record.input}\n\nExecution Trajectory:\n{full_trajectory}",
-                "output": record.actual_output,
-                "reference": record.expected_output or ""
-            }])
-            
-            task_results = evaluate_dataframe(task_df, [task_evaluator])
-            task_row = task_results.iloc[0]
-            
-            is_task_done = task_row.correctness_score['label'] == 'correct'
-            score.task_completion = 1.0 if is_task_done else 0.0
-            if 'explanation' in task_row and task_row['explanation']:
-                score.notes.append(f"task_completion_reason={task_row['explanation']}")
-          except Exception as exc:
-            score.task_completion = self._fallback_task_completion(record)
-            score.notes.append(f"task_completion_fallback={repr(exc)}")
-          
-          try:
-            hallucination_evaluator = HallucinationEvaluator(llm=eval_model)
-            actual_tools_with_args = json.dumps([
-              {"tool": t.name, "arguments": t.arguments} 
-              for t in record.tools_called if t.name
-            ], ensure_ascii=False)
-            arg_df = pd.DataFrame([{
-              "input": record.input,
-              "context": f"User Request: {record.input}\nExecution context: {full_trajectory}",
-              "output": actual_tools_with_args
-            }])
-            arg_results = evaluate_dataframe(arg_df, [hallucination_evaluator])
-            res_row = arg_results.iloc[0]
-            
-            is_factual = res_row.hallucination_score['label'] == 'factual'
-            score.argument_correctness = 1.0 if is_factual else 0.0
-            if 'explanation' in res_row and res_row['explanation']:
-              score.notes.append(f"argument_analysis={res_row['explanation']}")
-          except Exception as exc:
-            score.argument_correctness = self._fallback_task_completion(record)
-            score.notes.append(f"argument_correctness_fallback={repr(exc)}")
-          #score.argument_correctness = compute_argument_correctness(record)
-          
-        except Exception as exc:
-          score.tool_correctness = None
-          score.task_completion = self._fallback_task_completion(record)
-          score.notes.append(f"phoenix_eval_failed={repr(exc)}")  
-            
-        score.policy_violations = count_policy_violations(record)
-        
-        score.passed = (
-          (score.tool_correctness is None or score.tool_correctness >= 0.5) and 
-          (score.task_completion is None or score.task_completion >= 0.5) and
-          score.policy_violations == 0
-        )
-            
-        return score
-
-    def score_records(self, records: List[AgentEvalRecord]) -> Tuple[List[AgentPerCaseScore], Dict[str, Any]]:
-        scores = [self.score_record(record) for record in records]
-
-        return scores, {
-            "metricNames": [
-                "tool_correctness",
-                "task_completion",
-                "argument_correctness",
                 "policy_violations",
             ]
         }
@@ -1401,9 +1234,9 @@ def aggregate_scores(per_case: List[AgentPerCaseScore]) -> AgentAggregatedScores
         total_cases=len(per_case),
         passed_cases=sum(1 for x in per_case if x.passed),
 
-        tool_correctness_avg=mean([x.tool_correctness for x in per_case]),
-        task_completion_avg=mean([x.task_completion for x in per_case]),
-        argument_correctness_avg=mean([x.argument_correctness for x in per_case]),
+        tool_selection_avg=mean([x.tool_selection for x in per_case]),
+        tool_invocation_avg=mean([x.tool_invocation for x in per_case]),
+        tool_execution_avg=mean([x.tool_execution for x in per_case]),
 
         policy_violations_total=sum(x.policy_violations for x in per_case),
         latency_ms_avg=mean([x.latency_ms for x in per_case]),
@@ -1415,25 +1248,25 @@ def mark_per_case_pass_fail(cfg: RunnerConfig, per_case: List[AgentPerCaseScore]
         notes: List[str] = []
         passed = True
 
-        if cfg.thresholds.min_tool_correctness is not None and score.tool_correctness is not None:
-            if score.tool_correctness < cfg.thresholds.min_tool_correctness:
+        if cfg.thresholds.min_tool_selection is not None and score.tool_selection is not None:
+            if score.tool_selection < cfg.thresholds.min_tool_selection:
                 passed = False
                 notes.append(
-                    f"tool_correctness={score.tool_correctness:.4f} < minToolCorrectness={cfg.thresholds.min_tool_correctness:.4f}"
+                    f"tool_selection={score.tool_selection:.4f} < minToolSelection={cfg.thresholds.min_tool_selection:.4f}"
                 )
 
-        if cfg.thresholds.min_task_completion is not None and score.task_completion is not None:
-            if score.task_completion < cfg.thresholds.min_task_completion:
+        if cfg.thresholds.min_tool_invocation is not None and score.tool_invocation is not None:
+            if score.tool_invocation < cfg.thresholds.min_tool_invocation:
                 passed = False
                 notes.append(
-                    f"task_completion={score.task_completion:.4f} < minTaskCompletion={cfg.thresholds.min_task_completion:.4f}"
+                    f"tool_invocation={score.tool_invocation:.4f} < minToolInvocation={cfg.thresholds.min_tool_invocation:.4f}"
                 )
 
-        if cfg.thresholds.min_argument_correctness is not None and score.argument_correctness is not None:
-            if score.argument_correctness < cfg.thresholds.min_argument_correctness:
+        if cfg.thresholds.min_tool_execution is not None and score.tool_execution is not None:
+            if score.tool_execution < cfg.thresholds.min_tool_execution:
                 passed = False
                 notes.append(
-                    f"argument_correctness={score.argument_correctness:.4f} < minArgumentCorrectness={cfg.thresholds.min_argument_correctness:.4f}"
+                    f"tool_execution={score.tool_execution:.4f} < minToolExecution={cfg.thresholds.min_tool_execution:.4f}"
                 )
 
         if cfg.thresholds.max_policy_violations is not None:
@@ -1465,33 +1298,33 @@ def apply_threshold_policy(
             }
             notes.append(root_cause["details"])
 
-    if not failed and cfg.thresholds.min_tool_correctness is not None and agg.tool_correctness_avg is not None:
-        if agg.tool_correctness_avg < cfg.thresholds.min_tool_correctness:
+    if not failed and cfg.thresholds.min_tool_selection is not None and agg.tool_selection_avg is not None:
+        if agg.tool_selection_avg < cfg.thresholds.min_tool_selection:
             failed = True
             root_cause = {
-                "stage": "ToolSelection",
-                "metric": "tool_correctness",
-                "details": f"tool_correctness_avg={agg.tool_correctness_avg:.4f} < minToolCorrectness={cfg.thresholds.min_tool_correctness:.4f}",
+                "stage": "Tool Selection",
+                "metric": "tool_selection",
+                "details": f"tool_selection_avg={agg.tool_selection_avg:.4f} < minToolSelection={cfg.thresholds.min_tool_selection:.4f}",
             }
             notes.append(root_cause["details"])
 
-    if not failed and cfg.thresholds.min_argument_correctness is not None and agg.argument_correctness_avg is not None:
-        if agg.argument_correctness_avg < cfg.thresholds.min_argument_correctness:
+    if not failed and cfg.thresholds.min_tool_execution is not None and agg.tool_execution_avg is not None:
+        if agg.tool_execution_avg < cfg.thresholds.min_tool_execution:
             failed = True
             root_cause = {
-                "stage": "ToolArguments",
-                "metric": "argument_correctness",
-                "details": f"argument_correctness_avg={agg.argument_correctness_avg:.4f} < minArgumentCorrectness={cfg.thresholds.min_argument_correctness:.4f}",
+                "stage": "Tool Execution",
+                "metric": "tool_execution",
+                "details": f"tool_execution_avg={agg.tool_execution_avg:.4f} < minToolExecution={cfg.thresholds.min_tool_execution:.4f}",
             }
             notes.append(root_cause["details"])
 
-    if not failed and cfg.thresholds.min_task_completion is not None and agg.task_completion_avg is not None:
-        if agg.task_completion_avg < cfg.thresholds.min_task_completion:
+    if not failed and cfg.thresholds.min_tool_invocation is not None and agg.tool_invocation_avg is not None:
+        if agg.tool_invocation_avg < cfg.thresholds.min_tool_invocation:
             failed = True
             root_cause = {
-                "stage": "Outcome",
-                "metric": "task_completion",
-                "details": f"task_completion_avg={agg.task_completion_avg:.4f} < minTaskCompletion={cfg.thresholds.min_task_completion:.4f}",
+                "stage": "Tool Invocation",
+                "metric": "tool_invocation",
+                "details": f"tool_invocation_avg={agg.tool_invocation_avg:.4f} < minToolInvocation={cfg.thresholds.min_tool_invocation:.4f}",
             }
             notes.append(root_cause["details"])
 
@@ -1691,7 +1524,6 @@ async def main() -> int:
             record = call_agent_endpoint(cfg, case)
             records.append(record)
         
-        #adapter = DeepEvalAgentAdapter(model=cfg.llm_model, llm=base_llm)
         adapter = PhoenixAgentAdapter(model=cfg.llm_model, llm=base_llm)
         per_case_scores, deepeval_meta = adapter.score_records(records)
 
