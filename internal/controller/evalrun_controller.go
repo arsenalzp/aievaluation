@@ -61,12 +61,13 @@ type gateSummaryJSON struct {
 }
 
 type suiteAgentConfigJSON struct {
-	Type    string `json:"type,omitempty"`
 	Metrics struct {
-		MinToolSelection    *float32 `json:"minToolSelection,omitempty"`
-		MinToolInvocation   *float32 `json:"minToolInvocation,omitempty"`
-		MinToolExecution    *float32 `json:"minToolExecution,omitempty"`
-		MaxPolicyViolations *int32   `json:"maxPolicyViolations,omitempty"`
+		Agent struct {
+			MinToolSelection    *float32 `json:"minToolSelection,omitempty"`
+			MinToolInvocation   *float32 `json:"minToolInvocation,omitempty"`
+			MinToolExecution    *float32 `json:"minToolExecution,omitempty"`
+			MaxPolicyViolations *int32   `json:"maxPolicyViolations,omitempty"`
+		} `json:"agent,omitempty"`
 	} `json:"metrics,omitempty"`
 	RegressionPolicy struct {
 		MaxDrop *float32 `json:"maxDrop,omitempty"`
@@ -78,21 +79,22 @@ type suiteAgentConfigJSON struct {
 }
 
 type suiteConfigJSON struct {
-	Type    string `json:"type,omitempty"`
 	Metrics struct {
-		Retrieval struct {
-			MinContextRecall    *float32 `json:"minContextRecall,omitempty"`
-			MinContextPrecision *float32 `json:"minContextPrecision,omitempty"`
-		} `json:"retrieval,omitempty"`
-		Generation struct {
-			MinFaithfulness *float32 `json:"minFaithfulness,omitempty"`
-			MinCorrectness  *float32 `json:"minCorrectness,omitempty"`
-			MinRelevancy    *float32 `json:"minRelevancy,omitempty"`
-		} `json:"generation,omitempty"`
-		Trustworthiness struct {
-			MaxStaleChunkRatio   *float32 `json:"maxStaleChunkRatio,omitempty"`
-			MaxUnknownOwnerRatio *float32 `json:"maxUnknownOwnerRatio,omitempty"`
-		} `json:"trustworthiness,omitempty"`
+		Rag struct {
+			Retrieval struct {
+				MinContextRecall    *float32 `json:"minContextRecall,omitempty"`
+				MinContextPrecision *float32 `json:"minContextPrecision,omitempty"`
+			} `json:"retrieval,omitempty"`
+			Generation struct {
+				MinFaithfulness *float32 `json:"minFaithfulness,omitempty"`
+				MinCorrectness  *float32 `json:"minCorrectness,omitempty"`
+				MinRelevancy    *float32 `json:"minRelevancy,omitempty"`
+			} `json:"generation,omitempty"`
+			Trustworthiness struct {
+				MaxStaleChunkRatio   *float32 `json:"maxStaleChunkRatio,omitempty"`
+				MaxUnknownOwnerRatio *float32 `json:"maxUnknownOwnerRatio,omitempty"`
+			} `json:"trustworthiness,omitempty"`
+		} `json:"rag,omitempty"`
 	} `json:"metrics,omitempty"`
 
 	RegressionPolicy struct {
@@ -515,46 +517,42 @@ func buildEvalJob(
 
 // A render from EvalSuite.Spec to suite.json
 func renderSuiteConfigJSON(suite *aieval.EvalSuite) ([]byte, error) {
-	if suite.Spec.Mode == "agent" {
+	if suite.Spec.Metrics.Agent != nil {
 		var cfg suiteAgentConfigJSON
-		cfg.Type = "agent"
 		// Agent metrics
-		cfg.Metrics.MaxPolicyViolations = suite.Spec.MaxPolicyViolations
-		cfg.Metrics.MinToolSelection = suite.Spec.MinToolSelection
-		cfg.Metrics.MinToolInvocation = suite.Spec.MinToolInvocation
-		cfg.Metrics.MinToolExecution = suite.Spec.MinToolExecution
+		cfg.Metrics.Agent.MaxPolicyViolations = suite.Spec.MaxPolicyViolations
+		cfg.Metrics.Agent.MinToolSelection = suite.Spec.MinToolSelection
+		cfg.Metrics.Agent.MinToolInvocation = suite.Spec.MinToolInvocation
+		cfg.Metrics.Agent.MinToolExecution = suite.Spec.MinToolExecution
 
 		// RegressionPolicy
 		cfg.RegressionPolicy.MaxDrop = suite.Spec.RegressionPolicy.MaxDrop
 
-		// Execution
-		cfg.Execution.Mode = suite.Spec.Execution.Mode
+		cfg.Execution.TimeoutSeconds = suite.Spec.Execution.TimeoutSeconds
+
+		return json.MarshalIndent(cfg, "", "  ")
+	} else if suite.Spec.Metrics.Rag != nil {
+		var cfg suiteConfigJSON
+		// Metrics
+		cfg.Metrics.Rag.Retrieval.MinContextRecall = suite.Spec.Metrics.MinContextRecall
+		cfg.Metrics.Rag.Retrieval.MinContextPrecision = suite.Spec.Metrics.MinContextPrecision
+
+		cfg.Metrics.Rag.Generation.MinFaithfulness = suite.Spec.Metrics.MinFaithfulness
+		cfg.Metrics.Rag.Generation.MinCorrectness = suite.Spec.Metrics.MinCorrectness
+		cfg.Metrics.Rag.Generation.MinRelevancy = suite.Spec.Metrics.MinRelevancy
+
+		cfg.Metrics.Rag.Trustworthiness.MaxStaleChunkRatio = suite.Spec.Metrics.MaxStaleChunkRatio
+		cfg.Metrics.Rag.Trustworthiness.MaxUnknownOwnerRatio = suite.Spec.Metrics.MaxUnknownOwnerRatio
+
+		// RegressionPolicy
+		cfg.RegressionPolicy.MaxDrop = suite.Spec.RegressionPolicy.MaxDrop
+
 		cfg.Execution.TimeoutSeconds = suite.Spec.Execution.TimeoutSeconds
 
 		return json.MarshalIndent(cfg, "", "  ")
 	}
 
-	var cfg suiteConfigJSON
-	// Metrics
-	cfg.Type = "rag"
-	cfg.Metrics.Retrieval.MinContextRecall = suite.Spec.Metrics.MinContextRecall
-	cfg.Metrics.Retrieval.MinContextPrecision = suite.Spec.Metrics.MinContextPrecision
-
-	cfg.Metrics.Generation.MinFaithfulness = suite.Spec.Metrics.MinFaithfulness
-	cfg.Metrics.Generation.MinCorrectness = suite.Spec.Metrics.MinCorrectness
-	cfg.Metrics.Generation.MinRelevancy = suite.Spec.Metrics.MinRelevancy
-
-	cfg.Metrics.Trustworthiness.MaxStaleChunkRatio = suite.Spec.Metrics.MaxStaleChunkRatio
-	cfg.Metrics.Trustworthiness.MaxUnknownOwnerRatio = suite.Spec.Metrics.MaxUnknownOwnerRatio
-
-	// RegressionPolicy
-	cfg.RegressionPolicy.MaxDrop = suite.Spec.RegressionPolicy.MaxDrop
-
-	// Execution
-	cfg.Execution.Mode = suite.Spec.Execution.Mode
-	cfg.Execution.TimeoutSeconds = suite.Spec.Execution.TimeoutSeconds
-
-	return json.MarshalIndent(cfg, "", "  ")
+	return nil, nil
 }
 
 func suiteConfigMapName(suiteName, suiteHash string) string {

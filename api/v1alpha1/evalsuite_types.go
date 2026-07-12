@@ -68,9 +68,9 @@ type Rag struct {
 
 type Metrics struct {
 	// +kubebuilder:validation:Optional
-	Agent `json:"agent,omitempty"`
+	*Agent `json:"agent,omitempty"`
 	// +kubebuilder:validation:Optional
-	Rag `json:"rag,omitempty"`
+	*Rag `json:"rag,omitempty"`
 }
 
 type RegressionPolicy struct {

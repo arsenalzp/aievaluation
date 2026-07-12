@@ -218,9 +218,10 @@ def build_runner_config() -> RunnerConfig:
     suite = load_suite_config(suite_config_path)
 
     metrics = suite.get("metrics", {})
-    retrieval = metrics.get("retrieval", {})
-    generation = metrics.get("generation", {})
-    trust = metrics.get("trustworthiness", {})
+    rag_metrics = metrics.get("rag", {})
+    retrieval = rag_metrics.get("retrieval", {})
+    generation = rag_metrics.get("generation", {})
+    trust = rag_metrics.get("trustworthiness", {})
     regression = suite.get("regressionPolicy", {})
     execution = suite.get("execution", {})
 

@@ -252,6 +252,8 @@ def build_runner_config() -> RunnerConfig:
         min_tool_invocation=safe_float(agent_metrics.get("minToolInvocation")),
         max_policy_violations=safe_int(policy_metrics.get("maxPolicyViolations"), default=0),
     )
+    
+    print(f"thresholds={thresholds}")
 
     trace = TraceConfig(
         mode=trace_cfg.get("mode", "inline"),
@@ -1247,34 +1249,62 @@ def mark_per_case_pass_fail(cfg: RunnerConfig, per_case: List[AgentPerCaseScore]
     for score in per_case:
         notes: List[str] = []
         passed = True
-
-        if cfg.thresholds.min_tool_selection is not None and score.tool_selection is not None:
+        print(f"cfg.thresholds.min_tool_selection={cfg.thresholds.min_tool_selection}, score.tool_selection={score.tool_selection}")
+        print(f"cfg.thresholds.min_tool_invocation={cfg.thresholds.min_tool_invocation}, score.tool_invocation={score.tool_invocation}")
+        print(f"cfg.thresholds.min_tool_execution={cfg.thresholds.min_tool_execution}, score.tool_execution={score.tool_execution}")
+        print(f"cfg.thresholds.max_policy_violations={cfg.thresholds.max_policy_violations}, score.policy_violations={score.policy_violations}")
+        
+        if cfg.thresholds.min_tool_selection is not None:
+          if score.tool_selection is not None:
             if score.tool_selection < cfg.thresholds.min_tool_selection:
                 passed = False
                 notes.append(
                     f"tool_selection={score.tool_selection:.4f} < minToolSelection={cfg.thresholds.min_tool_selection:.4f}"
                 )
+          else:
+            passed = False
+            notes.append(
+              f"min_tool_selection thresholds was assigned, but assessment score was not received from the evaluator"
+            )
 
-        if cfg.thresholds.min_tool_invocation is not None and score.tool_invocation is not None:
+        if cfg.thresholds.min_tool_invocation is not None: 
+          if score.tool_invocation is not None:
             if score.tool_invocation < cfg.thresholds.min_tool_invocation:
                 passed = False
                 notes.append(
                     f"tool_invocation={score.tool_invocation:.4f} < minToolInvocation={cfg.thresholds.min_tool_invocation:.4f}"
                 )
-
-        if cfg.thresholds.min_tool_execution is not None and score.tool_execution is not None:
+          else:
+            passed = False
+            notes.append(
+              f"min_tool_invocation thresholds was assigned, but assessment score was not received from the evaluator"
+            )
+            
+        if cfg.thresholds.min_tool_execution is not None: 
+          if score.tool_execution is not None:
             if score.tool_execution < cfg.thresholds.min_tool_execution:
                 passed = False
                 notes.append(
                     f"tool_execution={score.tool_execution:.4f} < minToolExecution={cfg.thresholds.min_tool_execution:.4f}"
                 )
-
+          else:
+            passed = False
+            notes.append(
+              f"min_tool_execution thresholds was assigned, but assessment score was not received from the evaluator"
+            )
+            
         if cfg.thresholds.max_policy_violations is not None:
+          if score.policy_violations is not None:
             if score.policy_violations > cfg.thresholds.max_policy_violations:
                 passed = False
                 notes.append(
                     f"policy_violations={score.policy_violations} > maxPolicyViolations={cfg.thresholds.max_policy_violations}"
                 )
+          else:
+            passed = False
+            notes.append(
+              f"policy_violations thresholds was assigned, but assessment score was not received from the evaluator"
+            )
 
         score.passed = passed
         score.notes.extend(notes)

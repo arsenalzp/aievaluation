@@ -123,7 +123,7 @@ func testEvalSuite(name string) *aieval.EvalSuite {
 				Name: "dataset-1",
 			},
 			Metrics: aieval.Metrics{
-				Rag: aieval.Rag{
+				Rag: &aieval.Rag{
 					Retrieval: aieval.Retrieval{
 						MinContextRecall:    &minRecall,
 						MinContextPrecision: &minPrecision,
