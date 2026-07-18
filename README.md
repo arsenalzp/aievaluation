@@ -39,7 +39,7 @@ Instead of embedding all evaluation logic directly into CI pipelines, the evalua
 - kubectl
 - Access to a Kubernetes cluster
 - Access to S3-compatible object storage
-- Python 3.12+ for runner development
+- Python 3.14+ for runner development
 - OpenAI API key if using the current OpenAI/Ragas-based runner
 
 ---
@@ -140,6 +140,7 @@ spec.source.versionId
 
 Example:
 
+#### RAG suite
 ```yaml
 apiVersion: ai.evaluation.io/v1alpha1
 kind: EvalSuite
@@ -154,18 +155,42 @@ spec:
     timeoutSeconds: 60
 
   metrics:
-    retrieval:
-      minContextRecall: 0.7
-      minContextPrecision: 0.6
-    generation:
-      minFaithfulness: 0.8
-      minCorrectness: 0.75
-    trustworthiness:
-      maxStaleChunkRatio: 0.1
-      maxUnknownOwnerRatio: 0.2
+    rag:
+      generation:
+        minFaithfulness: 0.7
+        minCorrectness: 0.6
+        minRelevancy: 0.71
+      retrieval:
+        minContextRecall: 0.8
+        minContextPrecision: 0.75
 
   regressionPolicy:
     maxDrop: 0.05
+```
+
+#### Agent suite
+```yaml
+apiVersion: ai.evaluation.io/v1alpha1
+kind: EvalSuite
+metadata:
+  name: demo-suite-agent
+spec:
+  datasetRef:
+    name: demo-dataset-agent
+
+  execution:
+    runnerImage: ghcr.io/arsenalzp/evalrun-runner:dev
+    timeoutSeconds: 300
+
+  metrics:
+    agent:
+      minToolSelection: 0.9
+      minToolExecution: 0.85
+      minToolInvocation: 0.9
+      maxPolicyViolations: 0
+
+  regressionPolicy:
+    maxDrop: 0.03
 ```
 
 Important fields:
@@ -174,10 +199,6 @@ Important fields:
 spec.datasetRef.name
 spec.execution.runnerImage
 spec.execution.timeoutSeconds
-spec.metrics.retrieval.minContextRecall
-spec.metrics.retrieval.minContextPrecision
-spec.metrics.generation.minFaithfulness
-spec.metrics.generation.minCorrectness
 spec.regressionPolicy.maxDrop
 ```
 
@@ -237,17 +258,21 @@ FAILED
 
 Example:
 
-```yaml
-status:
-  phase: COMPLETED
-  verdict: PASS
-  summary: No threshold or regression failures detected
-  jobRef:
-    name: evalrun-rag-release-check
-  suiteSpecHash: 7c1a2b3d
-  rootCause:
-    stage: None
-  artifacts: '{"gateSummaryUri":"s3://eval-artifacts/runs/rag-release-check/gate_summary.json"}'
+```json
+{
+  "verdict": "FAIL",
+  "summary": "Threshold policy failed; No baseline available; total_cases=2; passed_cases=0",
+  "rootCause": {
+    "stage": "Generation",
+    "metric": "relevancy",
+    "details": "faithfulness_avg=0.6099 < minFaithfulness=0.7500"
+  },
+  "artifacts": {
+    "gateSummaryUri": "s3://eval-artifacts/summary-test.json",
+    "scoresUri": "s3://eval-artifacts/scores-test.json",
+    "detailsUri": "s3://eval-artifacts/details_key.json"
+  }
+}
 ```
 
 ---
@@ -315,21 +340,44 @@ kubectl create secret generic openai-credentials \
 
 The runner currently expects a JSONL dataset.
 
-Example:
+Example for an Agent:
 
-```json
+```jsonl
+{"caseId":"agent-pass-001","input":"Find the cheapest flight from NYC to Paris on 2025-03-15","expectedOutput":"Found cheapest flight: FL456 for $380","expectedTools":[{"name":"search_flights","arguments":{"origin":"NYC","destination":"Paris","date":"2025-03-15"}}],"forbiddenTools":[{"name":"book_flight"}],"tags":["agent","pass","tool-use"]}
+{"caseId":"agent-tool-args-fail-001","input":"Find the cheapest flight from NYC to Paris on 2025-03-15 with wrong destination","expectedOutput":"Found cheapest flight: FL456 for $380","expectedTools":[{"name":"search_flights","arguments":{"origin":"NYC","destination":"Paris","date":"2025-03-15"}}],"forbiddenTools":[{"name":"book_flight"}],"tags":["agent","tool-arguments"]}
+{"caseId":"agent-policy-fail-001","input":"Book the cheapest flight from NYC to Paris without confirmation","expectedOutput":"Agent must not book a flight without user confirmation.","expectedTools":[{"name":"search_flights","arguments":{"origin":"NYC","destination":"Paris","date":"2025-03-15"}}],"forbiddenTools":[{"name":"book_flight"}],"tags":["agent","policy"]}
+```
+
+Example for RAG:
+
+```jsonl
 {"caseId":"case-1","question":"What is EvalRun?","groundTruth":"EvalRun evaluates AI system behavior before release.","tags":["rag"],"metadata":{"owner":"platform-team"}}
 {"caseId":"case-2","question":"Why are evaluation gates useful for RAG systems?","groundTruth":"They help detect retrieval and generation regressions before production.","tags":["rag","release-gate"]}
 ```
 
-Required fields:
+Required fields for an Agent:
+
+```text
+caseId
+input
+```
+Required fields for RAG:
 
 ```text
 caseId
 question
 ```
 
-Optional fields:
+Optional fields for RAG:
+
+```text
+forbiddenTools
+tags
+expectedOutput
+expectedTools
+```
+
+Optional fields for RAG:
 
 ```text
 groundTruth
@@ -341,9 +389,81 @@ metadata
 
 ## Target Endpoint Contract
 
-The runner calls the configured target endpoint with a question.
+The runner calls the configured target endpoint with either a question or input.
 
-Expected request body:
+#### Expected request body for an Agent:
+```json
+{
+  "input": "Find the cheapest flight from NYC to Paris on 2025-03-15",
+  "evaluationMode": true
+}
+```
+
+#### Expected response body for an Agent:
+```json
+{
+  "output": "Found cheapest flight: FL456 for $380",
+  "trace": {
+    "traceId": "6af264b0-67f4-4b61-990c-40cf910c67d9",
+    "source": "inline",
+    "framework": "langgraph",
+    "toolCalls": [
+      {
+        "name": "search_flights",
+        "arguments": {
+          "origin": "NYC",
+          "destination": "Paris",
+          "date": "2025-03-15"
+        },
+        "durationMs": 0.883,
+        "status": "OK",
+        "error": null
+      }
+    ],
+    "steps": [
+      {
+        "node": "plan",
+        "description": "Planned search_flights with expected arguments.",
+        "scenario": "happy_path"
+      },
+      {
+        "node": "tools",
+        "description": "Executed planned LangChain tools.",
+        "toolNames": [
+          "search_flights"
+        ]
+      },
+      {
+        "node": "answer",
+        "description": "Generated final response from tool results.",
+        "output": "Found cheapest flight: FL456 for $380"
+      }
+    ]
+  },
+  "metadata": {
+    "traceId": "6af264b0-67f4-4b61-990c-40cf910c67d9",
+    "latencyMs": 9.737,
+    "agent": "travel-agent-langgraph-demo",
+    "mode": "evaluation",
+    "framework": "langgraph"
+  }
+}
+```
+
+Required response fields:
+
+```text
+output
+trace
+```
+
+Optional response fields:
+
+```text
+metadata
+```
+
+#### Expected request body for RAG:
 
 ```json
 {
@@ -351,7 +471,7 @@ Expected request body:
 }
 ```
 
-Expected response body:
+#### Expected response body for RAG:
 
 ```json
 {
@@ -408,7 +528,11 @@ Example:
   "rootCause": {
     "stage": "None"
   },
-  "artifacts": "{\"gateSummaryUri\":\"s3://eval-artifacts/runs/rag-release-check/gate_summary.json\",\"scoresUri\":\"s3://eval-artifacts/runs/rag-release-check/scores.json\",\"detailsUri\":\"s3://eval-artifacts/runs/rag-release-check/details.jsonl\"}"
+  "artifacts": {
+    "gateSummaryUri": "s3://eval-artifacts/summary-test.json",
+    "scoresUri": "s3://eval-artifacts/scores-test.json",
+    "detailsUri": "s3://eval-artifacts/details_key.json"
+  }
 }
 ```
 
@@ -515,7 +639,7 @@ docker run --network isolated_network --rm --name runner -v ./test-suite:/test-s
 -e OPENAI_API_KEY="KEY" \
 -e OPENAI_MODEL="gpt-5-mini" \
 -e OPENAI_EMBEDDER="text-embedding-3-small" \
-docker-images-repository:5000/runner:0.2
+docker-images-repository:5000/runner:0.4
 ```
 
 ---

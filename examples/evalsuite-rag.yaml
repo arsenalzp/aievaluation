@@ -1,0 +1,21 @@
+apiVersion: ai.evaluation.io/v1alpha1
+kind: EvalSuite
+metadata:
+  name: demo-suite-rag
+spec:
+  datasetRef:
+    name: demo-dataset
+  regressionPolicy:
+    maxDrop: 0.03
+  metrics:
+    rag:
+     generation:
+       minFaithfulness: 0.70
+       minCorrectness: 0.69
+       minRelevancy: 0.71
+     retrieval:
+       minContextRecall: 0.70
+       minContextPrecision: 0.65
+  execution:
+    runnerImage: "k8s:5000/runner:v0.6"
+    timeoutSeconds: 300

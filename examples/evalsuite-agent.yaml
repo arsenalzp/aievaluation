@@ -1,0 +1,18 @@
+apiVersion: ai.evaluation.io/v1alpha1
+kind: EvalSuite
+metadata:
+  name: demo-suite-agent
+spec:
+  datasetRef:
+    name: demo-dataset
+  regressionPolicy:
+    maxDrop: 0.03
+  metrics:
+    agent:
+      minToolSelection: 0.9
+      minToolExecution: 0.85
+      minToolInvocation: 0.9
+      maxPolicyViolations: 0
+  execution:
+    runnerImage: "k8s:5000/runner-agent:v0.3"
+    timeoutSeconds: 300
