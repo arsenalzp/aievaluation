@@ -23,7 +23,6 @@ from ragas.llms import llm_factory
 from ragas.embeddings import OpenAIEmbeddings
 from ragas import experiment, EvaluationDataset, SingleTurnSample
 from sqlalchemy.engine import row
-from pickle import TRUE
 
 # answer_correctness may not exist in some ragas versions
 # try:
@@ -618,18 +617,12 @@ def mark_per_case_pass_fail(cfg: RunnerConfig, per_case: List[PerCaseScore]) -> 
                     f"faithfulness={score.faithfulness:.4f} < minFaithfulness={cfg.thresholds.min_faithfulness:.4f}"
                 )
 
-        # Prefer answer_correctness if available, else use answer_relevancy as fallback proxy
-        effective_correctness = score.answer_correctness
-        correctness_metric_name = "answer_correctness"
-        if effective_correctness is None:
-            effective_correctness = score.answer_relevancy
-            correctness_metric_name = "answer_relevancy"
-        
-        if cfg.thresholds.min_correctness is not None and effective_correctness is not None:
-            if effective_correctness < cfg.thresholds.min_correctness:
+
+        if cfg.thresholds.min_correctness is not None and score.answer_correctness is not None:
+            if score.answer_correctness < cfg.thresholds.min_correctness:
                 passed = False
                 notes.append(
-                    f"{correctness_metric_name}={effective_correctness:.4f} < minCorrectness={cfg.thresholds.min_correctness:.4f}"
+                    f"answer_correctness={score.answer_correctness:.4f} < minCorrectness={cfg.thresholds.min_correctness:.4f}"
                 )
                 
         if cfg.thresholds.min_relevancy is not None and score.answer_relevancy is not None:
@@ -664,51 +657,46 @@ def apply_threshold_policy(cfg: RunnerConfig, agg: AggregatedScores) -> Tuple[bo
 
     # Retrieval stage checks
     if cfg.thresholds.min_context_recall is not None and agg.context_recall_avg is not None:
-        if agg.context_recall_avg < cfg.thresholds.min_context_recall:
-            failed = True
-            root_cause = {
-                "stage": "Retrieval",
-                "metric": "context_recall",
-                "details": f"context_recall_avg={agg.context_recall_avg:.4f} < minContextRecall={cfg.thresholds.min_context_recall:.4f}",
-            }
-            notes.append(root_cause["details"])
+      if agg.context_recall_avg < cfg.thresholds.min_context_recall:
+        failed = True
+        root_cause = {
+          "stage": "Retrieval",
+          "metric": "context_recall",
+          "details": f"context_recall_avg={agg.context_recall_avg:.4f} < minContextRecall={cfg.thresholds.min_context_recall:.4f}",
+        }
+        notes.append(root_cause["details"])
 
     if not failed and cfg.thresholds.min_context_precision is not None and agg.context_precision_avg is not None:
-        if agg.context_precision_avg < cfg.thresholds.min_context_precision:
-            failed = True
-            root_cause = {
-                "stage": "Retrieval",
-                "metric": "context_precision",
-                "details": f"context_precision_avg={agg.context_precision_avg:.4f} < minContextPrecision={cfg.thresholds.min_context_precision:.4f}",
-            }
-            notes.append(root_cause["details"])
+      if agg.context_precision_avg < cfg.thresholds.min_context_precision:
+        failed = True
+        root_cause = {
+          "stage": "Retrieval",
+          "metric": "context_precision",
+          "details": f"context_precision_avg={agg.context_precision_avg:.4f} < minContextPrecision={cfg.thresholds.min_context_precision:.4f}",
+        }
+        notes.append(root_cause["details"])
 
     # Generation stage checks
     if not failed and cfg.thresholds.min_faithfulness is not None and agg.faithfulness_avg is not None:
-        if agg.faithfulness_avg < cfg.thresholds.min_faithfulness:
-            failed = True
-            root_cause = {
-                "stage": "Generation",
-                "metric": "faithfulness",
-                "details": f"faithfulness_avg={agg.faithfulness_avg:.4f} < minFaithfulness={cfg.thresholds.min_faithfulness:.4f}",
-            }
-            notes.append(root_cause["details"])
+      if agg.faithfulness_avg < cfg.thresholds.min_faithfulness:
+        failed = True
+        root_cause = {
+          "stage": "Generation",
+          "metric": "faithfulness",
+          "details": f"faithfulness_avg={agg.faithfulness_avg:.4f} < minFaithfulness={cfg.thresholds.min_faithfulness:.4f}",
+        }
+        notes.append(root_cause["details"])
 
-    effective_correctness_avg = agg.answer_correctness_avg
-    correctness_metric_name = "answer_correctness_avg"
-    if effective_correctness_avg is None:
-        effective_correctness_avg = agg.answer_relevancy_avg
-        correctness_metric_name = "answer_relevancy_avg"
 
-    if not failed and cfg.thresholds.min_correctness is not None and effective_correctness_avg is not None:
-        if effective_correctness_avg < cfg.thresholds.min_correctness:
-            failed = True
-            root_cause = {
-                "stage": "Generation",
-                "metric": correctness_metric_name,
-                "details": f"{correctness_metric_name}={effective_correctness_avg:.4f} < minCorrectness={cfg.thresholds.min_correctness:.4f}",
-            }
-            notes.append(root_cause["details"])
+    if not failed and cfg.thresholds.min_correctness is not None and agg.answer_correctness_avg is not None:
+      if agg.answer_correctness_avg < cfg.thresholds.min_correctness:
+        failed = True
+        root_cause = {
+          "stage": "Generation",
+          "metric": "correctness",
+          "details": f"answer_correctness_avg={agg.answer_correctness_avg:.4f} < minCorrectness={cfg.thresholds.min_correctness:.4f}",
+        }
+        notes.append(root_cause["details"])
       
     if not failed and cfg.thresholds.min_relevancy is not None and agg.answer_relevancy_avg is not None:
       if agg.answer_relevancy_avg < cfg.thresholds.min_relevancy:
@@ -716,8 +704,9 @@ def apply_threshold_policy(cfg: RunnerConfig, agg: AggregatedScores) -> Tuple[bo
         root_cause = {
           "stage": "Generation",
           "metric": "relevancy",
-          "details": f"faithfulness_avg={agg.answer_relevancy_avg:.4f} < minFaithfulness={cfg.thresholds.min_relevancy:.4f}",
+          "details": f"answer_relevancy_avg={agg.answer_relevancy_avg:.4f} < minFaithfulness={cfg.thresholds.min_relevancy:.4f}",
         }
+        notes.append(root_cause["details"])
 
     return failed, root_cause, notes
 
