@@ -1,8 +1,8 @@
- # ai-eval
+ # EvalRun
 
 Kubernetes-native evaluation control plane for RAG and AI Agent systems.
 
-`ai-eval` provides Custom Resources and a Kubernetes controller for running AI evaluation workflows as part of a delivery pipeline. It is designed for platform teams that need release gates for RAG and agentic AI workloads before production deployment.
+`EvalRun` provides Custom Resources and a Kubernetes controller for running AI evaluation workflows as part of a delivery pipeline. It is designed for platform teams that need release gates for RAG and agentic AI workloads before production deployment.
 
 > **Status:** early development. CRD schemas, runner contract, configuration format, and artifact schemas may change.
 
@@ -20,7 +20,7 @@ A service can pass unit tests, integration tests, and smoke tests, but still fai
 - evaluation logic is hidden inside ad-hoc CI scripts;
 - evaluation results are not stored as reusable, machine-readable artifacts.
 
-`ai-eval` turns AI evaluation into a Kubernetes API-driven workflow:
+`EvalRun` turns AI evaluation into a Kubernetes API-driven workflow:
 
 ```text
 EvalDataset -> EvalSuite -> EvalRun -> Kubernetes Job -> Runner -> Artifacts -> EvalRun.status
@@ -35,6 +35,7 @@ Instead of embedding all evaluation logic directly into CI pipelines, the evalua
 ### Prerequisites
 
 - Go v1.24.0+
+- Helm v3.19.0+
 - Docker or another compatible container tool
 - kubectl
 - Access to a Kubernetes cluster
@@ -42,11 +43,24 @@ Instead of embedding all evaluation logic directly into CI pipelines, the evalua
 - Python 3.14+ for runner development
 - OpenAI API key if using the current OpenAI/Ragas-based runner
 
+### Quickstart guide
+
+The installation with Helm is pretty simple:
+
+```sh
+helm install evalrun-operator \
+--set 'manager.image.repository=quay.io/arsenalzp/evalrun-controller' \
+--set 'manager.image.tag=1.0.1' \
+--set 'rbacHelpers.enable=true' ./helm/chart
+```
+
+After that is it necessary to create all CRDs as descibed below.
+
 ---
 
 ## Architecture
 
-`ai-eval` currently consists of two runtime components:
+`EvalRun` currently consists of two runtime components:
 
 1. **Operator / Controller**
    - Written in Go.
