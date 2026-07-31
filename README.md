@@ -35,12 +35,26 @@ Instead of embedding all evaluation logic directly into CI pipelines, the evalua
 ### Prerequisites
 
 - Go v1.24.0+
+- Helm v3.19.0+
 - Docker or another compatible container tool
 - kubectl
 - Access to a Kubernetes cluster
 - Access to S3-compatible object storage
 - Python 3.14+ for runner development
 - OpenAI API key if using the current OpenAI/Ragas-based runner
+
+### Quickstart guide
+
+The installation with Helm is pretty simple:
+
+```sh
+helm install evalrun-operator \
+--set 'manager.image.repository=quay.io/arsenalzp/ai-eval-operator' \
+--set 'manager.image.tag=0.0.1' \
+--set 'rbacHelpers.enable=true' ./helm/chart
+```
+
+After that is it necessary to create all CRDs as descibed below.
 
 ---
 

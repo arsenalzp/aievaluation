@@ -1,0 +1,56 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+    name: {{ include "ai-eval.resourceName" (dict "suffix" "manager-role" "context" $) }}
+rules:
+    - apiGroups:
+        - ai.evaluation.io
+      resources:
+        - evaldatasets
+        - evalsuites
+      verbs:
+        - get
+        - list
+        - watch
+    - apiGroups:
+        - ai.evaluation.io
+      resources:
+        - evalruns
+      verbs:
+        - get
+        - list
+        - patch
+        - update
+        - watch
+    - apiGroups:
+        - ai.evaluation.io
+      resources:
+        - evalruns/status
+      verbs:
+        - get
+        - patch
+        - update
+    - apiGroups:
+        - batch
+      resources:
+        - jobs
+      verbs:
+        - create
+        - delete
+        - get
+        - list
+        - patch
+        - update
+        - watch
+    - apiGroups:
+       - ""
+      resources:
+        - configmaps
+      verbs:
+       - create
+       - delete
+       - get
+       - list
+       - patch
+       - update
+       - watch

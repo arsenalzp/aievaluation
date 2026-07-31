@@ -1,0 +1,24 @@
+{{- if .Values.rbacHelpers.enable }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+    labels:
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/name: {{ include "ai-eval.name" . }}
+        helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    name: {{ include "ai-eval.resourceName" (dict "suffix" "evalsuite-admin-role" "context" $) }}
+rules:
+    - apiGroups:
+        - ai.evaluation.io
+      resources:
+        - evalsuites
+      verbs:
+        - '*'
+    - apiGroups:
+        - ai.evaluation.io
+      resources:
+        - evalsuites/status
+      verbs:
+        - get
+{{- end }}

@@ -63,6 +63,15 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          - --metrics-bind-address=0
+          - --metrics-secure=false
+          - --webhook-cert-path=""
+          - --webhook-cert-name=""
+          - --webhook-cert-key=""
+          - --metrics-cert-path=""
+          - --metrics-cert-name=""
+          - --metrics-cert-key=""
+          - --enable-http2=false
         image: controller:latest
         name: manager
         ports: []
