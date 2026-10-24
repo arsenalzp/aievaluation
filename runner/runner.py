@@ -11,7 +11,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from openai import AsyncOpenAI
-from ragas.metrics.collections import Faithfulness, AnswerRelevancy, AnswerCorrectness
+from ragas.metrics.collections import (
+    Faithfulness,
+    AnswerRelevancy,
+    AnswerCorrectness,
+    ContextPrecision,
+    ContextRecall
+)
 from ragas.metrics import (
     faithfulness,
     answer_relevancy,
@@ -22,7 +28,7 @@ from ragas.metrics import (
 from ragas.llms import llm_factory
 from ragas.embeddings import OpenAIEmbeddings
 from ragas import experiment, EvaluationDataset, SingleTurnSample
-from sqlalchemy.engine import row
+
 
 # answer_correctness may not exist in some ragas versions
 # try:
@@ -36,15 +42,21 @@ from sqlalchemy.engine import row
 # ============================================================
 
 class SingleTurnExtension(SingleTurnSample):
-  case_id: str
-  ground_truth: str
-  
+    case_id: str
+    user_input: str
+    ground_truth: str
+    retrieved_contexts: List[str]
+    response: str
+
+    
 # Define experiment result structure
 class ExperimentResult(BaseModel):
-  case_id: str
-  faithfulness: float  
-  answer_relevancy: float
-  answer_correctness: float
+    case_id: str
+    faithfulness: float
+    answer_relevancy: float
+    answer_correctness: float
+    context_precision: float
+    context_recall: float
 
 
 @dataclass
@@ -228,7 +240,7 @@ def build_runner_config() -> RunnerConfig:
         min_context_recall=safe_float(retrieval.get("minContextRecall", None)),
         min_context_precision=safe_float(retrieval.get("minContextPrecision", None)),
         min_faithfulness=safe_float(generation.get("minFaithfulness", None)),
-        min_relevancy = safe_float(generation.get("minRelevancy", None)),
+        min_relevancy=safe_float(generation.get("minRelevancy", None)),
         min_correctness=safe_float(generation.get("minCorrectness", None)),
         max_stale_chunk_ratio=safe_float(trust.get("maxStaleChunkRatio", None)),
         max_unknown_owner_ratio=safe_float(trust.get("maxUnknownOwnerRatio", None)),
@@ -290,7 +302,7 @@ def download_dataset(cfg: RunnerConfig) -> str:
     
     with open(cfg.dataset_file, "wb") as fd:
         for chunk in resp.iter_content(chunk_size=128):
-          fd.write(chunk)
+            fd.write(chunk)
 
     return cfg.dataset_file
 
@@ -308,18 +320,19 @@ def load_optional_baseline(cfg: RunnerConfig) -> Optional[Dict[str, Any]]:
         raise
     return resp.json()
 
+
 def upload_json(cfg: RunnerConfig, key: str, payload: Dict[str, Any]) -> None:
     def safe_serialize(obj):
         if isinstance(obj, bytes):
             return obj.decode('utf-8', errors='ignore')
         if isinstance(obj, float) and (obj != obj or obj == float('inf') or obj == float('-inf')):
-            return None # NaN и Inf в null
+            return None  # NaN и Inf в null
         raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
     
     body = json.dumps(payload, ensure_ascii=False, indent=2, default=safe_serialize).encode("utf-8")
     
     resp = requests.put(
-        f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{key}", 
+        f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{key}",
         data=body,
         headers={"Content-Type": "application/json"}
     )
@@ -330,7 +343,6 @@ def upload_json(cfg: RunnerConfig, key: str, payload: Dict[str, Any]) -> None:
         print(f"Unable to do PUT request to {cfg.s3_endpoint} during uploading a json content")
         raise
     return resp.json()
-
 
 
 def upload_text(cfg: RunnerConfig, key: str, text: str, content_type: str = "text/plain") -> None:
@@ -349,11 +361,9 @@ def upload_text(cfg: RunnerConfig, key: str, text: str, content_type: str = "tex
     return resp.json()
 
 
-
 # ============================================================
 # Dataset parsing
 # ============================================================
-
 def parse_dataset_jsonl(path: str) -> List[DatasetCase]:
     cases: List[DatasetCase] = []
 
@@ -481,7 +491,7 @@ class RagasAdapter:
                     case_id=record.case_id,
                     user_input=record.question,
                     response=record.answer,
-                    retrieved_contexts = [context.text for context in record.contexts],
+                    retrieved_contexts=[context.text for context in record.contexts],
                     ground_truth=record.ground_truth
                 )
             )
@@ -508,7 +518,7 @@ class RagasAdapter:
     async def score_records(self, records: List[EvalRecord]) -> Tuple[List[PerCaseScore], Dict[str, Any]]:
         metric_names = ["faithfulness", "answer_relevancy", "answer_correctness"]
         generation_config = {
-          "max_completion_tokens": 8192, 
+          "max_completion_tokens": 8192,
           "max_tokens": 8192
         }
         openai_async_client = AsyncOpenAI(api_key=self._openai_api_key)
@@ -522,37 +532,51 @@ class RagasAdapter:
             client=openai_async_client,
             model=self._embedder_name,
         )
-
+        
+        answer_correctness = AnswerCorrectness(llm=ragas_llm, embeddings=embedder)
+        faithfulness = Faithfulness(llm=ragas_llm)
+        answer_relevancy = AnswerRelevancy(llm=ragas_llm, embeddings=embedder)
+        context_precision = ContextPrecision(llm=ragas_llm)
+        context_recall = ContextRecall(llm=ragas_llm)
+            
         @experiment(ExperimentResult, backend="inmemory")
         async def run_evaluation(row):
-          answer_correctness = AnswerCorrectness(llm=ragas_llm, embeddings=embedder)
-          faithfulness = Faithfulness(llm=ragas_llm)
-          answer_relevancy = AnswerRelevancy(llm=ragas_llm, embeddings=embedder)
+            correctness_result = await answer_correctness.ascore(
+                user_input=row.user_input,
+                response=row.response,
+                reference=row.ground_truth
+            )
+            faith_result = await faithfulness.ascore(
+                response=row.response,
+                retrieved_contexts=row.retrieved_contexts,
+                user_input=row.user_input
+            )
+            relevancy_result = await answer_relevancy.ascore(
+                user_input=row.user_input,
+                response=row.response
+            )
+            precision_result = await context_precision.ascore(
+                user_input=row.user_input,
+                retrieved_contexts=row.retrieved_contexts,
+                reference=row.ground_truth
+            )
+            recall_result = await context_recall.ascore(
+                user_input=row.user_input,
+                retrieved_contexts=row.retrieved_contexts,
+                reference=row.ground_truth
+            )
           
-          correctness_result = await answer_correctness.ascore(
-            user_input=row.user_input,
-            response=row.response,
-            reference=row.ground_truth
-          )
-          faith_result = await faithfulness.ascore(       
-            response=row.response,
-            retrieved_contexts=row.retrieved_contexts,
-            user_input=row.user_input
-          )
-          relevancy_result = await answer_relevancy.ascore(       
-            user_input=row.user_input,
-            response=row.response
-          )
-          
-          return ExperimentResult(
-            case_id=row.case_id,
-            faithfulness=faith_result.value,
-            answer_relevancy=relevancy_result.value,
-            answer_correctness=correctness_result.value
-          )
+            return ExperimentResult(
+                case_id=row.case_id,
+                faithfulness=faith_result.value,
+                answer_relevancy=relevancy_result.value,
+                answer_correctness=correctness_result.value,
+                context_precision=precision_result.value,
+                context_recall=recall_result.value
+            )
         
         if not records:
-          return [], {"metricNames": []}
+            return [], {"metricNames": []}
 
         dataset = self._build_hf_dataset(records)
         result = await run_evaluation.arun(dataset)
@@ -561,21 +585,21 @@ class RagasAdapter:
         per_case_scores: List[PerCaseScore] = []
 
         for idx, row in df.iterrows():
-          latency_ms = safe_float(records[idx].metadata.get("latencyMs"))
+            latency_ms = safe_float(records[idx].metadata.get("latencyMs"))
 
-          pcs = PerCaseScore(
-            case_id=row.get("case_id"),
-            faithfulness=safe_float(row.get("faithfulness")),
-            answer_relevancy=safe_float(row.get("answer_relevancy")),
-            answer_correctness=safe_float(row.get("answer_correctness")) if "answer_correctness" in row else None,
-            context_precision=safe_float(row.get("context_precision")) if "context_precision" in row else None,
-            context_recall=safe_float(row.get("context_recall")) if "context_recall" in row else None,
-            latency_ms=latency_ms,
-            passed=False,
-            notes=[],
-          )
+            pcs = PerCaseScore(
+                case_id=row.get("case_id"),
+                faithfulness=safe_float(row.get("faithfulness")),
+                answer_relevancy=safe_float(row.get("answer_relevancy")),
+                answer_correctness=safe_float(row.get("answer_correctness")) if "answer_correctness" in row else None,
+                context_precision=safe_float(row.get("context_precision")) if "context_precision" in row else None,
+                context_recall=safe_float(row.get("context_recall")) if "context_recall" in row else None,
+                latency_ms=latency_ms,
+                passed=False,
+                notes=[],
+            )
 
-          per_case_scores.append(pcs)
+            per_case_scores.append(pcs)
 
         return per_case_scores, {
           "metricNames": metric_names,
@@ -617,7 +641,6 @@ def mark_per_case_pass_fail(cfg: RunnerConfig, per_case: List[PerCaseScore]) -> 
                     f"faithfulness={score.faithfulness:.4f} < minFaithfulness={cfg.thresholds.min_faithfulness:.4f}"
                 )
 
-
         if cfg.thresholds.min_correctness is not None and score.answer_correctness is not None:
             if score.answer_correctness < cfg.thresholds.min_correctness:
                 passed = False
@@ -626,9 +649,9 @@ def mark_per_case_pass_fail(cfg: RunnerConfig, per_case: List[PerCaseScore]) -> 
                 )
                 
         if cfg.thresholds.min_relevancy is not None and score.answer_relevancy is not None:
-          if score.answer_relevancy < cfg.thresholds.min_relevancy:
-            passed = False
-            notes.append(
+            if score.answer_relevancy < cfg.thresholds.min_relevancy:
+                passed = False
+                notes.append(
                     f"answer_relevancy={score.answer_relevancy:.4f} < minRelevancy={cfg.thresholds.min_relevancy:.4f}"
                 )
           
@@ -657,56 +680,55 @@ def apply_threshold_policy(cfg: RunnerConfig, agg: AggregatedScores) -> Tuple[bo
 
     # Retrieval stage checks
     if cfg.thresholds.min_context_recall is not None and agg.context_recall_avg is not None:
-      if agg.context_recall_avg < cfg.thresholds.min_context_recall:
-        failed = True
-        root_cause = {
-          "stage": "Retrieval",
-          "metric": "context_recall",
-          "details": f"context_recall_avg={agg.context_recall_avg:.4f} < minContextRecall={cfg.thresholds.min_context_recall:.4f}",
-        }
-        notes.append(root_cause["details"])
+        if agg.context_recall_avg < cfg.thresholds.min_context_recall:
+            failed = True
+            root_cause = {
+              "stage": "Retrieval",
+              "metric": "context_recall",
+              "details": f"context_recall_avg={agg.context_recall_avg:.4f} < minContextRecall={cfg.thresholds.min_context_recall:.4f}",
+            }
+            notes.append(root_cause["details"])
 
     if not failed and cfg.thresholds.min_context_precision is not None and agg.context_precision_avg is not None:
-      if agg.context_precision_avg < cfg.thresholds.min_context_precision:
-        failed = True
-        root_cause = {
-          "stage": "Retrieval",
-          "metric": "context_precision",
-          "details": f"context_precision_avg={agg.context_precision_avg:.4f} < minContextPrecision={cfg.thresholds.min_context_precision:.4f}",
-        }
-        notes.append(root_cause["details"])
+        if agg.context_precision_avg < cfg.thresholds.min_context_precision:
+            failed = True
+            root_cause = {
+              "stage": "Retrieval",
+              "metric": "context_precision",
+              "details": f"context_precision_avg={agg.context_precision_avg:.4f} < minContextPrecision={cfg.thresholds.min_context_precision:.4f}",
+            }
+            notes.append(root_cause["details"])
 
     # Generation stage checks
     if not failed and cfg.thresholds.min_faithfulness is not None and agg.faithfulness_avg is not None:
-      if agg.faithfulness_avg < cfg.thresholds.min_faithfulness:
-        failed = True
-        root_cause = {
-          "stage": "Generation",
-          "metric": "faithfulness",
-          "details": f"faithfulness_avg={agg.faithfulness_avg:.4f} < minFaithfulness={cfg.thresholds.min_faithfulness:.4f}",
-        }
-        notes.append(root_cause["details"])
-
+        if agg.faithfulness_avg < cfg.thresholds.min_faithfulness:
+            failed = True
+            root_cause = {
+              "stage": "Generation",
+              "metric": "faithfulness",
+              "details": f"faithfulness_avg={agg.faithfulness_avg:.4f} < minFaithfulness={cfg.thresholds.min_faithfulness:.4f}",
+            }
+            notes.append(root_cause["details"])
 
     if not failed and cfg.thresholds.min_correctness is not None and agg.answer_correctness_avg is not None:
-      if agg.answer_correctness_avg < cfg.thresholds.min_correctness:
-        failed = True
-        root_cause = {
-          "stage": "Generation",
-          "metric": "correctness",
-          "details": f"answer_correctness_avg={agg.answer_correctness_avg:.4f} < minCorrectness={cfg.thresholds.min_correctness:.4f}",
-        }
-        notes.append(root_cause["details"])
+        if agg.answer_correctness_avg < cfg.thresholds.min_correctness:
+            failed = True
+            root_cause = {
+              "stage": "Generation",
+              "metric": "correctness",
+              "details": f"answer_correctness_avg={agg.answer_correctness_avg:.4f} < minCorrectness={cfg.thresholds.min_correctness:.4f}",
+            }
+            notes.append(root_cause["details"])
       
     if not failed and cfg.thresholds.min_relevancy is not None and agg.answer_relevancy_avg is not None:
-      if agg.answer_relevancy_avg < cfg.thresholds.min_relevancy:
-        failed = True
-        root_cause = {
-          "stage": "Generation",
-          "metric": "relevancy",
-          "details": f"answer_relevancy_avg={agg.answer_relevancy_avg:.4f} < minFaithfulness={cfg.thresholds.min_relevancy:.4f}",
-        }
-        notes.append(root_cause["details"])
+        if agg.answer_relevancy_avg < cfg.thresholds.min_relevancy:
+            failed = True
+            root_cause = {
+              "stage": "Generation",
+              "metric": "relevancy",
+              "details": f"answer_relevancy_avg={agg.answer_relevancy_avg:.4f} < minFaithfulness={cfg.thresholds.min_relevancy:.4f}",
+            }
+            notes.append(root_cause["details"])
 
     return failed, root_cause, notes
 
@@ -894,8 +916,8 @@ async def main() -> int:
 
         # 5) Evaluate with Ragas
         ragas_adapter = RagasAdapter(
-            model_name=cfg.llm_model, 
-            embedder_name=cfg.llm_embedder, 
+            model_name=cfg.llm_model,
+            embedder_name=cfg.llm_embedder,
             api_key=cfg.llm_api_key
         )
         per_case_scores, ragas_meta = await ragas_adapter.score_records(records)
