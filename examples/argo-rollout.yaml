@@ -1,0 +1,39 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: rag-service-demo
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rag-service
+  template:
+    metadata:
+      labels:
+        app: rag-service
+    spec:
+      containers:
+        - name: rag-service
+          image: my-registry/rag-service:v2.0.0
+          ports:
+            - containerPort: 8080
+  strategy:
+    canary:
+      steps:
+        - setWeight: 20
+        - pause: { duration: 10s }
+        - analysis:
+            templates:
+              - templateName: evalrun-ai-gate
+                clusterScope: true
+            args:
+              - name: evalrun-name
+                value: "canary-eval-{{pod-template-hash}}"
+              - name: evalsuite-name
+                value: "rag-release-suite"
+              - name: target-endpoint
+                value: "http://rag-service-canary.default.svc.cluster.local:8080/query"
+              - name: git-sha
+                value: "abc1234"
+        - setWeight: 100

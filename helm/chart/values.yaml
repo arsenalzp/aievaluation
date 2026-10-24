@@ -110,3 +110,20 @@ certManager:
 prometheus:
   enable: false
 
+## Add Argo
+##
+argoRollouts:
+  enabled: false
+  templateName: evalrun-ai-gate
+
+## Add Tekton
+##
+tekton:
+  enabled: false
+  taskName: evalrun-ai-gate
+
+## Add OpenShift Pipelines
+##
+openShiftPipelines:
+  enabled: false
+  taskName: evalrun-gate

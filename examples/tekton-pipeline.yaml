@@ -1,0 +1,20 @@
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  name: rag-service-eval-run-sample
+  namespace: default
+spec:
+  pipelineSpec:
+    tasks:
+      - name: gate-evaluation
+        taskRef:
+          name: evalrun-gate
+        params:
+          - name: evalrun-name
+            value: "tekton-eval-$(context.pipelineRun.name)"
+          - name: evalsuite-name
+            value: "rag-release-suite"
+          - name: target-endpoint
+            value: "http://rag-service-staging.default.svc.cluster.local:8080/query"
+          - name: git-sha
+            value: "a1b2c3d"

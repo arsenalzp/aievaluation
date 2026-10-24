@@ -1,0 +1,79 @@
+{{- if .Values.argoRollouts.enabled }}
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterAnalysisTemplate
+metadata:
+  name: {{ .Values.argoRollouts.templateName | default "evalrun-ai-gate" }}
+  labels:
+    app.kubernetes.io/name: evalrun-operator
+    app.kubernetes.io/component: argo-integration
+    app.kubernetes.io/managed-by: Helm
+spec:
+  args:
+    - name: evalrun-name
+    - name: evalsuite-name
+    - name: target-endpoint
+    - name: git-sha
+      value: "unknown"
+  metrics:
+    - name: evalrun-verdict-check
+      interval: 10s
+      failureLimit: 1
+      provider:
+        job:
+          spec:
+            template:
+              spec:
+                serviceAccountName: {{ include "ai-eval.resourceName" (dict "suffix" "controller-manager" "context" $) }}
+                restartPolicy: Never
+                containers:
+                  - name: evalrun-trigger
+                    image: bitnami/kubectl:latest
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -euo pipefail
+
+                        echo "Creating EvalRun/{{ "{{" }}args.evalrun-name}}..."
+                        cat <<EOF | kubectl apply -f -
+                        apiVersion: ai.evaluation.io/v1alpha1
+                        kind: EvalRun
+                        metadata:
+                          name: {{ "{{" }}args.evalrun-name}}
+                        spec:
+                          suiteRef:
+                            name: {{ "{{" }}args.evalsuite-name}}
+                          targetEndpoint: "{{ "{{" }}args.target-endpoint}}"
+                          revision:
+                            gitSHA: "{{ "{{" }}args.git-sha}}"
+                        EOF
+
+                        echo "Monitoring EvalRun execution..."
+                        DEADLINE=1500
+                        ELAPSED=0
+
+                        while [ "$ELAPSED" -lt "$DEADLINE" ]; do
+                          PHASE=$(kubectl get evalrun {{ "{{" }}args.evalrun-name}} -o jsonpath='{.status.phase}' 2>/dev/null || true)
+                          VERDICT=$(kubectl get evalrun {{ "{{" }}args.evalrun-name}} -o jsonpath='{.status.verdict}' 2>/dev/null || true)
+
+                          echo "elapsed=${ELAPSED}s phase=${PHASE:-PENDING} verdict=${VERDICT:-NONE}"
+
+                          if [ "$PHASE" = "COMPLETED" ]; then
+                            if [ "$VERDICT" = "PASS" ]; then
+                              echo "EvalRun VERDICT IS PASS. Promoting rollout!"
+                              exit 0
+                            else
+                              echo "EvalRun VERDICT IS FAIL ($VERDICT). Aborting rollout!"
+                              exit 1
+                            fi
+                          elif [ "$PHASE" = "FAILED" ]; then
+                            echo "EvalRun execution error!"
+                            exit 1
+                          fi
+
+                          sleep 10
+                          ELAPSED=$((ELAPSED + 10))
+                        done
+
+                        echo "EvalRun Timed Out!"
+                        exit 1
+{{- end }}

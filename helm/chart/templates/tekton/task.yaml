@@ -1,0 +1,74 @@
+{{- if .Values.tekton.enabled }}
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: {{ .Values.tekton.taskName | default "evalrun-gate" }}
+  labels:
+    app.kubernetes.io/name: evalrun-operator
+    app.kubernetes.io/component: tekton-integration
+    app.kubernetes.io/managed-by: Helm
+spec:
+  params:
+    - name: evalrun-name
+      type: string
+      description: "Name of EvalRun CRD"
+    - name: evalsuite-name
+      type: string
+      description: "Name of EvalSuite"
+    - name: target-endpoint
+      type: string
+      description: "URL to RAG or AI endpoint services"
+    - name: git-sha
+      type: string
+      default: "unknown"
+  steps:
+    - name: trigger-and-wait
+      image: bitnami/kubectl:latest
+      script: |
+        #!/bin/sh
+        set -euo pipefail
+
+        echo "Creating EvalRun/$(params.evalrun-name)..."
+        cat <<EOF | kubectl apply -f -
+        apiVersion: ai.evaluation.io/v1alpha1
+        kind: EvalRun
+        metadata:
+          name: $(params.evalrun-name)
+        spec:
+          suiteRef:
+            name: $(params.evalsuite-name)
+          targetEndpoint: "$(params.target-endpoint)"
+          revision:
+            gitSHA: "$(params.git-sha)"
+        EOF
+
+        echo "Monitoring EvalRun execution..."
+        DEADLINE=1500
+        ELAPSED=0
+
+        while [ "$ELAPSED" -lt "$DEADLINE" ]; do
+          PHASE=$(kubectl get evalrun $(params.evalrun-name) -o jsonpath='{.status.phase}' 2>/dev/null || true)
+          VERDICT=$(kubectl get evalrun $(params.evalrun-name) -o jsonpath='{.status.verdict}' 2>/dev/null || true)
+
+          echo "elapsed=${ELAPSED}s phase=${PHASE:-PENDING} verdict=${VERDICT:-NONE}"
+
+          if [ "$PHASE" = "COMPLETED" ]; then
+            if [ "$VERDICT" = "PASS" ]; then
+              echo "EvalRun VERDICT IS PASS. Pipeline step succeeded!"
+              exit 0
+            else
+              echo "EvalRun VERDICT IS FAIL ($VERDICT). Failing pipeline!"
+              exit 1
+            fi
+          elif [ "$PHASE" = "FAILED" ]; then
+            echo "EvalRun execution error!"
+            exit 1
+          fi
+
+          sleep 10
+          ELAPSED=$((ELAPSED + 10))
+        done
+
+        echo "EvalRun Timed Out!"
+        exit 1
+{{- end }}

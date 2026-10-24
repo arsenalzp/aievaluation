@@ -1,0 +1,23 @@
+name: Test AI Agents and RAG-system
+on: 
+  pull_request:
+    branches: [ "master" ]
+    types: [opened, labeled, synchronize]
+
+jobs:
+  eval-job:
+    runs-on: self-hosted
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run AI Eval Gate
+        uses: arsenalzp/runaieval@master
+        with:
+          default_namespace: "default"
+          endpoint_rag: "http://k8s:8080/rag/query?debug=true"
