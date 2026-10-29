@@ -40,6 +40,9 @@ class VulnerabilityType(str, Enum):
     UNAUTHORIZED_ACTION = "unauthorized_action"
     NONE = "none"
     
+    def __str__(self) -> str:
+        return self.value
+
 
 # Structured output for vulnerabilities verdict
 class SafetyAuditVerdict(BaseModel):
@@ -105,8 +108,7 @@ class EvalRecord:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class PerCaseScore:
+class PerCaseScore(BaseModel):
     case_id: str
     faithfulness: Optional[float] = None
     answer_relevancy: Optional[float] = None
@@ -118,6 +120,10 @@ class PerCaseScore:
     vulnerability_type: Optional[VulnerabilityType] = None
     latency_ms: Optional[float] = None
     notes: List[str] = field(default_factory=list)
+    passed: Optional[bool] = False
+    
+    def to_dict(self) -> dict:
+        return self.model_dump(exclude_none=True)
 
 
 @dataclass
@@ -521,7 +527,6 @@ class RagasAdapter:
     async def evaluate_safety_case(
         self,
         openai_client: AsyncOpenAI,
-        model_name: str,
         records: List[EvalRecord]
     ) -> List[SafetyAuditVerdict]:
         # Evaluate security of RAG/Agent response with Structured Outputs
@@ -539,7 +544,7 @@ class RagasAdapter:
             user_message = f"User Input (Attack Payload):\n{record.question}\n\nSystem Response:\n{record.answer}"
             try:
                 completion = await openai_client.beta.chat.completions.parse(
-                    model=model_name,
+                    model=self._model_name,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message}
@@ -652,7 +657,7 @@ class RagasAdapter:
         dataset = self._build_hf_dataset(records)
         result = await run_evaluation.arun(dataset)
         
-        sec_results: List[SafetyAuditVerdict] = await self.evaluate_safety_case(openai_async_client, self._model_name, records)
+        sec_results: List[SafetyAuditVerdict] = await self.evaluate_safety_case(openai_async_client, records)
         
         safety_map: Dict[str, SafetyAuditVerdict] = {v.case_id: v for v in sec_results}
         
@@ -686,8 +691,8 @@ class RagasAdapter:
                 context_precision=safe_float(row.get("context_precision")) if "context_precision" in row else None,
                 context_recall=safe_float(row.get("context_recall")) if "context_recall" in row else None,
                 safety_passed=safety_passed,
-                safety_reason=safety_reason,
-                vulnerability_type=vulnerability_type,
+                safety_reason=safety_reason if not safety_passed else None,
+                vulnerability_type=vulnerability_type if not safety_passed else None,
                 latency_ms=latency_ms,
                 notes=[],
             )
@@ -730,7 +735,7 @@ def mark_per_case_pass_fail(cfg: RunnerConfig, per_case: List[PerCaseScore]) -> 
         if not score.safety_passed:
             passed = False
             notes.append(
-                f"safety_passed={score.safety_passed}, safety_reason={score.safety_reason}, vulnerability_type={score.vulnerability_type}"
+                f"vulnerability_type={score.vulnerability_type}"
             )
         
         if cfg.thresholds.min_faithfulness is not None and score.faithfulness is not None:
@@ -949,7 +954,7 @@ def publish_details_jsonl(cfg: RunnerConfig, records: List[EvalRecord], scores: 
             "answer": record.answer,
             "contexts": [asdict(c) for c in record.contexts],
             "metadata": record.metadata,
-            "score": asdict(score) if score else None,
+            "score": score.to_dict() if score else None,
         }
         lines.append(json.dumps(row, ensure_ascii=False))
 
@@ -977,7 +982,7 @@ def publish_scores_json(
         },
         "aggregatedScores": asdict(agg),
         "regression": asdict(regression),
-        "perCase": [asdict(x) for x in per_case],
+        "perCase": [x.to_dict() for x in per_case],
     }
     upload_json(cfg, cfg.scores_key, payload)
 
