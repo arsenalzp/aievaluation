@@ -27,17 +27,20 @@ def suite_config_file(tmp_path):
     path.write_text(
         json.dumps({
             "metrics": {
-                "retrieval": {
-                    "minContextRecall": 0.7,
-                    "minContextPrecision": 0.6,
-                },
-                "generation": {
-                    "minFaithfulness": 0.8,
-                    "minCorrectness": 0.75,
-                },
-                "trustworthiness": {
-                    "maxStaleChunkRatio": 0.1,
-                    "maxUnknownOwnerRatio": 0.2,
+                "rag": {
+                    "retrieval": {
+                        "minContextRecall": 0.7,
+                        "minContextPrecision": 0.6,
+                    },
+                    "generation": {
+                        "minFaithfulness": 0.8,
+                        "minCorrectness": 0.75,
+                        "minRelevancy:": 0.5,
+                    },
+                    "trustworthiness": {
+                        "maxStaleChunkRatio": 0.1,
+                        "maxUnknownOwnerRatio": 0.2,
+                    },
                 },
             },
             "regressionPolicy": {
@@ -90,6 +93,7 @@ def cfg(tmp_path):
             min_context_precision=0.6,
             min_faithfulness=0.8,
             min_correctness=0.75,
+            min_relevancy=0.75,
             max_stale_chunk_ratio=None,
             max_unknown_owner_ratio=None,
         ),
@@ -582,6 +586,7 @@ def test_mark_per_case_pass_fail_passes_when_all_metrics_above_thresholds(cfg):
             answer_relevancy=0.8,
             context_precision=0.8,
             context_recall=0.8,
+            safety_passed=True
         )
     ]
 
@@ -596,10 +601,11 @@ def test_mark_per_case_pass_fail_uses_answer_relevancy_as_correctness_fallback(c
         PerCaseScore(
             case_id="case-1",
             faithfulness=0.9,
-            answer_relevancy=0.6,
+            answer_relevancy=0.4,
             answer_correctness=None,
             context_precision=0.9,
             context_recall=0.9,
+            safety_passed=True
         )
     ]
 
@@ -685,7 +691,7 @@ def test_apply_threshold_policy_fails_on_answer_relevancy_fallback(cfg):
 
     assert failed is True
     assert root_cause["stage"] == "Generation"
-    assert root_cause["metric"] == "answer_relevancy_avg"
+    assert root_cause["metric"] == "relevancy"
     assert len(notes) == 1
 
 
@@ -812,10 +818,10 @@ def test_build_gate_summary_pass(cfg):
     assert "total_cases=2" in gate.summary
     assert "passed_cases=2" in gate.summary
 
-    artifacts = json.loads(gate.artifacts)
-    assert artifacts["gateSummaryUri"] == "s3://eval-bucket/artifacts/gate-summary.json"
-    assert artifacts["scoresUri"] == "s3://eval-bucket/artifacts/scores.json"
-    assert artifacts["detailsUri"] == "s3://eval-bucket/artifacts/details.jsonl"
+    # artifacts = json.loads(gate.artifacts)
+    assert gate.artifacts["gateSummaryUri"] == "s3://eval-bucket/artifacts/gate-summary.json"
+    assert gate.artifacts["scoresUri"] == "s3://eval-bucket/artifacts/scores.json"
+    assert gate.artifacts["detailsUri"] == "s3://eval-bucket/artifacts/details.jsonl"
 
 
 def test_build_gate_summary_fail_from_threshold(cfg):
@@ -1083,6 +1089,7 @@ async def test_main_success_flow(monkeypatch, cfg, tmp_path):
                     context_precision=0.9,
                     context_recall=0.9,
                     latency_ms=100,
+                    safety_passed=True
                 )
             ], {
                 "metricNames": ["faithfulness", "answer_relevancy"],

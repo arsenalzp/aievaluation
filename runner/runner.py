@@ -254,7 +254,6 @@ def load_suite_config(path: str) -> Dict[str, Any]:
 def build_runner_config() -> RunnerConfig:
     suite_config_path = getenv_required("SUITE_CONFIG")
     suite = load_suite_config(suite_config_path)
-
     metrics = suite.get("metrics", {})
     rag_metrics = metrics.get("rag", {})
     retrieval = rag_metrics.get("retrieval", {})
