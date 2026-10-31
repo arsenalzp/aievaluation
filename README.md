@@ -14,6 +14,7 @@ Traditional CI/CD checks are not enough for RAG and AI Agent systems.
 
 A service can pass unit tests, integration tests, and smoke tests, but still fail because:
 
+- security or privacy vulnerabilities are exposed (e.g., PII leakage or prompt injections);
 - retrieved context is incomplete or irrelevant;
 - generated answers are not faithful to retrieved evidence;
 - answer quality regresses after prompt, model, dataset, or retrieval changes;
@@ -75,7 +76,7 @@ After that is it necessary to create all CRDs as descibed below.
    - Runs inside the Kubernetes `Job`.
    - Downloads a JSONL evaluation dataset from S3-compatible object storage.
    - Calls the target RAG or AI endpoint.
-   - Computes evaluation scores.
+   - Computes evaluation scores and runs zero-tolerance security audits (Safety Judge).
    - Publishes structured artifacts to object storage.
 
 High-level flow:
@@ -382,7 +383,7 @@ caseId
 question
 ```
 
-Optional fields for RAG:
+Optional fields for Agent:
 
 ```text
 forbiddenTools
@@ -921,7 +922,7 @@ The current implementation focuses on:
 - JSONL dataset processing;
 - S3-compatible artifact publishing;
 - gate summary propagation into `EvalRun.status`;
-- threshold-based evaluation policy;
+- threshold-based evaluation policy and zero-tolerance security/safety audits (Safety Judge);
 - regression comparison against a baseline;
 - initial unit tests for controller and runner logic.
 
@@ -956,7 +957,7 @@ Planned improvements:
 - more controller reconciliation tests;
 - optional Helm chart;
 - integration examples for GitHub Actions, Argo Rollouts, Tekton, and OpenShift Pipelines;
-- additional evaluation dimensions for security and privacy checks.
+- expanded evaluation dimensions for security, privacy checks, and red-teaming.
 
 ---
 
