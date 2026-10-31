@@ -130,7 +130,9 @@ class PerCaseScore(BaseModel):
 class AggregatedScores:
     total_cases: int
     passed_cases: int
-
+    
+    safety_passed: Optional[bool]
+    vulnerability_type: Optional[str]
     faithfulness_avg: Optional[float]
     answer_relevancy_avg: Optional[float]
     answer_correctness_avg: Optional[float]
@@ -711,7 +713,9 @@ def aggregate_scores(per_case: List[PerCaseScore]) -> AggregatedScores:
     return AggregatedScores(
         total_cases=len(per_case),
         passed_cases=sum(1 for x in per_case if x.passed),
-
+        
+        vulnerability_type="; ".join(x.vulnerability_type for x in per_case if x.vulnerability_type is not None),
+        safety_passed=True if len([x.safety_passed for x in per_case if x.safety_passed is False]) == 0 else False,
         faithfulness_avg=mean([x.faithfulness for x in per_case]),
         answer_relevancy_avg=mean([x.answer_relevancy for x in per_case]),
         answer_correctness_avg=mean([x.answer_correctness for x in per_case]),
@@ -780,7 +784,16 @@ def apply_threshold_policy(cfg: RunnerConfig, agg: AggregatedScores) -> Tuple[bo
     failed = False
     notes: List[str] = []
     root_cause = {"stage": "None"}
-
+    
+    if not agg.safety_passed:
+        failed = True
+        root_cause = {
+              "stage": "Safety",
+              "metric": "safety_passed",
+              "details": f"vulnerability_type={agg.vulnerability_type}"
+        }
+        notes.append(root_cause["details"])
+        
     # Retrieval stage checks
     if cfg.thresholds.min_context_recall is not None and agg.context_recall_avg is not None:
         if agg.context_recall_avg < cfg.thresholds.min_context_recall:
@@ -892,7 +905,12 @@ def build_gate_summary(
     verdict = "PASS"
     root_cause = {"stage": "None"}
     summary_parts: List[str] = []
-
+    
+    if not agg.safety_passed:
+        verdict = "FAIL"
+        root_cause = threshold_root_cause
+        summary_parts.append("Security checks failed")
+        
     if threshold_failed:
         verdict = "FAIL"
         root_cause = threshold_root_cause
@@ -923,9 +941,9 @@ def build_gate_summary(
     summary_parts.append(f"passed_cases={agg.passed_cases}")
 
     artifacts = {
-        "gateSummaryUri": f"s3://{cfg.s3_bucket}/{cfg.gate_summary_key}",
-        "scoresUri": f"s3://{cfg.s3_bucket}/{cfg.scores_key}",
-        "detailsUri": f"s3://{cfg.s3_bucket}/{cfg.details_key}",
+        "gateSummaryUri": f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.gate_summary_key}",
+        "scoresUri": f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.scores_key}",
+        "detailsUri": f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.details_key}",
     }
 
     return GateSummary(
@@ -1068,9 +1086,9 @@ async def main() -> int:
                     "details": traceback.format_exc()[-3000:],
                 },
                 artifacts={
-                    "gateSummaryUri": f"s3://{cfg.s3_bucket}/{cfg.gate_summary_key}",
-                    "scoresUri": f"s3://{cfg.s3_bucket}/{cfg.scores_key}",
-                    "detailsUri": f"s3://{cfg.s3_bucket}/{cfg.details_key}",
+                    "gateSummaryUri": f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.gate_summary_key}",
+                    "scoresUri": f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.scores_key}",
+                    "detailsUri": f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.details_key}",
                 },
             )
             publish_gate_summary(cfg, gate)
