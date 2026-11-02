@@ -1,0 +1,10 @@
+apiVersion: ai.evaluation.io/v1alpha1
+kind: EvalDataset
+metadata:
+  name: demo-dataset-agent-multiturn
+spec:
+  source:
+    objectStorageEndpoint: "https://object-storage-endpoint.svc.cluster:9876"
+    bucket: "eval-artifacts"
+    objectKey: "datasets/agent-multiturn.jsonl"   # upload examples/dataset-agent-multiturn.jsonl here
+  format: "jsonl"

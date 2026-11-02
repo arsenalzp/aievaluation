@@ -37,8 +37,19 @@ type Revision struct {
 	PRnumber *int32  `json:"prNumber,omitempty"`
 }
 
+// RootCause explains the first failing (or warning) finding of the gate.
+// Only Stage is set by older runners; the remaining fields are populated by multi-turn evaluation.
 type RootCause struct {
-	Stage string `json:"stage,omitempty"`
+	Stage       string `json:"stage,omitempty"`
+	Metric      string `json:"metric,omitempty"`
+	Details     string `json:"details,omitempty"`
+	Evaluator   string `json:"evaluator,omitempty"`
+	Code        string `json:"code,omitempty"`
+	CaseID      string `json:"caseId,omitempty"`
+	TurnIndex   *int32 `json:"turnIndex,omitempty"`
+	Observed    string `json:"observed,omitempty"`
+	Required    string `json:"required,omitempty"`
+	ArtifactURI string `json:"artifactUri,omitempty"`
 }
 
 // EvalRunSpec defines the desired state of EvalRun.
@@ -69,6 +80,10 @@ type Artifacts struct {
 	GateSummaryUri string `json:"gateSummaryUri,omitempty"`
 	ScoresUri      string `json:"scoresUri,omitempty"`
 	DetailsUri     string `json:"detailsUri,omitempty"`
+	// Multi-turn evaluation only.
+	ManifestUri      string `json:"manifestUri,omitempty"`
+	ViolationsUri    string `json:"violationsUri,omitempty"`
+	ConversationsUri string `json:"conversationsUri,omitempty"`
 }
 
 type GateSummary struct {

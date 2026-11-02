@@ -53,6 +53,88 @@ type Agent struct {
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=0
 	MaxPolicyViolations *int32 `json:"maxPolicyViolations,omitempty"`
+
+	// Outcome, Conversation, Tools and Policy configure multi-turn evaluation
+	// (spec.evaluation.interactionMode: MultiTurn). They are additive: the flat fields above keep working.
+
+	// +kubebuilder:validation:Optional
+	Outcome *AgentOutcome `json:"outcome,omitempty"`
+	// +kubebuilder:validation:Optional
+	Conversation *AgentConversation `json:"conversation,omitempty"`
+	// +kubebuilder:validation:Optional
+	Tools *AgentTools `json:"tools,omitempty"`
+	// +kubebuilder:validation:Optional
+	Policy *AgentPolicy `json:"policy,omitempty"`
+}
+
+// AgentOutcome holds goal-level thresholds.
+type AgentOutcome struct {
+	// Minimum share of cases (every trial) that complete without blocking violations.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinGoalCompletion *float32 `json:"minGoalCompletion,omitempty"`
+}
+
+// AgentConversation holds conversation-level limits and semantic (LLM-judged) thresholds.
+type AgentConversation struct {
+	// Maximum number of user turns per session. The runner stops at the limit and reports MAX_TURNS_EXCEEDED.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	MaxTurns *int32 `json:"maxTurns,omitempty"`
+
+	// Semantic thresholds are only enforced by evaluators with provider deepeval.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinKnowledgeRetention *float32 `json:"minKnowledgeRetention,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinConversationCompleteness *float32 `json:"minConversationCompleteness,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinTurnRelevancy *float32 `json:"minTurnRelevancy,omitempty"`
+}
+
+// AgentTools holds deterministic tool-use thresholds and limits for a whole session.
+type AgentTools struct {
+	// Share of required tools that were called (deterministic).
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinSelectionAccuracy *float32 `json:"minSelectionAccuracy,omitempty"`
+	// Share of expected tool calls whose (partial) expected arguments matched.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinArgumentAccuracy *float32 `json:"minArgumentAccuracy,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	MaxToolCalls *int32 `json:"maxToolCalls,omitempty"`
+	// Maximum number of identical calls (same tool and canonical JSON arguments) per session.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	MaxRepeatedCalls *int32 `json:"maxRepeatedCalls,omitempty"`
+}
+
+// AgentPolicy configures the zero-tolerance policy gate.
+type AgentPolicy struct {
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=0
+	MaxCriticalViolations *int32 `json:"maxCriticalViolations,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=0
+	MaxHighViolations *int32 `json:"maxHighViolations,omitempty"`
+	// What happens when maxTurns / maxToolCalls / maxRepeatedCalls are exceeded:
+	// Fail records a HIGH violation, Warn a MEDIUM one (WARN verdict).
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=Fail;Warn
+	// +kubebuilder:default=Fail
+	LimitsAction string `json:"limitsAction,omitempty"`
 }
 
 type Rag struct {
@@ -85,6 +167,78 @@ type Execution struct {
 	TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
 }
 
+// PhoenixTrace locates the Phoenix server that stores the agent's OpenInference traces.
+type PhoenixTrace struct {
+	// Phoenix base URL, e.g. http://phoenix.observability.svc:6006 (no authentication support yet).
+	// +kubebuilder:validation:Optional
+	Endpoint string `json:"endpoint,omitempty"`
+	// Phoenix project name holding the agent's spans.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=default
+	Project string `json:"project,omitempty"`
+}
+
+// TraceSpec selects where tool-call observations come from.
+type TraceSpec struct {
+	// inline: tool calls reported in the agent response (default).
+	// phoenix: Phoenix/OpenInference spans only.
+	// auto: Phoenix when spans exist for the turn's trace, otherwise inline; conflicts are reported, never merged.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=inline;phoenix;auto
+	// +kubebuilder:default=inline
+	Source string `json:"source,omitempty"`
+	// +kubebuilder:validation:Optional
+	Phoenix *PhoenixTrace `json:"phoenix,omitempty"`
+}
+
+// Evaluation selects how interactions are driven. The task type itself (agent / rag) is defined by
+// spec.execution.mode, or inferred from spec.metrics when the mode is not set.
+type Evaluation struct {
+	// SingleTurn (default) keeps the existing one-request-per-case behaviour.
+	// MultiTurn replays scripted multi-turn conversations in a session.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=SingleTurn;MultiTurn
+	// +kubebuilder:default=SingleTurn
+	InteractionMode string `json:"interactionMode,omitempty"`
+	// Number of times every scripted conversation is replayed; a case passes only if all trials pass (pass^k).
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10
+	Trials *int32 `json:"trials,omitempty"`
+	// +kubebuilder:validation:Optional
+	Trace *TraceSpec `json:"trace,omitempty"`
+}
+
+// Evaluator configures one evaluator of a multi-turn evaluation.
+// The built-in deterministic evaluator always runs; semantic evaluators are optional.
+type Evaluator struct {
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=builtin;deepeval
+	// +kubebuilder:default=builtin
+	Provider string `json:"provider,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=deterministic;multiTurn
+	Type string `json:"type,omitempty"`
+	// When true, a failure of this evaluator (or a metric below its threshold) fails the run.
+	// When false, it is recorded and turns the verdict into WARN at most.
+	// +kubebuilder:validation:Optional
+	Required bool `json:"required,omitempty"`
+	// Semantic metrics (provider deepeval). Defaults to all supported metrics.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:items:Enum=knowledgeRetention;conversationCompleteness;turnRelevancy
+	Metrics []string `json:"metrics,omitempty"`
+	// Judge model; defaults to the EvalRun model.
+	// +kubebuilder:validation:Optional
+	Model string `json:"model,omitempty"`
+	// Judge runs per conversation; the median is used.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=5
+	Samples *int32 `json:"samples,omitempty"`
+}
+
 // EvalSuiteSpec defines the desired state of EvalSuite.
 type EvalSuiteSpec struct {
 	// DatasetRef references EvalDataset resource (not ConfigMap).
@@ -92,6 +246,13 @@ type EvalSuiteSpec struct {
 	Metrics          `json:"metrics,omitempty"`
 	RegressionPolicy `json:"regressionPolicy,omitempty"`
 	Execution        `json:"execution,omitempty"`
+
+	// Evaluation is optional; omitting it keeps the single-turn behaviour of existing suites.
+	// +kubebuilder:validation:Optional
+	Evaluation *Evaluation `json:"evaluation,omitempty"`
+	// Evaluators is only used by multi-turn evaluation.
+	// +kubebuilder:validation:Optional
+	Evaluators []Evaluator `json:"evaluators,omitempty"`
 }
 
 // EvalSuiteStatus defines the observed state of EvalSuite.

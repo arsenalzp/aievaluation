@@ -53,6 +53,106 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              evaluation:
+                description: Evaluation is optional; omitting it keeps the single-turn
+                  behaviour of existing suites.
+                properties:
+                  interactionMode:
+                    default: SingleTurn
+                    description: |-
+                      SingleTurn (default) keeps the existing one-request-per-case behaviour.
+                      MultiTurn replays scripted multi-turn conversations in a session.
+                    enum:
+                    - SingleTurn
+                    - MultiTurn
+                    type: string
+                  trace:
+                    description: TraceSpec selects where tool-call observations come
+                      from.
+                    properties:
+                      phoenix:
+                        description: PhoenixTrace locates the Phoenix server that
+                          stores the agent's OpenInference traces.
+                        properties:
+                          endpoint:
+                            description: Phoenix base URL, e.g. http://phoenix.observability.svc:6006
+                              (no authentication support yet).
+                            type: string
+                          project:
+                            default: default
+                            description: Phoenix project name holding the agent's
+                              spans.
+                            type: string
+                        type: object
+                      source:
+                        default: inline
+                        description: |-
+                          inline: tool calls reported in the agent response (default).
+                          phoenix: Phoenix/OpenInference spans only.
+                          auto: Phoenix when spans exist for the turn's trace, otherwise inline; conflicts are reported, never merged.
+                        enum:
+                        - inline
+                        - phoenix
+                        - auto
+                        type: string
+                    type: object
+                  trials:
+                    description: Number of times every scripted conversation is replayed;
+                      a case passes only if all trials pass (pass^k).
+                    format: int32
+                    maximum: 10
+                    minimum: 1
+                    type: integer
+                type: object
+              evaluators:
+                description: Evaluators is only used by multi-turn evaluation.
+                items:
+                  description: |-
+                    Evaluator configures one evaluator of a multi-turn evaluation.
+                    The built-in deterministic evaluator always runs; semantic evaluators are optional.
+                  properties:
+                    metrics:
+                      description: Semantic metrics (provider deepeval). Defaults
+                        to all supported metrics.
+                      items:
+                        enum:
+                        - knowledgeRetention
+                        - conversationCompleteness
+                        - turnRelevancy
+                        type: string
+                      type: array
+                    model:
+                      description: Judge model; defaults to the EvalRun model.
+                      type: string
+                    name:
+                      minLength: 1
+                      type: string
+                    provider:
+                      default: builtin
+                      enum:
+                      - builtin
+                      - deepeval
+                      type: string
+                    required:
+                      description: |-
+                        When true, a failure of this evaluator (or a metric below its threshold) fails the run.
+                        When false, it is recorded and turns the verdict into WARN at most.
+                      type: boolean
+                    samples:
+                      description: Judge runs per conversation; the median is used.
+                      format: int32
+                      maximum: 5
+                      minimum: 1
+                      type: integer
+                    type:
+                      enum:
+                      - deterministic
+                      - multiTurn
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
               execution:
                 properties:
                   mode:
@@ -71,6 +171,31 @@ spec:
                 properties:
                   agent:
                     properties:
+                      conversation:
+                        description: AgentConversation holds conversation-level limits
+                          and semantic (LLM-judged) thresholds.
+                        properties:
+                          maxTurns:
+                            description: Maximum number of user turns per session.
+                              The runner stops at the limit and reports MAX_TURNS_EXCEEDED.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          minConversationCompleteness:
+                            maximum: 1
+                            minimum: 0
+                            type: number
+                          minKnowledgeRetention:
+                            description: Semantic thresholds are only enforced by
+                              evaluators with provider deepeval.
+                            maximum: 1
+                            minimum: 0
+                            type: number
+                          minTurnRelevancy:
+                            maximum: 1
+                            minimum: 0
+                            type: number
+                        type: object
                       maxPolicyViolations:
                         format: int32
                         minimum: 0
@@ -87,6 +212,67 @@ spec:
                         maximum: 1
                         minimum: 0
                         type: number
+                      outcome:
+                        description: AgentOutcome holds goal-level thresholds.
+                        properties:
+                          minGoalCompletion:
+                            description: Minimum share of cases (every trial) that
+                              complete without blocking violations.
+                            maximum: 1
+                            minimum: 0
+                            type: number
+                        type: object
+                      policy:
+                        description: AgentPolicy configures the zero-tolerance policy
+                          gate.
+                        properties:
+                          limitsAction:
+                            default: Fail
+                            description: |-
+                              What happens when maxTurns / maxToolCalls / maxRepeatedCalls are exceeded:
+                              Fail records a HIGH violation, Warn a MEDIUM one (WARN verdict).
+                            enum:
+                            - Fail
+                            - Warn
+                            type: string
+                          maxCriticalViolations:
+                            default: 0
+                            format: int32
+                            minimum: 0
+                            type: integer
+                          maxHighViolations:
+                            default: 0
+                            format: int32
+                            minimum: 0
+                            type: integer
+                        type: object
+                      tools:
+                        description: AgentTools holds deterministic tool-use thresholds
+                          and limits for a whole session.
+                        properties:
+                          maxRepeatedCalls:
+                            description: Maximum number of identical calls (same tool
+                              and canonical JSON arguments) per session.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          maxToolCalls:
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          minArgumentAccuracy:
+                            description: Share of expected tool calls whose (partial)
+                              expected arguments matched.
+                            maximum: 1
+                            minimum: 0
+                            type: number
+                          minSelectionAccuracy:
+                            description: Share of required tools that were called
+                              (deterministic).
+                            maximum: 1
+                            minimum: 0
+                            type: number
+                        type: object
                     type: object
                   rag:
                     properties:

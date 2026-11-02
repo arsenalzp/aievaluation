@@ -392,11 +392,23 @@ runner-build: ## Build runner image.
 runner-push: ## Push runner image.
 >$(CONTAINER_TOOL) push ${RUNNER_IMG}
 
+# The agent runner (single-turn and multi-turn agent evaluation) is a separate image from the RAG runner.
+AGENT_RUNNER_IMG ?= runner-agent:latest
+AGENT_RUNNER_DIR ?= runner-agent
+
+.PHONY: agent-runner-image-build
+agent-runner-image-build: ## Build agent runner image (EvalSuite.spec.execution.runnerImage for agent suites).
+>$(CONTAINER_TOOL) build -t ${AGENT_RUNNER_IMG} -f $(AGENT_RUNNER_DIR)/Dockerfile $(AGENT_RUNNER_DIR)
+
+.PHONY: agent-runner-image-push
+agent-runner-image-push: ## Push agent runner image.
+>$(CONTAINER_TOOL) push ${AGENT_RUNNER_IMG}
+
 .PHONY: images-build
-images-build: controller-build runner-build ## Build controller and runner images.
+images-build: controller-build runner-build agent-runner-image-build ## Build controller, runner and agent runner images.
 
 .PHONY: images-push
-images-push: controller-push runner-push ## Push controller and runner images.
+images-push: controller-push runner-push agent-runner-image-push ## Push controller, runner and agent runner images.
 
 .PHONY: images
 images: images-build images-push ## Build and push controller and runner images.
@@ -409,5 +421,13 @@ runner-install-dev: ## Install runner Python development dependencies.
 runner-test: ## Run runner Python tests.
 >cd $(RUNNER_DIR) && pytest
 
+.PHONY: agent-runner-install-dev
+agent-runner-install-dev: ## Install agent runner Python development dependencies.
+>cd runner-agent && python -m pip install -r requirements.txt -r requirements-dev.txt
+
+.PHONY: agent-runner-test
+agent-runner-test: ## Run agent runner (single-turn + multi-turn) Python tests.
+>cd runner-agent && python -m pytest
+
 .PHONY: test-all
-test-all: test runner-test ## Run controller and runner tests.
+test-all: test runner-test agent-runner-test ## Run controller, runner and agent runner tests.

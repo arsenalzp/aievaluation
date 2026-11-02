@@ -1,0 +1,17 @@
+{
+  "metrics": {
+    "agent": {
+      "outcome": {"minGoalCompletion": 0.9},
+      "conversation": {"maxTurns": 10, "minKnowledgeRetention": 0.85, "minConversationCompleteness": 0.85, "minTurnRelevancy": 0.8},
+      "tools": {"minSelectionAccuracy": 0.9, "minArgumentAccuracy": 0.9, "maxToolCalls": 20, "maxRepeatedCalls": 1},
+      "policy": {"maxCriticalViolations": 0, "maxHighViolations": 0, "limitsAction": "Fail"}
+    }
+  },
+  "regressionPolicy": {"maxDrop": 0.03},
+  "execution": {"timeoutSeconds": 600},
+  "evaluation": {"interactionMode": "MultiTurn", "trials": 1, "trace": {"source": "inline"}},
+  "evaluators": [
+    {"name": "trajectory-policy", "provider": "builtin", "type": "deterministic", "required": true},
+    {"name": "conversation-quality", "provider": "deepeval", "type": "multiTurn", "metrics": ["knowledgeRetention", "conversationCompleteness", "turnRelevancy"], "samples": 1}
+  ]
+}

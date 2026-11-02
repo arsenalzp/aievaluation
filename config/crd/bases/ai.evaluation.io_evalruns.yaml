@@ -106,11 +106,18 @@ spec:
             properties:
               artifacts:
                 properties:
+                  conversationsUri:
+                    type: string
                   detailsUri:
                     type: string
                   gateSummaryUri:
                     type: string
+                  manifestUri:
+                    description: Multi-turn evaluation only.
+                    type: string
                   scoresUri:
+                    type: string
+                  violationsUri:
                     type: string
                 type: object
               completedAt:
@@ -198,9 +205,31 @@ spec:
               phase:
                 type: string
               rootCause:
+                description: |-
+                  RootCause explains the first failing (or warning) finding of the gate.
+                  Only Stage is set by older runners; the remaining fields are populated by multi-turn evaluation.
                 properties:
+                  artifactUri:
+                    type: string
+                  caseId:
+                    type: string
+                  code:
+                    type: string
+                  details:
+                    type: string
+                  evaluator:
+                    type: string
+                  metric:
+                    type: string
+                  observed:
+                    type: string
+                  required:
+                    type: string
                   stage:
                     type: string
+                  turnIndex:
+                    format: int32
+                    type: integer
                 type: object
               startedAt:
                 format: date-time
