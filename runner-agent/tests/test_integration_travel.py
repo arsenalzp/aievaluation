@@ -63,7 +63,7 @@ def test_stale_destination_fails_with_high_violations(uploader, layout):
     assert result.root_cause["stage"] == "Policy"
     assert result.root_cause["caseId"] == "travel-001"
     assert result.root_cause["turnIndex"] == 3
-    assert result.root_cause["artifactUri"].startswith("s3://bucket/runs/r1/conversations/travel-001")
+    assert result.root_cause["artifactUri"].startswith("http://s3/buckets/bucket/objects/runs/r1/conversations/travel-001")
 
 
 def test_booking_without_approval_is_critical_fail(uploader, layout):

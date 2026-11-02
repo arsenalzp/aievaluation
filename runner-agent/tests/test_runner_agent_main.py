@@ -67,8 +67,10 @@ def test_multi_turn_suite_runs_the_multi_turn_path(runner, monkeypatch):
                           "runs/run1/conversations/travel-001.json"}
     gate = store["runs/run1/gate_summary.json"]
     assert gate["verdict"] == "PASS" and gate["interactionMode"] == "MultiTurn"
-    assert gate["artifacts"]["gateSummaryUri"] == "s3://bucket/runs/run1/gate_summary.json"
-    assert gate["artifacts"]["violationsUri"] == "s3://bucket/runs/run1/violations.jsonl"
+    # same URI form as the RAG runner: {S3_ENDPOINT}/buckets/{bucket}/objects/{key}
+    assert gate["artifacts"]["gateSummaryUri"] == "http://s3/buckets/bucket/objects/runs/run1/gate_summary.json"
+    assert gate["artifacts"]["violationsUri"] == "http://s3/buckets/bucket/objects/runs/run1/violations.jsonl"
+    assert gate["rootCause"] == {"stage": "None"}
     assert {r["sessionId"] for r in agent.requests} == {"evalrun-run1-travel-001"}
 
 
@@ -87,6 +89,7 @@ def test_malformed_multi_turn_dataset_publishes_a_dataset_failure(runner):
     gate = store["runs/run1/gate_summary.json"]
     assert gate["verdict"] == "FAIL"
     assert gate["rootCause"]["stage"] == "Dataset" and gate["rootCause"]["caseId"] == "broken-1"
+    assert gate["artifacts"]["gateSummaryUri"] == "http://s3/buckets/bucket/objects/runs/run1/gate_summary.json"
     assert "turns[0].role" in gate["rootCause"]["details"]
 
 
@@ -137,6 +140,11 @@ def test_single_turn_flow_is_unchanged(runner, monkeypatch):
     gate = store["runs/run1/gate_summary.json"]
     assert gate["verdict"] == "PASS" and gate["schemaVersion"] == "evalrun.gate_summary/v1"
     assert "interactionMode" not in gate
+    assert gate["artifacts"] == {
+        "gateSummaryUri": "http://s3/buckets/bucket/objects/runs/run1/gate_summary.json",
+        "scoresUri": "http://s3/buckets/bucket/objects/runs/run1/scores.json",
+        "detailsUri": "http://s3/buckets/bucket/objects/runs/run1/details.jsonl",
+    }
 
 
 def test_max_policy_violations_is_read_from_agent_metrics(runner, monkeypatch):

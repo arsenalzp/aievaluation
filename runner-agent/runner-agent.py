@@ -158,6 +158,11 @@ def now_epoch_ms() -> int:
     return int(time.time() * 1000)
 
 
+def artifact_uri(cfg: "RunnerConfig", key: str) -> str:
+    """Artifact URI in the object-store gateway form used by all runners: {S3_ENDPOINT}/buckets/{bucket}/objects/{key}."""
+    return f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{key}"
+
+
 def ensure_dir(path: str) -> None:
     if path:
         os.makedirs(path, exist_ok=True)
@@ -1452,9 +1457,9 @@ def build_gate_summary(
     summary_parts.append(f"passed_cases={agg.passed_cases}")
 
     artifacts = {
-        "gateSummaryUri": f"s3://{cfg.s3_bucket}/{cfg.gate_summary_key}",
-        "scoresUri": f"s3://{cfg.s3_bucket}/{cfg.scores_key}",
-        "detailsUri": f"s3://{cfg.s3_bucket}/{cfg.details_key}",
+        "gateSummaryUri": artifact_uri(cfg, cfg.gate_summary_key),
+        "scoresUri": artifact_uri(cfg, cfg.scores_key),
+        "detailsUri": artifact_uri(cfg, cfg.details_key),
     }
 
     return GateSummary(
@@ -1658,9 +1663,9 @@ async def main() -> int:
                     **({"caseId": e.case_id} if isinstance(e, DatasetError) and e.case_id else {}),
                 },
                 artifacts={
-                    "gateSummaryUri": f"s3://{cfg.s3_bucket}/{cfg.gate_summary_key}",
-                    "scoresUri": f"s3://{cfg.s3_bucket}/{cfg.scores_key}",
-                    "detailsUri": f"s3://{cfg.s3_bucket}/{cfg.details_key}",
+                    "gateSummaryUri": artifact_uri(cfg, cfg.gate_summary_key),
+                    "scoresUri": artifact_uri(cfg, cfg.scores_key),
+                    "detailsUri": artifact_uri(cfg, cfg.details_key),
                 },
             )
             publish_gate_summary(cfg, gate)

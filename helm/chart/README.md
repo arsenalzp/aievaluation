@@ -14,6 +14,7 @@ Traditional CI/CD checks are not enough for RAG and AI Agent systems.
 
 A service can pass unit tests, integration tests, and smoke tests, but still fail because:
 
+- security or privacy vulnerabilities are exposed (e.g., PII leakage or prompt injections);
 - retrieved context is incomplete or irrelevant;
 - generated answers are not faithful to retrieved evidence;
 - answer quality regresses after prompt, model, dataset, or retrieval changes;
@@ -75,7 +76,7 @@ After that is it necessary to create all CRDs as descibed below.
    - Runs inside the Kubernetes `Job`.
    - Downloads a JSONL evaluation dataset from S3-compatible object storage.
    - Calls the target RAG or AI endpoint.
-   - Computes evaluation scores.
+   - Computes evaluation scores and runs zero-tolerance security audits (Safety Judge).
    - Publishes structured artifacts to object storage.
 
 High-level flow:
@@ -282,9 +283,9 @@ Example:
     "details": "faithfulness_avg=0.6099 < minFaithfulness=0.7500"
   },
   "artifacts": {
-    "gateSummaryUri": "s3://eval-artifacts/summary-test.json",
-    "scoresUri": "s3://eval-artifacts/scores-test.json",
-    "detailsUri": "s3://eval-artifacts/details_key.json"
+    "gateSummaryUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/gate_summary.json",
+    "scoresUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/scores.json",
+    "detailsUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/details.jsonl"
   }
 }
 ```
@@ -551,14 +552,19 @@ Example:
     "stage": "None"
   },
   "artifacts": {
-    "gateSummaryUri": "s3://eval-artifacts/summary-test.json",
-    "scoresUri": "s3://eval-artifacts/scores-test.json",
-    "detailsUri": "s3://eval-artifacts/details_key.json"
+    "gateSummaryUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/gate_summary.json",
+    "scoresUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/scores.json",
+    "detailsUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/details.jsonl"
   }
 }
 ```
 
 The controller reads `gate_summary.json` and updates `EvalRun.status`.
+
+All runners (RAG, agent single-turn, agent multi-turn) report artifact URIs in the same object-store gateway form,
+`{S3_ENDPOINT}/buckets/{bucket}/objects/{key}`, for example
+`http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/gate_summary.json`. The controller copies them into
+`EvalRun.status.artifacts` unchanged. (When `run_local.py` has no gateway endpoint it falls back to `s3://{bucket}/{key}`.)
 
 Multi-turn evaluation adds `manifest.json`, `violations.jsonl` and `conversations/<case-id>.json` next to these files,
 see [Multi-turn Agent Evaluation](#multi-turn-agent-evaluation).
@@ -798,7 +804,7 @@ Example: `knowledgeRetention=0.94`, `conversationCompleteness=0.92`, one critica
     "required": "<= 0",
     "caseId": "travel-correction-001",
     "turnIndex": 2,
-    "artifactUri": "s3://eval-artifacts/runs/demo-run/conversations/travel-correction-001.json",
+    "artifactUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/conversations/travel-correction-001.json",
     "details": "'book_flight' was called without the required event 'explicit_user_confirmation'"
   }
 }
@@ -1273,6 +1279,7 @@ The current implementation focuses on:
 - JSONL dataset processing;
 - S3-compatible artifact publishing;
 - gate summary propagation into `EvalRun.status`;
+- threshold-based evaluation policy and zero-tolerance security/safety audits (Safety Judge);
 - threshold-based evaluation policy;
 - scripted multi-turn agent evaluation with deterministic trajectory/policy checks, optional DeepEval semantic scores and Phoenix/OpenInference trajectories;
 - regression comparison against a baseline;
@@ -1309,7 +1316,7 @@ Planned improvements:
 - more controller reconciliation tests;
 - optional Helm chart;
 - integration examples for GitHub Actions, Argo Rollouts, Tekton, and OpenShift Pipelines;
-- additional evaluation dimensions for security and privacy checks.
+- expanded evaluation dimensions for security, privacy checks, and red-teaming.
 
 ---
 

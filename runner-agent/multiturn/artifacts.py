@@ -86,6 +86,9 @@ class ArtifactLayout:
     manifest_key: str
     violations_key: str
     conversations_prefix: str
+    # Object-store gateway base URL (S3_ENDPOINT). Artifact URIs use the same form as the RAG runner:
+    # {endpoint}/buckets/{bucket}/objects/{key}. Without an endpoint (local runs) they fall back to s3://bucket/key.
+    endpoint: str = ""
 
     @classmethod
     def from_env(cls, bucket: str, gate_summary_key: str, scores_key: str, details_key: str,
@@ -98,9 +101,12 @@ class ArtifactLayout:
             manifest_key=env.get("MANIFEST_KEY") or join("manifest.json"),
             violations_key=env.get("VIOLATIONS_KEY") or join("violations.jsonl"),
             conversations_prefix=(env.get("CONVERSATIONS_PREFIX") or join("conversations")).rstrip("/"),
+            endpoint=(env.get("S3_ENDPOINT") or "").rstrip("/"),
         )
 
     def uri(self, key: str) -> str:
+        if self.endpoint:
+            return f"{self.endpoint}/buckets/{self.bucket}/objects/{key}"
         return f"s3://{self.bucket}/{key}"
 
     def conversation_key(self, case_id: str, trial: int) -> str:

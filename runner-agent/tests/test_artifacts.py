@@ -58,8 +58,15 @@ def test_layout_keys_and_uris():
     assert layout.manifest_key == "runs/r/manifest.json"
     assert layout.conversation_key("a/b c", 1) == "runs/r/conversations/a_b_c.json"
     assert layout.conversation_key("a", 3) == "runs/r/conversations/a__t3.json"
+    # without a gateway endpoint (local runs) URIs fall back to s3://bucket/key
     uris = layout.artifact_uris()
     assert uris["violationsUri"] == "s3://bkt/runs/r/violations.jsonl" and uris["conversationsUri"].endswith("/conversations/")
+    # in a Job S3_ENDPOINT is set and URIs use the same gateway form as the RAG runner
+    gw = ArtifactLayout.from_env("bkt", "runs/r/gate_summary.json", "runs/r/scores.json", "runs/r/details.jsonl",
+                                 {"S3_ENDPOINT": "http://k8s:9876/"})
+    assert gw.uri("runs/r/scores.json") == "http://k8s:9876/buckets/bkt/objects/runs/r/scores.json"
+    assert gw.artifact_uris()["gateSummaryUri"] == "http://k8s:9876/buckets/bkt/objects/runs/r/gate_summary.json"
+    assert gw.artifact_uris()["conversationsUri"] == "http://k8s:9876/buckets/bkt/objects/runs/r/conversations/"
     env = {"MANIFEST_KEY": "m.json", "VIOLATIONS_KEY": "v.jsonl", "CONVERSATIONS_PREFIX": "convs/"}
     custom = ArtifactLayout.from_env("bkt", "g.json", "s.json", "d.jsonl", env)
     assert (custom.manifest_key, custom.violations_key, custom.conversations_prefix) == ("m.json", "v.jsonl", "convs")

@@ -283,9 +283,9 @@ Example:
     "details": "faithfulness_avg=0.6099 < minFaithfulness=0.7500"
   },
   "artifacts": {
-    "gateSummaryUri": "s3://eval-artifacts/summary-test.json",
-    "scoresUri": "s3://eval-artifacts/scores-test.json",
-    "detailsUri": "s3://eval-artifacts/details_key.json"
+    "gateSummaryUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/gate_summary.json",
+    "scoresUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/scores.json",
+    "detailsUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/details.jsonl"
   }
 }
 ```
@@ -552,14 +552,19 @@ Example:
     "stage": "None"
   },
   "artifacts": {
-    "gateSummaryUri": "s3://eval-artifacts/summary-test.json",
-    "scoresUri": "s3://eval-artifacts/scores-test.json",
-    "detailsUri": "s3://eval-artifacts/details_key.json"
+    "gateSummaryUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/gate_summary.json",
+    "scoresUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/scores.json",
+    "detailsUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/details.jsonl"
   }
 }
 ```
 
 The controller reads `gate_summary.json` and updates `EvalRun.status`.
+
+All runners (RAG, agent single-turn, agent multi-turn) report artifact URIs in the same object-store gateway form,
+`{S3_ENDPOINT}/buckets/{bucket}/objects/{key}`, for example
+`http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/gate_summary.json`. The controller copies them into
+`EvalRun.status.artifacts` unchanged. (When `run_local.py` has no gateway endpoint it falls back to `s3://{bucket}/{key}`.)
 
 Multi-turn evaluation adds `manifest.json`, `violations.jsonl` and `conversations/<case-id>.json` next to these files,
 see [Multi-turn Agent Evaluation](#multi-turn-agent-evaluation).
@@ -799,7 +804,7 @@ Example: `knowledgeRetention=0.94`, `conversationCompleteness=0.92`, one critica
     "required": "<= 0",
     "caseId": "travel-correction-001",
     "turnIndex": 2,
-    "artifactUri": "s3://eval-artifacts/runs/demo-run/conversations/travel-correction-001.json",
+    "artifactUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/demo-run/conversations/travel-correction-001.json",
     "details": "'book_flight' was called without the required event 'explicit_user_confirmation'"
   }
 }

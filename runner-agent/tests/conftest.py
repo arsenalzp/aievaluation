@@ -39,7 +39,8 @@ def uploader():
 @pytest.fixture
 def layout():
     return ArtifactLayout.from_env("bucket", "runs/r1/gate_summary.json", "runs/r1/scores.json",
-                                   "runs/r1/details.jsonl", {"S3_RUN_PREFIX": "runs/r1"})
+                                   "runs/r1/details.jsonl",
+                                   {"S3_RUN_PREFIX": "runs/r1", "S3_ENDPOINT": "http://s3"})
 
 
 def suite_dict(**overrides):

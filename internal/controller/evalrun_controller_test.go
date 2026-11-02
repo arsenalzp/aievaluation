@@ -1018,17 +1018,17 @@ const failingGateSummaryJSON = `{
     "required": "<= 0",
     "caseId": "travel-approval-001",
     "turnIndex": 4,
-    "artifactUri": "s3://eval-artifacts/runs/run-1/conversations/travel-approval-001.json",
+    "artifactUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/conversations/travel-approval-001.json",
     "details": "'book_flight' was called without the required event 'explicit_user_confirmation'"
   },
   "findings": [{"level": "FAIL", "stage": "Policy"}],
   "artifacts": {
-    "gateSummaryUri": "s3://eval-artifacts/runs/run-1/gate_summary.json",
-    "scoresUri": "s3://eval-artifacts/runs/run-1/scores.json",
-    "detailsUri": "s3://eval-artifacts/runs/run-1/details.jsonl",
-    "manifestUri": "s3://eval-artifacts/runs/run-1/manifest.json",
-    "violationsUri": "s3://eval-artifacts/runs/run-1/violations.jsonl",
-    "conversationsUri": "s3://eval-artifacts/runs/run-1/conversations/"
+    "gateSummaryUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/gate_summary.json",
+    "scoresUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/scores.json",
+    "detailsUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/details.jsonl",
+    "manifestUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/manifest.json",
+    "violationsUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/violations.jsonl",
+    "conversationsUri": "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/conversations/"
   }
 }`
 
@@ -1082,7 +1082,7 @@ func TestGateSummaryWithCriticalViolationIsPropagatedToStatus(t *testing.T) {
 	if rc.TurnIndex == nil || *rc.TurnIndex != 4 {
 		t.Fatalf("turn index not preserved: %v", rc.TurnIndex)
 	}
-	if rc.ArtifactURI != "s3://eval-artifacts/runs/run-1/conversations/travel-approval-001.json" {
+	if rc.ArtifactURI != "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/conversations/travel-approval-001.json" {
 		t.Fatalf("artifact uri not preserved: %s", rc.ArtifactURI)
 	}
 	if !strings.Contains(updated.Status.Summary, "without the required event") {
@@ -1098,12 +1098,12 @@ func TestGateSummaryArtifactURIsArePropagatedToStatus(t *testing.T) {
 	a := updated.Status.Artifacts
 
 	want := map[string]string{
-		a.GateSummaryUri:   "s3://eval-artifacts/runs/run-1/gate_summary.json",
-		a.ScoresUri:        "s3://eval-artifacts/runs/run-1/scores.json",
-		a.DetailsUri:       "s3://eval-artifacts/runs/run-1/details.jsonl",
-		a.ManifestUri:      "s3://eval-artifacts/runs/run-1/manifest.json",
-		a.ViolationsUri:    "s3://eval-artifacts/runs/run-1/violations.jsonl",
-		a.ConversationsUri: "s3://eval-artifacts/runs/run-1/conversations/",
+		a.GateSummaryUri:   "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/gate_summary.json",
+		a.ScoresUri:        "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/scores.json",
+		a.DetailsUri:       "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/details.jsonl",
+		a.ManifestUri:      "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/manifest.json",
+		a.ViolationsUri:    "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/violations.jsonl",
+		a.ConversationsUri: "http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/conversations/",
 	}
 	for got, expected := range want {
 		if got != expected {
@@ -1115,7 +1115,7 @@ func TestGateSummaryArtifactURIsArePropagatedToStatus(t *testing.T) {
 func TestWarnVerdictIsPropagatedWithGateWarningCondition(t *testing.T) {
 	warn := `{"verdict":"WARN","summary":"Passed with warnings (1): judge unavailable",
 	  "rootCause":{"stage":"Evaluator","evaluator":"conversation-quality","code":"EVALUATOR_FAILURE","details":"judge unavailable"},
-	  "artifacts":{"gateSummaryUri":"s3://b/g.json"}}`
+	  "artifacts":{"gateSummaryUri":"http://k8s:9876/buckets/b/objects/g.json"}}`
 	updated := reconcileFinishedRun(t, warn)
 
 	if updated.Status.Verdict != "WARN" || updated.Status.Phase != aieval.PhaseCompleted {
@@ -1133,7 +1133,7 @@ func TestWarnVerdictIsPropagatedWithGateWarningCondition(t *testing.T) {
 func TestSingleTurnGateSummaryStillPropagates(t *testing.T) {
 	old := `{"schemaVersion":"evalrun.gate_summary/v1","evaluationType":"agent","verdict":"PASS","summary":"ok",
 	  "rootCause":{"stage":"None"},
-	  "artifacts":{"gateSummaryUri":"s3://b/g.json","scoresUri":"s3://b/s.json","detailsUri":"s3://b/d.jsonl"}}`
+	  "artifacts":{"gateSummaryUri":"http://k8s:9876/buckets/b/objects/g.json","scoresUri":"http://k8s:9876/buckets/b/objects/s.json","detailsUri":"http://k8s:9876/buckets/b/objects/d.jsonl"}}`
 	updated := reconcileFinishedRun(t, old)
 	if updated.Status.Verdict != "PASS" || updated.Status.RootCause.Stage != "None" || updated.Status.Artifacts.ManifestUri != "" {
 		t.Fatalf("unexpected status for single-turn gate: %+v", updated.Status)
@@ -1204,7 +1204,7 @@ func TestFailedJobKeepsTheRunnersPublishedRootCause(t *testing.T) {
 	// The runner exits non-zero for dataset/configuration errors but publishes a precise FAIL gate first.
 	published := `{"verdict":"FAIL","summary":"Execution failure: bad dataset",
 	  "rootCause":{"stage":"Dataset","caseId":"broken-1","details":"field=turns[0].role"},
-	  "artifacts":{"gateSummaryUri":"s3://eval-artifacts/runs/run-1/gate_summary.json"}}`
+	  "artifacts":{"gateSummaryUri":"http://k8s:9876/buckets/eval-artifacts/objects/runs/run-1/gate_summary.json"}}`
 	r := newTestReconciler(t, run, suite, dataset, job)
 	r.GateFetcher = func(context.Context, *aieval.EvalRun, string) (*aieval.GateSummary, error) {
 		var g aieval.GateSummary
