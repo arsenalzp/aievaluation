@@ -148,6 +148,23 @@ func (r *EvalRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
+	// 1.1) Runs created by a controller version without status.observedGeneration: their Job was built for
+	// the first generation (legacy job name and artifact prefix). Adopting them as generation 1 keeps them
+	// untouched when the spec never changed and re-evaluates them when it did.
+	if run.Status.ObservedGeneration == 0 && run.Status.JobRef.Name != "" {
+		patch := client.MergeFrom(run.DeepCopy())
+		run.Status.ObservedGeneration = 1
+		if err := r.Status().Patch(ctx, &run, patch); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// 1.2) The spec changed after the evaluation started (e.g. a new gitSHA was applied to the same EvalRun):
+	// the previous verdict no longer describes this spec, so discard it and evaluate again.
+	if run.Status.ObservedGeneration != 0 && run.Generation > run.Status.ObservedGeneration {
+		return r.restartEvalRun(ctx, &run)
+	}
+
 	// 2) Load EvalSuite (policy/dependency)
 	suiteName := run.Spec.SuiteRef
 	if suiteName.Name == "" {
@@ -208,6 +225,8 @@ func (r *EvalRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 
+		// The Job evaluates the current spec; the artifact prefix depends on this generation.
+		run.Status.ObservedGeneration = run.Generation
 		newJob := buildEvalJob(&run, &suite, &dataset, jobName, suiteCfgCM)
 		if err := controllerutil.SetControllerReference(&run, newJob, r.Scheme); err != nil {
 			return ctrl.Result{}, err
@@ -217,7 +236,11 @@ func (r *EvalRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 
-		patch := client.MergeFrom(run.DeepCopy())
+		// ObservedGeneration was already set in memory for buildEvalJob; clear it in the patch base so the
+		// merge patch carries it.
+		base := run.DeepCopy()
+		base.Status.ObservedGeneration = 0
+		patch := client.MergeFrom(base)
 		run.Status.Phase = aieval.PhaseRunning
 		run.Status.JobRef = v1.LocalObjectReference{Name: jobName}
 		run.Status.StartedAt = metav1.Now()
@@ -230,6 +253,17 @@ func (r *EvalRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// 4.1) The Job exists but recording it in the status failed earlier: record it now, so that a later
+	// spec change is detected and the artifacts are read from this generation's prefix.
+	if run.Status.JobRef.Name == "" {
+		patch := client.MergeFrom(run.DeepCopy())
+		run.Status.JobRef = v1.LocalObjectReference{Name: jobName}
+		run.Status.ObservedGeneration = run.Generation
+		if err := r.Status().Patch(ctx, &run, patch); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 5) Observe Job completion/failure
@@ -359,9 +393,66 @@ func jobTerminalState(job *batchv1.Job) (completed bool, failed bool, reason str
 	return false, false, "", ""
 }
 
+// restartEvalRun discards the result of a previous spec generation: it deletes the old Job (its pods go
+// with it) and resets the status so the next reconcile creates a Job for the current generation.
+// Artifacts of the previous generation stay in the object store under their own prefix.
+func (r *EvalRunReconciler) restartEvalRun(ctx context.Context, run *aieval.EvalRun) (ctrl.Result, error) {
+	l := log.FromContext(ctx).WithValues("evalrun", client.ObjectKeyFromObject(run))
+
+	if old := run.Status.JobRef.Name; old != "" {
+		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: old, Namespace: run.Namespace}}
+		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+	}
+
+	previous := run.Status.ObservedGeneration
+	run.Status = aieval.EvalRunStatus{
+		Phase:   aieval.PhasePending,
+		Summary: fmt.Sprintf("EvalRun spec changed (generation %d -> %d); re-evaluating", previous, run.Generation),
+	}
+	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type:               "Reevaluating",
+		Status:             metav1.ConditionTrue,
+		Reason:             "SpecChanged",
+		Message:            run.Status.Summary,
+		LastTransitionTime: metav1.Now(),
+	})
+	if err := r.Status().Update(ctx, run); err != nil {
+		return ctrl.Result{}, err
+	}
+	if r.Queue != nil {
+		r.Queue.Forget(run.Name)
+	}
+
+	l.Info("spec changed, re-evaluating", "previousGeneration", previous, "generation", run.Generation)
+	return ctrl.Result{RequeueAfter: time.Second}, nil
+}
+
+// generationSuffix keeps the first generation on the legacy names and suffixes later ones, so a
+// re-evaluation never collides with the previous Job or overwrites the previous artifacts.
+func generationSuffix(gen int64) string {
+	if gen <= 1 {
+		return ""
+	}
+	return fmt.Sprintf("-g%d", gen)
+}
+
 func desiredJobName(run *aieval.EvalRun) string {
-	// Deterministic name makes idempotency trivial
-	return fmt.Sprintf("evalrun-%s", run.Name)
+	if run.Status.JobRef.Name != "" {
+		return run.Status.JobRef.Name
+	}
+	// Deterministic name per spec generation makes idempotency trivial
+	return fmt.Sprintf("evalrun-%s%s", run.Name, generationSuffix(run.Generation))
+}
+
+// runArtifactPrefix is the object-store prefix of the generation the current Job evaluates:
+// runs/<name> for the first generation (unchanged layout), runs/<name>/g<N> for re-evaluations.
+func runArtifactPrefix(run *aieval.EvalRun) string {
+	if gen := run.Status.ObservedGeneration; gen > 1 {
+		return fmt.Sprintf("runs/%s/g%d", run.Name, gen)
+	}
+	return fmt.Sprintf("runs/%s", run.Name)
 }
 
 func hashSuiteSpec(suite *aieval.EvalSuite) string {
@@ -389,7 +480,7 @@ func buildEvalJob(
 	backoff := int32(0)
 	runnerImage := suite.Spec.Execution.RunnerImage
 
-	runPrefix := fmt.Sprintf("runs/%s", run.Name)
+	runPrefix := runArtifactPrefix(run)
 	baselineKey := fmt.Sprintf("baselines/%s.json", suite.Name)
 
 	datasetBucket := ""
@@ -429,7 +520,7 @@ func buildEvalJob(
 		{Name: "VIOLATIONS_KEY", Value: fmt.Sprintf("%s/violations.jsonl", runPrefix)},
 		{Name: "CONVERSATIONS_PREFIX", Value: fmt.Sprintf("%s/conversations", runPrefix)},
 		{Name: "S3_SUMMARY_BUCKET", Value: run.Spec.SummaryBucket},
-		{Name: "S3_SUMMARY_KEY", Value: fmt.Sprintf("runs/%s/gate_summary.json", run.Name)},
+		{Name: "S3_SUMMARY_KEY", Value: fmt.Sprintf("%s/gate_summary.json", runPrefix)},
 		{Name: "TARGET_ENDPOINT", Value: run.Spec.TargetEndpoint},
 		{Name: "OPENAI_MODEL", Value: run.Spec.Model},
 		{Name: "OPENAI_EMBEDDER", Value: run.Spec.Embedder},
@@ -690,7 +781,7 @@ func (r *EvalRunReconciler) ensureSuiteConfigMap(ctx context.Context, suite *aie
 func (r *EvalRunReconciler) buildGateReaderPod(run *aieval.EvalRun) *corev1.Pod {
 	podName := fmt.Sprintf("gate-reader-%s", run.Name)
 
-	gatePath := fmt.Sprintf("%s/runs/%s/gate_summary.json", artifactsMount, run.Name)
+	gatePath := fmt.Sprintf("%s/%s/gate_summary.json", artifactsMount, runArtifactPrefix(run))
 	cmd := fmt.Sprintf("set -e; cat %s", gatePath)
 
 	return &corev1.Pod{
@@ -737,7 +828,7 @@ func (r *EvalRunReconciler) fetchGateSummary(ctx context.Context, suite *aieval.
 }
 
 func fetchGateSummaryFromObjectStorage(run *aieval.EvalRun, bucketEndpoint string) (*aieval.GateSummary, error) {
-	key := fmt.Sprintf("runs/%s/gate_summary.json", run.Name)
+	key := fmt.Sprintf("%s/gate_summary.json", runArtifactPrefix(run))
 	objectStorClnt := objectstorage.NewClient(bucketEndpoint)
 	obj, err := objectStorClnt.GetObject(run.Spec.SummaryBucket, key)
 	if err != nil {

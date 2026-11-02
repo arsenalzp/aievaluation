@@ -1227,3 +1227,179 @@ func TestFailedJobKeepsTheRunnersPublishedRootCause(t *testing.T) {
 		t.Fatalf("artifact URI lost")
 	}
 }
+
+// ============================================================
+// Re-evaluation when the EvalRun spec changes
+// ============================================================
+
+// finishedRunAtGeneration returns a COMPLETED/PASS run whose spec is at metadata.generation gen while
+// its Job and status belong to observedGen (0 = created by a controller without observedGeneration).
+func finishedRunAtGeneration(gen, observedGen int64) *aieval.EvalRun {
+	run := testEvalRun("run-1")
+	run.Generation = gen
+	run.Status.Phase = aieval.PhaseCompleted
+	run.Status.Verdict = "PASS"
+	run.Status.Summary = "old result"
+	run.Status.RootCause = aieval.RootCause{Stage: "None"}
+	run.Status.JobRef = v1.LocalObjectReference{Name: "evalrun-run-1"}
+	run.Status.ObservedGeneration = observedGen
+	return run
+}
+
+func getRun(t *testing.T, r *EvalRunReconciler) aieval.EvalRun {
+	t.Helper()
+	var run aieval.EvalRun
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "run-1", Namespace: "default"}, &run); err != nil {
+		t.Fatal(err)
+	}
+	return run
+}
+
+func TestGenerationAwareJobNameAndArtifactPrefix(t *testing.T) {
+	run := testEvalRun("run-1")
+	run.Generation = 1
+	if got := desiredJobName(run); got != "evalrun-run-1" {
+		t.Fatalf("generation 1 must keep the legacy job name, got %s", got)
+	}
+	if got := runArtifactPrefix(run); got != "runs/run-1" {
+		t.Fatalf("unexpected prefix %s", got)
+	}
+
+	run.Generation = 3
+	if got := desiredJobName(run); got != "evalrun-run-1-g3" {
+		t.Fatalf("unexpected job name for generation 3: %s", got)
+	}
+	run.Status.ObservedGeneration = 3
+	if got := runArtifactPrefix(run); got != "runs/run-1/g3" {
+		t.Fatalf("unexpected prefix for generation 3: %s", got)
+	}
+
+	run.Status.JobRef = v1.LocalObjectReference{Name: "evalrun-run-1"}
+	if got := desiredJobName(run); got != "evalrun-run-1" {
+		t.Fatalf("a recorded Job must win over the computed name, got %s", got)
+	}
+}
+
+func TestSpecChangeReevaluatesCompletedRun(t *testing.T) {
+	ctx := context.Background()
+	suite, dataset := testEvalSuite("suite-1"), testEvalDataset("dataset-1")
+	run := finishedRunAtGeneration(2, 1) // a new gitSHA was applied after the first evaluation finished
+	run.Status.SuiteSpecHash = hashSuiteSpec(suite)
+	oldJob := completedJob(run, suite, dataset)
+
+	r := newTestReconciler(t, run, suite, dataset, oldJob)
+	r.GateFetcher = func(_ context.Context, got *aieval.EvalRun, _ string) (*aieval.GateSummary, error) {
+		if got.Status.ObservedGeneration != 2 {
+			t.Fatalf("gate must be read for generation 2, got %d", got.Status.ObservedGeneration)
+		}
+		return &aieval.GateSummary{Verdict: "FAIL", Summary: "new result", RootCause: aieval.RootCause{Stage: "Policy"}}, nil
+	}
+
+	// 1st reconcile: the old result is discarded.
+	if _, err := r.Reconcile(ctx, reconcileRequest("run-1")); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	reset := getRun(t, r)
+	if reset.Status.Phase != aieval.PhasePending || reset.Status.Verdict != "" || reset.Status.JobRef.Name != "" {
+		t.Fatalf("expected a reset PENDING status, got phase=%s verdict=%q job=%q", reset.Status.Phase, reset.Status.Verdict, reset.Status.JobRef.Name)
+	}
+	if reset.Status.ObservedGeneration == reset.Generation {
+		t.Fatalf("observedGeneration must not claim the new generation before its Job exists")
+	}
+	if c := meta.FindStatusCondition(reset.Status.Conditions, "Reevaluating"); c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("expected Reevaluating condition, got %+v", reset.Status.Conditions)
+	}
+	var gone batchv1.Job
+	if err := r.Get(ctx, types.NamespacedName{Name: "evalrun-run-1", Namespace: "default"}, &gone); err == nil {
+		t.Fatalf("the previous generation's Job must be deleted")
+	}
+
+	// 2nd reconcile: a Job for generation 2 with its own artifact prefix.
+	if _, err := r.Reconcile(ctx, reconcileRequest("run-1")); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	running := getRun(t, r)
+	if running.Status.Phase != aieval.PhaseRunning || running.Status.ObservedGeneration != 2 || running.Status.JobRef.Name != "evalrun-run-1-g2" {
+		t.Fatalf("expected RUNNING generation 2 with job evalrun-run-1-g2, got %s/%d/%s",
+			running.Status.Phase, running.Status.ObservedGeneration, running.Status.JobRef.Name)
+	}
+	var newJob batchv1.Job
+	if err := r.Get(ctx, types.NamespacedName{Name: "evalrun-run-1-g2", Namespace: "default"}, &newJob); err != nil {
+		t.Fatalf("expected the generation 2 Job: %v", err)
+	}
+	env := envMap(newJob.Spec.Template.Spec.Containers[0].Env)
+	for name, want := range map[string]string{
+		"GATE_SUMMARY_KEY": "runs/run-1/g2/gate_summary.json",
+		"S3_SUMMARY_KEY":   "runs/run-1/g2/gate_summary.json",
+		"S3_RUN_PREFIX":    "runs/run-1/g2",
+	} {
+		if env[name].Value != want {
+			t.Fatalf("%s = %q, want %q", name, env[name].Value, want)
+		}
+	}
+
+	// 3rd reconcile after the new Job finished: the new verdict replaces the old one.
+	newJob.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	if err := r.Status().Update(ctx, &newJob); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcileRequest("run-1")); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	done := getRun(t, r)
+	if done.Status.Phase != aieval.PhaseCompleted || done.Status.Verdict != "FAIL" || done.Status.Summary != "new result" || done.Status.ObservedGeneration != 2 {
+		t.Fatalf("expected the generation 2 verdict, got %s/%s/%q/%d", done.Status.Phase, done.Status.Verdict, done.Status.Summary, done.Status.ObservedGeneration)
+	}
+}
+
+func TestUnchangedCompletedRunIsNotReevaluated(t *testing.T) {
+	ctx := context.Background()
+	suite, dataset := testEvalSuite("suite-1"), testEvalDataset("dataset-1")
+	run := finishedRunAtGeneration(1, 1)
+	run.Status.SuiteSpecHash = hashSuiteSpec(suite)
+	r := newTestReconciler(t, run, suite, dataset, completedJob(run, suite, dataset))
+
+	if _, err := r.Reconcile(ctx, reconcileRequest("run-1")); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	got := getRun(t, r)
+	if got.Status.Phase != aieval.PhaseCompleted || got.Status.Verdict != "PASS" || got.Status.Summary != "old result" {
+		t.Fatalf("an unchanged run must keep its result, got %s/%s/%q", got.Status.Phase, got.Status.Verdict, got.Status.Summary)
+	}
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs, client.InNamespace("default")); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 || jobs.Items[0].Name != "evalrun-run-1" {
+		t.Fatalf("expected only the original Job, got %d", len(jobs.Items))
+	}
+}
+
+func TestLegacyRunWithoutObservedGenerationIsAdopted(t *testing.T) {
+	ctx := context.Background()
+	suite, dataset := testEvalSuite("suite-1"), testEvalDataset("dataset-1")
+
+	// Spec never changed: adopted as generation 1, result kept.
+	run := finishedRunAtGeneration(1, 0)
+	run.Status.SuiteSpecHash = hashSuiteSpec(suite)
+	r := newTestReconciler(t, run, suite, dataset, completedJob(run, suite, dataset))
+	if _, err := r.Reconcile(ctx, reconcileRequest("run-1")); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	got := getRun(t, r)
+	if got.Status.ObservedGeneration != 1 || got.Status.Phase != aieval.PhaseCompleted || got.Status.Verdict != "PASS" {
+		t.Fatalf("expected adoption as generation 1 with the result kept, got %d/%s/%s", got.Status.ObservedGeneration, got.Status.Phase, got.Status.Verdict)
+	}
+
+	// Spec was re-applied before the upgrade: the old verdict may be stale, so it is re-evaluated.
+	stale := finishedRunAtGeneration(2, 0)
+	stale.Status.SuiteSpecHash = hashSuiteSpec(suite)
+	r = newTestReconciler(t, stale, suite, dataset, completedJob(stale, suite, dataset))
+	if _, err := r.Reconcile(ctx, reconcileRequest("run-1")); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	got = getRun(t, r)
+	if got.Status.Phase != aieval.PhasePending || got.Status.Verdict != "" {
+		t.Fatalf("expected a legacy run with a changed spec to be re-evaluated, got %s/%s", got.Status.Phase, got.Status.Verdict)
+	}
+}

@@ -51,10 +51,15 @@ spec:
         while [ "$ELAPSED" -lt "$DEADLINE" ]; do
           PHASE=$(oc get evalrun $(params.evalrun-name) -o jsonpath='{.status.phase}' 2>/dev/null || true)
           VERDICT=$(oc get evalrun $(params.evalrun-name) -o jsonpath='{.status.verdict}' 2>/dev/null || true)
+          GEN=$(oc get evalrun $(params.evalrun-name) -o jsonpath='{.metadata.generation}' 2>/dev/null || true)
+          OBSERVED=$(oc get evalrun $(params.evalrun-name) -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)
 
-          echo "elapsed=${ELAPSED}s phase=${PHASE:-PENDING} verdict=${VERDICT:-NONE}"
+          echo "elapsed=${ELAPSED}s generation=${GEN:-?} observed=${OBSERVED:-0} phase=${PHASE:-PENDING} verdict=${VERDICT:-NONE}"
 
-          if [ "$PHASE" = "COMPLETED" ]; then
+          # A status from an earlier spec generation (re-applied EvalRun) is stale: keep waiting.
+          if [ -z "$GEN" ] || [ "${OBSERVED:-0}" != "$GEN" ]; then
+            :
+          elif [ "$PHASE" = "COMPLETED" ]; then
             if [ "$VERDICT" = "PASS" ]; then
               echo "EvalRun VERDICT IS PASS!"
               exit 0

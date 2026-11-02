@@ -106,6 +106,12 @@ type EvalRunStatus struct {
 	RootCause        `json:"rootCause,omitempty"`
 	Artifacts        `json:"artifacts,omitempty"`
 	ExecutionFailure *ExecutionFailure `json:"executionFailure,omitempty"`
+	// ObservedGeneration is the metadata.generation of the EvalRun spec that the current Job and status belong to.
+	// When the spec changes (for example a new revision.gitSHA is applied to the same EvalRun), the controller
+	// discards the previous result and evaluates again. Clients waiting for a verdict must wait until
+	// status.observedGeneration equals metadata.generation before trusting status.phase and status.verdict.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`

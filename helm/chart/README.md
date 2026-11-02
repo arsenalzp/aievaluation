@@ -55,7 +55,9 @@ helm install evalrun-operator \
 --set 'rbacHelpers.enable=true' ./helm/chart
 ```
 
-After that is it necessary to create all CRDs as descibed below.
+The chart installs the CRDs and the controller. After that, create the `EvalDataset`, `EvalSuite` and `EvalRun`
+resources as described below. Chart values and the Argo Rollouts / Tekton / OpenShift Pipelines gate integrations
+are described in [Helm Chart](#helm-chart).
 
 ---
 
@@ -294,6 +296,35 @@ Example:
 `GateWarning` condition. `rootCause` always has `stage`; runners may add `metric`, `details`, `evaluator`, `code`,
 `caseId`, `turnIndex`, `observed`, `required` and `artifactUri`. Multi-turn runs add `manifestUri`, `violationsUri`
 and `conversationsUri` to `artifacts`. See [Multi-turn Agent Evaluation](#multi-turn-agent-evaluation).
+
+### Re-applying an EvalRun (re-evaluation)
+
+An `EvalRun` can be re-applied under the same name, for example by a CI job that uses one `EvalRun` per pull
+request and applies it again with a new `spec.revision.gitSHA` on every push. Any change to `spec` increases
+`metadata.generation`, and the controller evaluates again:
+
+1. `status.observedGeneration` is the spec generation that the current Job and status belong to.
+2. When `metadata.generation` is greater than `status.observedGeneration`, the controller deletes the previous Job,
+   resets the status to `PENDING` (condition `Reevaluating`, reason `SpecChanged`) and creates a new Job.
+3. The first generation keeps the original names (Job `evalrun-<name>`, artifacts under `runs/<name>/`).
+   Later generations use Job `evalrun-<name>-g<N>` and artifacts under `runs/<name>/g<N>/`, so the artifacts of
+   earlier generations are kept in the object store.
+
+Changes to labels, annotations or the referenced `EvalSuite` do not change `metadata.generation` and do not
+trigger a re-evaluation (an `EvalSuite` change is still reported by the `SuiteChanged` condition).
+
+A client that waits for a verdict must check that `status.observedGeneration` equals `metadata.generation`
+before it trusts `status.phase` and `status.verdict`; otherwise it can read the result of the previous
+generation in the moment before the controller resets it:
+
+```sh
+read -r GEN OBSERVED PHASE VERDICT <<<"$(kubectl get evalrun "$NAME" -n "$NS" \
+  -o jsonpath='{.metadata.generation} {.status.observedGeneration} {.status.phase} {.status.verdict}')"
+if [ "${OBSERVED:-0}" = "$GEN" ] && [ "$PHASE" = "COMPLETED" ]; then echo "verdict=$VERDICT"; fi
+```
+
+`EvalRun`s created by an earlier controller version have no `observedGeneration`. They are adopted as generation 1;
+if their spec was already changed (generation greater than 1), they are evaluated again once.
 
 ---
 
@@ -1206,16 +1237,167 @@ make bundle-push
 
 ### Helm Chart
 
-A Helm chart is not included yet.
+The Helm chart lives in `helm/chart` (chart `aievaluation`, version `1.1.0`). It installs:
 
-It may be added later to simplify installation and configuration of:
+- the CRDs (`EvalDataset`, `EvalSuite`, `EvalRun`) from `templates/crd/`;
+- the controller manager `Deployment`, its service account and RBAC;
+- optional admin/editor/viewer helper roles for the CRDs;
+- the optional metrics `Service` and Prometheus `ServiceMonitor`;
+- optional CI/CD gate integrations for Argo Rollouts, Tekton and OpenShift Pipelines.
 
-- operator image;
-- default runner image;
-- RBAC;
-- namespace configuration;
-- object storage configuration;
-- example resources.
+Install from the repository:
+
+```sh
+helm install evalrun-operator ./helm/chart \
+  --set 'manager.image.repository=quay.io/arsenalzp/evalrun-controller' \
+  --set 'manager.image.tag=1.0.1' \
+  --set 'rbacHelpers.enable=true'
+```
+
+Main values (`helm/chart/values.yaml`):
+
+| Value | Default | Description |
+|---|---|---|
+| `manager.image.repository` / `manager.image.tag` | `controller` / `latest` | Controller image. |
+| `manager.replicas`, `manager.resources`, `manager.nodeSelector`, `manager.tolerations`, `manager.affinity` | see file | Controller pod settings. |
+| `manager.env`, `manager.imagePullSecrets` | `[]` | Extra environment variables and pull secrets for the controller. |
+| `crd.enable` | `true` | Install the CRDs with the chart. |
+| `crd.keep` | `true` | Keep the CRDs when the release is uninstalled. |
+| `rbacHelpers.enable` | `false` | Install admin/editor/viewer roles for the CRDs. |
+| `metrics.enable` / `metrics.port` | `true` / `8443` | Expose the controller `/metrics` endpoint. |
+| `prometheus.enable` | `false` | Create a `ServiceMonitor` (requires prometheus-operator). |
+| `certManager.enable` | `false` | cert-manager integration for webhook and metrics certificates. |
+| `argoRollouts.enabled` / `argoRollouts.templateName` | `false` / `evalrun-ai-gate` | Install an Argo Rollouts `ClusterAnalysisTemplate`. |
+| `tekton.enabled` / `tekton.taskName` | `false` / `evalrun-ai-gate` | Install a Tekton `Task`. |
+| `openShiftPipelines.enabled` / `openShiftPipelines.taskName` | `false` / `evalrun-gate` | Install an OpenShift Pipelines `ClusterTask`. |
+
+The runner image is not a chart value: it is set per suite in `EvalSuite.spec.execution.runnerImage`.
+Object storage and the OpenAI credentials are configured through the `EvalDataset`/`EvalRun` resources and Secrets,
+not through the chart.
+
+#### CI/CD gate integrations
+
+The three integrations share the same logic and parameters (`evalrun-name`, `evalsuite-name`, `target-endpoint`,
+`git-sha`, default `unknown`). A `kubectl` step creates or re-applies the `EvalRun`, polls it every 10 seconds,
+ignores the status until `.status.observedGeneration` equals `.metadata.generation`
+(see [Re-applying an EvalRun](#re-applying-an-evalrun-re-evaluation)) and then:
+
+- exits `0` when the run is `COMPLETED` with verdict `PASS` (rollout promoted / pipeline step succeeds);
+- exits `1` when the verdict is anything else, including `WARN`;
+- exits `1` when the run is `FAILED` or after a 1500-second timeout.
+
+| Integration | Resource | Step image |
+|---|---|---|
+| Argo Rollouts | `ClusterAnalysisTemplate` (`argoproj.io/v1alpha1`), job metric `evalrun-verdict-check`, `failureLimit: 1` | `bitnami/kubectl:latest` |
+| Tekton | `Task` (`tekton.dev/v1beta1`) | `bitnami/kubectl:latest` |
+| OpenShift Pipelines | `ClusterTask` (`tekton.dev/v1beta1`) | `registry.redhat.io/openshift4/ose-cli:latest` |
+
+The service account that runs the step must be allowed to create and read `evalruns` in the target namespace.
+The Argo Rollouts template runs under the controller manager service account.
+
+Enable them at install time, for example:
+
+```sh
+helm upgrade --install evalrun-operator ./helm/chart \
+  --set 'argoRollouts.enabled=true' \
+  --set 'tekton.enabled=true'
+```
+
+The gate scripts rely on `status.observedGeneration`, which is reported by controller versions that include
+re-evaluation. With an older controller image they wait until the timeout, so upgrade the controller together
+with the chart.
+
+### GitHub Action
+
+A composite GitHub Action that turns an `EvalRun` into a pull-request gate is maintained in a **separate repository**
+(so it can be versioned and published independently of the operator). It talks to the cluster only through
+`kubectl` and the `EvalRun` status fields described in [EvalRun Status](#evalrun-status).
+
+What it does:
+
+1. Selects the `EvalSuite`: `default_evalsuite`, or the value of a PR label `evalsuite:<name>`.
+2. Selects the evaluation type: `rag` by default, `agent` when the PR has the label `type:agent` or `agent`
+   (manual `workflow_dispatch` runs always use `rag`).
+3. Checks that it may `create`, `get` and `patch` `evalruns` in the target namespace, renders an `EvalRun` manifest
+   from a template with `envsubst`, applies it and records the `metadata.generation` it applied. The `EvalRun` is named `pr-<number>-ai-eval` for pull requests and `manual-ai-eval-<run number>`
+   otherwise; the same `EvalRun` is re-applied on every push to the PR (see [Re-applying an EvalRun](#re-applying-an-evalrun-re-evaluation)).
+4. Waits up to 1500 seconds for phase `COMPLETED` or `FAILED` **of that generation**
+   (`status.observedGeneration` equal to the applied generation). If a newer push re-applies the same `EvalRun`
+   in the meantime, the older workflow fails as superseded instead of reporting the newer commit's result.
+5. Writes a job summary and creates or updates one PR comment with phase, verdict, suite, type, commit, the root cause
+   (`stage` plus `code`, `metric`, `evaluator`, `caseId`, `turnIndex`, `observed`, `required`, `details`, `artifactUri`
+   when the runner reports them) and the `scoresUri` / `gateSummaryUri` / `detailsUri` artifact links.
+6. Fails the workflow unless the phase is `COMPLETED` and the verdict is `PASS` (a `WARN` verdict also fails).
+
+Inputs:
+
+| Input | Default | Description |
+|---|---|---|
+| `template_path_rag` | `.github/templates/evalrun-rag.yaml.tpl` | `EvalRun` template for RAG evaluation. |
+| `template_path_agent` | `.github/templates/evalrun-agent.yaml.tpl` | `EvalRun` template for agent evaluation. |
+| `endpoint_rag` | `http://k8s:8080/rag/query?debug=true` | RAG target endpoint. |
+| `endpoint_agent` | `http://k8s:8080/agent/invoke` | Agent target endpoint. |
+| `default_namespace` | `default` | Namespace of the `EvalRun`. |
+| `default_evalsuite` | `demo-suite` | `EvalSuite` used when no `evalsuite:` label is set. |
+
+The templates are rendered with `envsubst`; the variables available to them are `EVALRUN_NAME`, `EVALSUITE_NAME`,
+`NAMESPACE`, `TARGET_ENDPOINT`, `PR_NUMBER`, `GIT_SHA`, `GITHUB_REPOSITORY` and `GITHUB_WORKFLOW`. A minimal template:
+
+```yaml
+apiVersion: ai.evaluation.io/v1alpha1
+kind: EvalRun
+metadata:
+  name: ${EVALRUN_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  suiteRef:
+    name: ${EVALSUITE_NAME}
+  targetEndpoint: "${TARGET_ENDPOINT}"
+  revision:
+    gitSHA: "${GIT_SHA}"
+    prNumber: ${PR_NUMBER}
+```
+
+Usage (replace `<owner>/<action-repo>@<tag>` with the action repository and a release tag):
+
+```yaml
+name: AI Evaluation Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]   # "labeled" re-runs the gate when PR labels change
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write   # PR comment
+
+jobs:
+  run-evaluation:
+    runs-on: self-hosted   # needs kubectl access to the cluster, jq, curl and envsubst (gettext)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run AI Eval Gate
+        uses: <owner>/<action-repo>@<tag>
+        with:
+          default_namespace: "eval-namespace"
+          default_evalsuite: "demo-suite"
+          endpoint_rag: "http://rag-service.default.svc:8080/query"
+          endpoint_agent: "http://agent-service.default.svc:8080/invoke"
+```
+
+Requirements and notes:
+
+- The runner needs a kubeconfig or in-cluster service account allowed to `create`, `get` and `patch` `evalruns` in
+  `default_namespace` (for example a self-hosted or Actions Runner Controller runner in the cluster).
+- The action needs a controller that reports `status.observedGeneration`
+  (see [Re-applying an EvalRun](#re-applying-an-evalrun-re-evaluation)); with an older controller the wait step times out.
+- Pull requests from forks get a read-only `GITHUB_TOKEN`: the PR comment cannot be written and a warning is logged;
+  the verdict is still in the job summary and still decides the job result.
+- Label and input values are passed to the shell through environment variables, not interpolated into scripts.
+- Re-running a workflow for the same commit does not re-evaluate: the applied spec is unchanged, so its existing
+  result is returned. A re-evaluation needs a spec change (for example a new commit).
 
 ---
 
@@ -1238,7 +1420,9 @@ It may be added later to simplify installation and configuration of:
 │   └── samples/
 ├── internal/
 │   └── controller/
-│       └── evalsuite_controller.go
+│       └── evalrun_controller.go
+├── helm/
+│   └── chart/                       # Helm chart: CRDs, controller, RBAC, metrics, Argo/Tekton/OpenShift gates
 ├── runner/                          # RAG runner
 │   ├── Dockerfile
 │   ├── runner.py
@@ -1314,8 +1498,7 @@ Planned improvements:
 - clearer artifact schema versioning;
 - default runner image support;
 - more controller reconciliation tests;
-- optional Helm chart;
-- integration examples for GitHub Actions, Argo Rollouts, Tekton, and OpenShift Pipelines;
+- Flagger integration and an end-to-end canary rollback example (GitHub Actions, Argo Rollouts, Tekton and OpenShift Pipelines gates already exist, see [GitHub Action](#github-action) and [Helm Chart](#helm-chart));
 - expanded evaluation dimensions for security, privacy checks, and red-teaming.
 
 ---

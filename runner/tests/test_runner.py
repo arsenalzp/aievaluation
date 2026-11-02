@@ -619,6 +619,8 @@ def test_apply_threshold_policy_fails_on_context_recall_first(cfg):
     agg = AggregatedScores(
         total_cases=2,
         passed_cases=1,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.9,
         answer_relevancy_avg=0.9,
         answer_correctness_avg=None,
@@ -639,6 +641,8 @@ def test_apply_threshold_policy_fails_on_context_precision_when_recall_ok(cfg):
     agg = AggregatedScores(
         total_cases=2,
         passed_cases=1,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.9,
         answer_relevancy_avg=0.9,
         answer_correctness_avg=None,
@@ -659,6 +663,8 @@ def test_apply_threshold_policy_fails_on_faithfulness_when_retrieval_ok(cfg):
     agg = AggregatedScores(
         total_cases=2,
         passed_cases=1,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.6,
         answer_relevancy_avg=0.9,
         answer_correctness_avg=None,
@@ -679,6 +685,8 @@ def test_apply_threshold_policy_fails_on_answer_relevancy_fallback(cfg):
     agg = AggregatedScores(
         total_cases=2,
         passed_cases=1,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.9,
         answer_relevancy_avg=0.6,
         answer_correctness_avg=None,
@@ -699,6 +707,8 @@ def test_apply_threshold_policy_passes(cfg):
     agg = AggregatedScores(
         total_cases=2,
         passed_cases=2,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.9,
         answer_relevancy_avg=0.9,
         answer_correctness_avg=None,
@@ -718,6 +728,8 @@ def test_apply_regression_policy_without_baseline(cfg):
     agg = AggregatedScores(
         total_cases=1,
         passed_cases=1,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.9,
         answer_relevancy_avg=0.9,
         answer_correctness_avg=None,
@@ -737,6 +749,8 @@ def test_apply_regression_policy_fails_when_drop_exceeds_limit(cfg):
     agg = AggregatedScores(
         total_cases=1,
         passed_cases=1,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.80,
         answer_relevancy_avg=0.9,
         answer_correctness_avg=None,
@@ -762,6 +776,8 @@ def test_apply_regression_policy_passes_when_drop_within_limit(cfg):
     agg = AggregatedScores(
         total_cases=1,
         passed_cases=1,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.86,
         answer_relevancy_avg=0.9,
         answer_correctness_avg=None,
@@ -787,6 +803,8 @@ def test_build_gate_summary_pass(cfg):
     agg = AggregatedScores(
         total_cases=2,
         passed_cases=2,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.9,
         answer_relevancy_avg=0.9,
         answer_correctness_avg=None,
@@ -818,16 +836,17 @@ def test_build_gate_summary_pass(cfg):
     assert "total_cases=2" in gate.summary
     assert "passed_cases=2" in gate.summary
 
-    # artifacts = json.loads(gate.artifacts)
-    assert gate.artifacts["gateSummaryUri"] == "s3://eval-bucket/artifacts/gate-summary.json"
-    assert gate.artifacts["scoresUri"] == "s3://eval-bucket/artifacts/scores.json"
-    assert gate.artifacts["detailsUri"] == "s3://eval-bucket/artifacts/details.jsonl"
+    assert gate.artifacts["gateSummaryUri"] == "http://s3.local/buckets/eval-bucket/objects/artifacts/gate-summary.json"
+    assert gate.artifacts["scoresUri"] == "http://s3.local/buckets/eval-bucket/objects/artifacts/scores.json"
+    assert gate.artifacts["detailsUri"] == "http://s3.local/buckets/eval-bucket/objects/artifacts/details.jsonl"
 
 
 def test_build_gate_summary_fail_from_threshold(cfg):
     agg = AggregatedScores(
         total_cases=2,
         passed_cases=1,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.6,
         answer_relevancy_avg=0.9,
         answer_correctness_avg=None,
@@ -867,6 +886,8 @@ def test_build_gate_summary_fail_from_regression(cfg):
     agg = AggregatedScores(
         total_cases=2,
         passed_cases=2,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.8,
         answer_relevancy_avg=0.9,
         answer_correctness_avg=None,
@@ -965,6 +986,8 @@ def test_publish_scores_json(monkeypatch, cfg):
     agg = AggregatedScores(
         total_cases=1,
         passed_cases=1,
+        safety_passed=True,
+        vulnerability_type="",
         faithfulness_avg=0.9,
         answer_relevancy_avg=0.8,
         answer_correctness_avg=None,
