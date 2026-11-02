@@ -1,0 +1,15 @@
+apiVersion: ai.evaluation.io/v1alpha1
+kind: EvalRun
+metadata:
+  name: demo-run-agent-multiturn-1
+spec:
+  model: "gpt-5-mini"                 # judge model for optional semantic evaluators
+  embedder: "text-embedding-3-small"
+  summaryBucket: "eval-artifacts"
+  suiteRef:
+    name: demo-suite-agent-multiturn
+  revision:
+    gitSHA: "abc123"
+    prNumber: 1
+  # The tested agent endpoint must implement the session-aware turn contract (see README).
+  targetEndpoint: "https://travel-agent.svc.cluster:8080/chat"

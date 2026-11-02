@@ -67,6 +67,12 @@ type suiteAgentConfigJSON struct {
 			MinToolInvocation   *float32 `json:"minToolInvocation,omitempty"`
 			MinToolExecution    *float32 `json:"minToolExecution,omitempty"`
 			MaxPolicyViolations *int32   `json:"maxPolicyViolations,omitempty"`
+
+			// Multi-turn sections; nil (omitted) for single-turn suites so their rendering is unchanged.
+			Outcome      *aieval.AgentOutcome      `json:"outcome,omitempty"`
+			Conversation *aieval.AgentConversation `json:"conversation,omitempty"`
+			Tools        *aieval.AgentTools        `json:"tools,omitempty"`
+			Policy       *aieval.AgentPolicy       `json:"policy,omitempty"`
 		} `json:"agent,omitempty"`
 	} `json:"metrics,omitempty"`
 	RegressionPolicy struct {
@@ -76,6 +82,8 @@ type suiteAgentConfigJSON struct {
 		Mode           string `json:"mode,omitempty"`
 		TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
 	} `json:"execution,omitempty"`
+	Evaluation *aieval.Evaluation `json:"evaluation,omitempty"`
+	Evaluators []aieval.Evaluator `json:"evaluators,omitempty"`
 }
 
 type suiteConfigJSON struct {
@@ -112,6 +120,10 @@ type EvalRunReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Queue  workqueue.TypedRateLimitingInterface[string]
+
+	// GateFetcher reads gate_summary.json of a finished run. Defaults to the object-storage reader;
+	// tests inject a fake.
+	GateFetcher func(ctx context.Context, run *aieval.EvalRun, objectStorageEndpoint string) (*aieval.GateSummary, error)
 }
 
 // +kubebuilder:rbac:groups=ai.evaluation.io,resources=evalruns,verbs=get;list;watch;update;patch
@@ -165,6 +177,10 @@ func (r *EvalRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if dataset.Spec.Source.ObjectKey == "" {
 		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "DatasetObjectKeyMissing", "Pending", fmt.Sprintf("EvalDataset %s: spec.source.objectKey must be set", dataset.Name), 30*time.Second)
+	}
+
+	if err := validateSuite(&suite); err != nil {
+		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "SuiteInvalid", "Pending", fmt.Sprintf("EvalSuite %q is invalid: %v", suite.Name, err), 30*time.Second)
 	}
 
 	// 3) Snapshot suiteSpecHash (Skipped comment block for brevity)
@@ -256,13 +272,18 @@ func (r *EvalRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			r.Queue.Forget(run.Name)
 		}
 	} else {
-		// Job failed
+		// Job failed. The runner publishes a FAIL gate_summary before exiting non-zero on dataset,
+		// configuration and execution errors; prefer that precise root cause over the generic one.
 		gate := &aieval.GateSummary{
 			Verdict: "FAIL",
 			Summary: fmt.Sprintf("Execution job failed: %s: %s", reason, msg),
 			RootCause: aieval.RootCause{
 				Stage: "Execution",
 			},
+		}
+		if published, err := r.fetchGateSummary(ctx, &suite, &run, dataset.Spec.Source.ObjectStorageEndpoint); err == nil && published.Verdict == "FAIL" {
+			l.Info("using gate_summary published by the failed runner", "stage", published.RootCause.Stage)
+			gate = published
 		}
 		if err := r.completeEvalRun(ctx, &run, aieval.PhaseFailed, gate); err != nil {
 			return ctrl.Result{}, err
@@ -288,6 +309,16 @@ func (r *EvalRunReconciler) completeEvalRun(ctx context.Context, run *aieval.Eva
 	run.Status.Summary = gate.Summary
 	run.Status.RootCause = gate.RootCause
 	run.Status.Artifacts = gate.Artifacts
+	// A WARN verdict is a completed run; additionally surface it as a standard condition.
+	if gate.Verdict == "WARN" {
+		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+			Type:               "GateWarning",
+			Status:             metav1.ConditionTrue,
+			Reason:             "VerdictWarn",
+			Message:            gate.Summary,
+			LastTransitionTime: metav1.Now(),
+		})
+	}
 	return r.Status().Update(ctx, run)
 }
 
@@ -393,6 +424,10 @@ func buildEvalJob(
 		{Name: "GATE_SUMMARY_KEY", Value: fmt.Sprintf("%s/gate_summary.json", runPrefix)},
 		{Name: "SCORES_KEY", Value: fmt.Sprintf("%s/scores.json", runPrefix)},
 		{Name: "DETAILS_KEY", Value: fmt.Sprintf("%s/details.jsonl", runPrefix)},
+		// multi-turn artifacts (ignored by runners that do not know them)
+		{Name: "MANIFEST_KEY", Value: fmt.Sprintf("%s/manifest.json", runPrefix)},
+		{Name: "VIOLATIONS_KEY", Value: fmt.Sprintf("%s/violations.jsonl", runPrefix)},
+		{Name: "CONVERSATIONS_PREFIX", Value: fmt.Sprintf("%s/conversations", runPrefix)},
 		{Name: "S3_SUMMARY_BUCKET", Value: run.Spec.SummaryBucket},
 		{Name: "S3_SUMMARY_KEY", Value: fmt.Sprintf("runs/%s/gate_summary.json", run.Name)},
 		{Name: "TARGET_ENDPOINT", Value: run.Spec.TargetEndpoint},
@@ -517,13 +552,21 @@ func buildEvalJob(
 
 // A render from EvalSuite.Spec to suite.json
 func renderSuiteConfigJSON(suite *aieval.EvalSuite) ([]byte, error) {
-	if suite.Spec.Metrics.Agent != nil {
+	if suite.Spec.Metrics.Agent != nil || isMultiTurn(suite) {
 		var cfg suiteAgentConfigJSON
-		// Agent metrics
-		cfg.Metrics.Agent.MaxPolicyViolations = suite.Spec.MaxPolicyViolations
-		cfg.Metrics.Agent.MinToolSelection = suite.Spec.MinToolSelection
-		cfg.Metrics.Agent.MinToolInvocation = suite.Spec.MinToolInvocation
-		cfg.Metrics.Agent.MinToolExecution = suite.Spec.MinToolExecution
+		// Agent metrics (a multi-turn suite may legitimately omit metrics.agent and rely on defaults)
+		if agent := suite.Spec.Metrics.Agent; agent != nil {
+			cfg.Metrics.Agent.MaxPolicyViolations = agent.MaxPolicyViolations
+			cfg.Metrics.Agent.MinToolSelection = agent.MinToolSelection
+			cfg.Metrics.Agent.MinToolInvocation = agent.MinToolInvocation
+			cfg.Metrics.Agent.MinToolExecution = agent.MinToolExecution
+			cfg.Metrics.Agent.Outcome = agent.Outcome
+			cfg.Metrics.Agent.Conversation = agent.Conversation
+			cfg.Metrics.Agent.Tools = agent.Tools
+			cfg.Metrics.Agent.Policy = agent.Policy
+		}
+		cfg.Evaluation = suite.Spec.Evaluation
+		cfg.Evaluators = suite.Spec.Evaluators
 
 		// RegressionPolicy
 		cfg.RegressionPolicy.MaxDrop = suite.Spec.RegressionPolicy.MaxDrop
@@ -553,6 +596,50 @@ func renderSuiteConfigJSON(suite *aieval.EvalSuite) ([]byte, error) {
 	}
 
 	return nil, nil
+}
+
+const interactionModeMultiTurn = "MultiTurn"
+
+// isMultiTurn reports whether the suite asks for scripted multi-turn evaluation.
+func isMultiTurn(suite *aieval.EvalSuite) bool {
+	return suite.Spec.Evaluation != nil && suite.Spec.Evaluation.InteractionMode == interactionModeMultiTurn
+}
+
+// validateSuite rejects combinations the CRD schema cannot express. The error text is surfaced in
+// the EvalRun status so the user sees the cause instead of a failing Job.
+func validateSuite(suite *aieval.EvalSuite) error {
+	eval := suite.Spec.Evaluation
+	if !isMultiTurn(suite) {
+		if len(suite.Spec.Evaluators) > 0 {
+			return fmt.Errorf("spec.evaluators is only supported with spec.evaluation.interactionMode: MultiTurn")
+		}
+		return nil
+	}
+	// The task type is spec.execution.mode; when unset it is inferred from the metrics section (as for single-turn suites).
+	if mode := suite.Spec.Execution.Mode; mode == "rag" || (mode == "" && suite.Spec.Metrics.Agent == nil && suite.Spec.Metrics.Rag != nil) {
+		return fmt.Errorf("spec.evaluation.interactionMode: MultiTurn is only supported for agent evaluation (spec.execution.mode is %q, metrics: rag)", mode)
+	}
+	if suite.Spec.Execution.Mode == "agent" && suite.Spec.Metrics.Agent == nil && suite.Spec.Metrics.Rag != nil {
+		return fmt.Errorf("spec.execution.mode is agent but only spec.metrics.rag is set")
+	}
+	if eval.Trace != nil && eval.Trace.Source != "" && eval.Trace.Source != "inline" &&
+		(eval.Trace.Phoenix == nil || eval.Trace.Phoenix.Endpoint == "") {
+		return fmt.Errorf("spec.evaluation.trace.phoenix.endpoint is required when trace.source is %q", eval.Trace.Source)
+	}
+	seen := map[string]bool{}
+	for i, ev := range suite.Spec.Evaluators {
+		if seen[ev.Name] {
+			return fmt.Errorf("spec.evaluators[%d]: duplicate evaluator name %q", i, ev.Name)
+		}
+		seen[ev.Name] = true
+		if ev.Provider == "builtin" && ev.Type == "multiTurn" {
+			return fmt.Errorf("spec.evaluators[%d]: provider builtin only supports type deterministic", i)
+		}
+		if ev.Provider == "deepeval" && ev.Type == "deterministic" {
+			return fmt.Errorf("spec.evaluators[%d]: provider deepeval only supports type multiTurn", i)
+		}
+	}
+	return nil
 }
 
 func suiteConfigMapName(suiteName, suiteHash string) string {
@@ -643,6 +730,13 @@ func (r *EvalRunReconciler) buildGateReaderPod(run *aieval.EvalRun) *corev1.Pod 
 }
 
 func (r *EvalRunReconciler) fetchGateSummary(ctx context.Context, suite *aieval.EvalSuite, run *aieval.EvalRun, bucketEndpoint string) (*aieval.GateSummary, error) {
+	if r.GateFetcher != nil {
+		return r.GateFetcher(ctx, run, bucketEndpoint)
+	}
+	return fetchGateSummaryFromObjectStorage(run, bucketEndpoint)
+}
+
+func fetchGateSummaryFromObjectStorage(run *aieval.EvalRun, bucketEndpoint string) (*aieval.GateSummary, error) {
 	key := fmt.Sprintf("runs/%s/gate_summary.json", run.Name)
 	objectStorClnt := objectstorage.NewClient(bucketEndpoint)
 	obj, err := objectStorClnt.GetObject(run.Spec.SummaryBucket, key)

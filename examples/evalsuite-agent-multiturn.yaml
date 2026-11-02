@@ -1,0 +1,56 @@
+# Multi-turn agent evaluation (scripted conversations).
+# Deterministic trajectory/policy checks always run and decide the verdict;
+# the DeepEval evaluator is an optional semantic advisor (required: false -> at most WARN).
+apiVersion: ai.evaluation.io/v1alpha1
+kind: EvalSuite
+metadata:
+  name: demo-suite-agent-multiturn
+spec:
+  datasetRef:
+    name: demo-dataset-agent-multiturn
+  execution:
+    runnerImage: ghcr.io/arsenalzp/evalrun-runner-agent:dev   # build: make agent-runner-image-build
+    mode: agent               # optional; metrics.agent and the runner image are what select agent evaluation
+    timeoutSeconds: 600       # per turn request, not for the whole Job
+  evaluation:
+    interactionMode: MultiTurn
+    trials: 1                 # >1 replays every conversation k times; a case passes only if all trials pass
+    trace:
+      source: inline          # inline | phoenix | auto (see README "Trace sources")
+      # phoenix:
+      #   endpoint: http://phoenix.observability.svc:6006
+      #   project: travel-agent
+  metrics:
+    agent:
+      outcome:
+        minGoalCompletion: 0.90
+      conversation:
+        maxTurns: 10
+        minKnowledgeRetention: 0.85
+        minConversationCompleteness: 0.85
+        minTurnRelevancy: 0.80
+      tools:
+        minSelectionAccuracy: 0.90
+        minArgumentAccuracy: 0.90
+        maxToolCalls: 20
+        maxRepeatedCalls: 1
+      policy:
+        maxCriticalViolations: 0
+        maxHighViolations: 0
+        limitsAction: Fail    # Fail -> HIGH violation, Warn -> MEDIUM (WARN verdict)
+  evaluators:
+    - name: trajectory-policy
+      provider: builtin
+      type: deterministic
+      required: true
+    - name: conversation-quality
+      provider: deepeval
+      type: multiTurn
+      required: false
+      samples: 1
+      metrics:
+        - knowledgeRetention
+        - conversationCompleteness
+        - turnRelevancy
+  regressionPolicy:
+    maxDrop: 0.03

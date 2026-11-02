@@ -16,6 +16,9 @@ from phoenix.evals.metrics import (
 )
 import requests
 from llm import base_llm
+from multiturn.config import ConfigError, INTERACTION_MULTI, get_interaction_mode
+from multiturn.dataset import DatasetError, classify_dataset
+from multiturn.entrypoint import run_multiturn_job
 
 # ============================================================
 # Data models
@@ -250,7 +253,9 @@ def build_runner_config() -> RunnerConfig:
         min_tool_selection=safe_float(agent_metrics.get("minToolSelection")),
         min_tool_execution=safe_float(agent_metrics.get("minToolExecution")),
         min_tool_invocation=safe_float(agent_metrics.get("minToolInvocation")),
-        max_policy_violations=safe_int(policy_metrics.get("maxPolicyViolations"), default=0),
+        # The controller renders maxPolicyViolations under metrics.agent; older configs used metrics.policy.
+        max_policy_violations=safe_int(
+            agent_metrics.get("maxPolicyViolations", policy_metrics.get("maxPolicyViolations")), default=0),
     )
     
     print(f"thresholds={thresholds}")
@@ -1536,12 +1541,65 @@ def publish_gate_summary(cfg: RunnerConfig, gate: GateSummary) -> None:
 # Main
 # ============================================================
 
+class _ObjectStoreUploader:
+    """Adapts the module level upload helpers to the ``Uploader`` protocol used by ``multiturn``."""
+
+    def __init__(self, cfg: RunnerConfig):
+        self.cfg = cfg
+
+    def put_json(self, key: str, payload: Dict[str, Any]) -> Any:
+        return upload_json(self.cfg, key, payload)
+
+    def put_text(self, key: str, text: str, content_type: str = "text/plain") -> Any:
+        return upload_text(self.cfg, key, text, content_type=content_type)
+
+
+def run_multi_turn(cfg: RunnerConfig, suite: Dict[str, Any], dataset_path: str) -> None:
+    """Multi-turn path: scripted sessions, deterministic checks, optional semantic evaluators, gate."""
+    run_multiturn_job(
+        suite=suite,
+        env=os.environ,
+        dataset_path=dataset_path,
+        bucket=cfg.s3_bucket,
+        gate_summary_key=cfg.gate_summary_key,
+        scores_key=cfg.scores_key,
+        details_key=cfg.details_key,
+        target_endpoint=cfg.target_endpoint,
+        uploader=_ObjectStoreUploader(cfg),
+        baseline=load_optional_baseline(cfg),
+        llm_model=cfg.llm_model,
+    )
+
+
+def guard_dataset_matches_mode(dataset_path: str, multi_turn: bool) -> None:
+    with open(dataset_path, "r", encoding="utf-8") as fh:
+        multi_ids, single_ids = classify_dataset(fh)
+    if multi_turn and single_ids:
+        raise DatasetError(
+            "evaluation.interactionMode=MultiTurn requires every case to be a multi-turn case "
+            "(type 'multiTurn' with 'turns'); this case looks single-turn",
+            case_id=single_ids[0], field_path="type")
+    if not multi_turn and multi_ids:
+        raise DatasetError(
+            "multi-turn case found but the EvalSuite uses interactionMode=SingleTurn; "
+            "set spec.evaluation.interactionMode: MultiTurn",
+            case_id=multi_ids[0], field_path="type")
+
+
 async def main() -> int:
     try:
         cfg = build_runner_config()
         ensure_dir(cfg.work_dir)
 
         dataset_path = download_dataset(cfg)
+
+        suite = load_suite_config(cfg.suite_config_path)
+        multi_turn = get_interaction_mode(suite) == INTERACTION_MULTI
+        guard_dataset_matches_mode(dataset_path, multi_turn)
+        if multi_turn:
+            run_multi_turn(cfg, suite, dataset_path)
+            # Quality failures are expressed through gate_summary.verdict, not the exit code.
+            return 0
 
         cases = parse_dataset_jsonl(dataset_path)
         if not cases:
@@ -1592,8 +1650,12 @@ async def main() -> int:
                 verdict="FAIL",
                 summary=f"Execution failure: {str(e)}",
                 rootCause={
-                    "stage": "Execution",
-                    "details": traceback.format_exc()[-3000:],
+                    # dataset/config problems get their own stage so the cause is obvious in EvalRun.status
+                    "stage": ("Dataset" if isinstance(e, DatasetError)
+                              else "Configuration" if isinstance(e, ConfigError) else "Execution"),
+                    "details": (str(e) if isinstance(e, (DatasetError, ConfigError))
+                                else traceback.format_exc()[-3000:]),
+                    **({"caseId": e.case_id} if isinstance(e, DatasetError) and e.case_id else {}),
                 },
                 artifacts={
                     "gateSummaryUri": f"s3://{cfg.s3_bucket}/{cfg.gate_summary_key}",
