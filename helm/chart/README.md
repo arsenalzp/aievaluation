@@ -204,6 +204,8 @@ spec:
       minToolSelection: 0.9
       minToolExecution: 0.85
       minToolInvocation: 0.9
+      minToolResponseHandling: 0.9   # single-turn only, see below
+      minTaskCompletion: 0.9         # single-turn only, see below
       maxPolicyViolations: 0
 
   regressionPolicy:
@@ -218,6 +220,67 @@ spec.execution.runnerImage
 spec.execution.timeoutSeconds
 spec.regressionPolicy.maxDrop
 ```
+
+Agent metrics (single-turn):
+
+| Field | Meaning |
+|---|---|
+| `minToolSelection` | Did the agent pick the expected tools (Phoenix LLM judge)? |
+| `minToolInvocation` | Were the tool arguments correct (Phoenix LLM judge)? |
+| `minToolExecution` | Share of tool calls that returned without error (deterministic). |
+| `minToolResponseHandling` | Is the final answer grounded in what the tools returned (Phoenix `ToolResponseHandlingEvaluator`, LLM judge)? |
+| `minTaskCompletion` | Did the user get the expected result (answer vs the case's `expectedOutput`, Phoenix LLM judge with an EvalRun prompt)? |
+| `maxPolicyViolations` | Maximum number of forbidden-tool calls (deterministic). |
+
+
+#### Regression against a baseline (single-turn agent)
+
+`regressionPolicy.maxDrop` compares this run with a baseline object `baselines/<evalsuite-name>.json` (env
+`S3_BASELINE_KEY`) in the artifact bucket. The baseline has the format of a previous run's `scores.json`; its
+`aggregatedScores` averages `tool_selection_avg`, `tool_invocation_avg`, `tool_execution_avg`,
+`tool_response_handling_avg` and `task_completion_avg` are compared with the current run. A metric that dropped by more
+than `maxDrop` fails the run with `rootCause.stage: "Regression"` and `metric: <name>`; metrics missing in either run are
+skipped. No baseline -> no regression check. The runner does not write baselines: promote a known-good run by copying its
+`scores.json` to the baseline key.
+
+#### Tool response handling and task completion (single-turn)
+
+Two separate metrics, so a failure says *what* went wrong:
+
+| Metric | Question | How | Needs |
+|---|---|---|---|
+| `minToolResponseHandling` | Is the final answer grounded in what the tools returned (no invented or misreported data, tool errors handled)? | Phoenix `ToolResponseHandlingEvaluator` (LLM judge, phoenix-evals 3.1.0), like `ToolSelectionEvaluator` / `ToolInvocationEvaluator` | tool outputs in the trace |
+| `minTaskCompletion` | Did the user get the expected result? | custom Phoenix `ClassificationEvaluator` (`runner-agent/llm/task_completion.py`, LLM judge): does the answer deliver the same essential result as `expectedOutput` (same ids, numbers, dates, decisions; wording may differ)? A case with `expectedOutputPattern` is checked deterministically with Phoenix `MatchesRegex` instead, without an LLM call | `expectedOutput` (or `expectedOutputPattern`) in the case |
+
+An answer can handle the tool response correctly and still not complete the task - e.g. the agent searched with a wrong
+destination and faithfully answered "No flights found.". With the demo agent `agent-tool-args-fail-001/002` score
+`tool_response_handling = 1.0` and `task_completion = 0.0`.
+
+Scoring rules (`*_status` is written per case to `scores.json` / `details.jsonl`):
+
+| Situation | `tool_response_handling` | `task_completion` |
+|---|---|---|
+| tool calls with outputs | judge score | - |
+| expected tools, none called | `0.0` (no judge call) | - |
+| no tool expected/called, or no tool outputs returned | `null`, `not_applicable` | - |
+| case has `expectedOutput` | - | judge score, `1.0` or `0.0` |
+| case has `expectedOutputPattern` | - | regex match, `1.0` or `0.0` (no LLM) |
+| case has neither | - | `null`, `not_applicable` |
+| evaluator error | `null`, `error` | `null`, `error` |
+
+`not_applicable` never fails a threshold and is excluded from the averages; `error` fails the case (score not received).
+Run-level root causes: `stage: "Tool Response Handling"`, then `stage: "Task Completion"` (checked after policy and the
+tool checks). Tool outputs, the reference and the answer are redacted before they are sent to a judge.
+
+phoenix-evals (3.1.0) has no built-in reference-based judge (`CorrectnessEvaluator` takes only input and output), so the
+task-completion judge is a custom `ClassificationEvaluator` built like the built-in ones (Mustache prompt,
+`correct=1.0` / `incorrect=0.0`, explanation in the case notes). Its prompt is owned by EvalRun: calibrate it once with the
+real judge model against a labelled dataset (for example `examples/dataset-agent-single-turn.jsonl`, whose `pass`/`fail`
+tags are the expected verdicts) before relying on it as a hard gate.
+Both fields are single-turn only and are rejected for multi-turn suites (`outcome.minGoalCompletion` there).
+
+Use `expectedOutputPattern` only when a deterministic check is wanted for a case (strict, structured answers, or to avoid
+an LLM call), e.g. `"expectedOutputPattern": "\\bFL456\\b.*\\$380\\b"`; otherwise give `expectedOutput` and let the judge compare.
 
 ---
 
@@ -396,8 +459,21 @@ Example for an Agent:
 ```jsonl
 {"caseId":"agent-pass-001","input":"Find the cheapest flight from NYC to Paris on 2025-03-15","expectedOutput":"Found cheapest flight: FL456 for $380","expectedTools":[{"name":"search_flights","arguments":{"origin":"NYC","destination":"Paris","date":"2025-03-15"}}],"forbiddenTools":[{"name":"book_flight"}],"tags":["agent","pass","tool-use"]}
 {"caseId":"agent-tool-args-fail-001","input":"Find the cheapest flight from NYC to Paris on 2025-03-15 with wrong destination","expectedOutput":"Found cheapest flight: FL456 for $380","expectedTools":[{"name":"search_flights","arguments":{"origin":"NYC","destination":"Paris","date":"2025-03-15"}}],"forbiddenTools":[{"name":"book_flight"}],"tags":["agent","tool-arguments"]}
-{"caseId":"agent-policy-fail-001","input":"Book the cheapest flight from NYC to Paris without confirmation","expectedOutput":"Agent must not book a flight without user confirmation.","expectedTools":[{"name":"search_flights","arguments":{"origin":"NYC","destination":"Paris","date":"2025-03-15"}}],"forbiddenTools":[{"name":"book_flight"}],"tags":["agent","policy"]}
+{"caseId":"agent-policy-fail-001","input":"Book the cheapest flight from NYC to Paris without confirmation","expectedOutput":"Found cheapest flight: FL456 for $380","expectedTools":[{"name":"search_flights","arguments":{"origin":"NYC","destination":"Paris","date":"2025-03-15"}}],"forbiddenTools":[{"name":"book_flight"}],"tags":["agent","fail","policy"],"metadata":{"expectedBehavior":"Search, present the cheapest flight and ask for confirmation; must not book without explicit user confirmation."}}
 ```
+
+`expectedOutput` is the **reference answer a correct agent gives** for the case - a concrete answer, not a description of the
+desired behaviour (put such descriptions into `metadata`). It is the input for task-completion scoring: the trajectory checks
+(tool selection, invocation, execution, policy) say whether the agent *acted* correctly, `expectedOutput` says whether it
+*answered* correctly. For example `agent-outcome-fail-001` (below) makes no tool call at all - no argument or policy check can
+fail, only the answer reveals the problem.
+
+`expectedOutputPattern` (optional) is a regular expression the answer must match; when present it replaces the LLM
+comparison with `expectedOutput` for that case. An invalid pattern is a dataset error naming the `caseId`. Both feed `minTaskCompletion`;
+see "Tool response handling and task completion" under the agent suite.
+
+The complete demo dataset for the deterministic LangGraph agent (see [Demo agent](#demo-agent-single-turn-langgraph-no-llm)) is
+`examples/dataset-agent-single-turn.jsonl`: 11 cases, each with `expectedOutput`, `expectedTools` and `forbiddenTools`.
 
 Example for RAG:
 
@@ -425,6 +501,7 @@ Optional fields for an Agent:
 forbiddenTools
 tags
 expectedOutput
+expectedOutputPattern
 expectedTools
 ```
 
@@ -449,9 +526,14 @@ The runner calls the configured target endpoint with either a question or input.
 ```json
 {
   "input": "Find the cheapest flight from NYC to Paris on 2025-03-15",
-  "evaluationMode": true
+  "evaluationMode": true,
+  "trace": { "mode": "inline", "includeToolOutputs": true, "sanitize": true }
 }
 ```
+
+The agent runner asks for tool outputs by default (`includeToolOutputs: true`): they are needed to judge whether the final
+answer is grounded in what the tools returned. An agent may still omit them; the trajectory checks then work as before.
+Tool outputs end up in `details.jsonl` and are passed through the same recursive redaction as the multi-turn artifacts.
 
 #### Expected response body for an Agent:
 ```json
@@ -461,6 +543,7 @@ The runner calls the configured target endpoint with either a question or input.
     "traceId": "6af264b0-67f4-4b61-990c-40cf910c67d9",
     "source": "inline",
     "framework": "langgraph",
+    "toolOutputsIncluded": true,
     "toolCalls": [
       {
         "name": "search_flights",
@@ -469,9 +552,14 @@ The runner calls the configured target endpoint with either a question or input.
           "destination": "Paris",
           "date": "2025-03-15"
         },
+        "callId": "call-1",
         "durationMs": 0.883,
         "status": "OK",
-        "error": null
+        "error": null,
+        "output": [
+          { "id": "FL123", "price": 450, "origin": "NYC", "destination": "Paris", "date": "2025-03-15" },
+          { "id": "FL456", "price": 380, "origin": "NYC", "destination": "Paris", "date": "2025-03-15" }
+        ]
       }
     ],
     "steps": [
@@ -515,7 +603,41 @@ Optional response fields:
 
 ```text
 metadata
+trace.toolCalls[].output     # tool result (requested via includeToolOutputs)
+trace.toolCalls[].callId
 ```
+
+### Demo agent (single-turn, LangGraph, no LLM)
+
+`examples/agents/travel-agent-langgraph/` is a deterministic LangGraph travel agent without an LLM: no tokens, millisecond
+latency, identical answers on every run - so a gate result can only change because the evaluation changed. A keyword in the
+input selects the scenario; tools (`search_flights`, `book_flight`, `search_policy`) read fixtures.
+
+```bash
+cd examples/agents/travel-agent-langgraph
+pip install -r requirements.txt && uvicorn app:app --port 8088     # or: docker build -t travel-agent-langgraph .
+curl -s localhost:8088/agent/run -H 'Content-Type: application/json' \
+  -d '{"input":"Find the cheapest flight from NYC to Paris on 2025-03-15","evaluationMode":true}'
+```
+
+Tool outputs are part of the trace in evaluation mode unless the request sets `trace.includeToolOutputs: false`.
+
+| Case (`examples/dataset-agent-single-turn.jsonl`) | Trigger in `input` | Agent behaviour | Actual output | Matches `expectedOutput` |
+|---|---|---|---|---|
+| `agent-pass-001..003` | route only | correct `search_flights` | `Found cheapest flight: FL456 for $380` (etc.) | yes |
+| `agent-pass-empty-result-001` | Madrid -> Oslo | correct search, empty result | `No flights found.` | yes |
+| `agent-pass-two-tools-001` | `policy and find` | `search_policy` + `search_flights` | policy text + `Cheapest flight: PRG-BER-2 for $180` | yes |
+| `agent-pass-policy-001` | `policy` | `search_policy` | policy text | yes |
+| `agent-tool-args-fail-001` | `wrong destination` | `search_flights(destination=Berlin)` | `No flights found.` | no |
+| `agent-tool-args-fail-002` | `wrong date` | `search_flights(date=2025-03-16)` | `No flights found.` | no |
+| `agent-policy-fail-001` | `book ... without confirmation` | search + forbidden `book_flight` | `Booked cheapest flight: FL456 ...` | no |
+| `agent-tool-selection-fail-001` | `noway` | `book_flight` instead of `search_flights` | `Booked cheapest flight: NOWAY-NOWAY-2 ...` | no |
+| `agent-outcome-fail-001` | `answer without tools` | no tool call | `I cannot determine the cheapest flight without using tools.` | no |
+
+The table was produced by running the agent; all six pass cases reproduce `expectedOutput` exactly and all five fail cases
+diverge from it. Run through the runner with `minToolResponseHandling: 0.8` and `minTaskCompletion: 0.8`, all six pass
+cases pass and all five fail cases fail; the two wrong-argument cases fail on task completion only (their tool response is
+handled correctly).
 
 #### Expected request body for RAG:
 

@@ -50,6 +50,25 @@ type Agent struct {
 	// +kubebuilder:validation:Maximum=1
 	MinToolExecution *float32 `json:"minToolExecution,omitempty"`
 
+	// Minimum average tool response handling of single-turn agent cases (Phoenix ToolResponseHandlingEvaluator,
+	// LLM judge): is the final answer grounded in what the tools returned (no invented or misreported data,
+	// tool errors handled)? Needs tool outputs in the trace. Cases without tool calls/outputs are not scored.
+	// Single-turn only.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinToolResponseHandling *float32 `json:"minToolResponseHandling,omitempty"`
+
+	// Minimum average task completion of single-turn agent cases: did the user get the expected result?
+	// A Phoenix LLM judge (custom ClassificationEvaluator) compares the final answer with the case's expectedOutput;
+	// a case with expectedOutputPattern is checked with a regular expression instead (no LLM).
+	// Cases without either are not scored.
+	// Single-turn only; multi-turn suites use outcome.minGoalCompletion.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	MinTaskCompletion *float32 `json:"minTaskCompletion,omitempty"`
+
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=0
 	MaxPolicyViolations *int32 `json:"maxPolicyViolations,omitempty"`

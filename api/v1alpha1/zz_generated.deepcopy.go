@@ -44,6 +44,16 @@ func (in *Agent) DeepCopyInto(out *Agent) {
 		*out = new(float32)
 		**out = **in
 	}
+	if in.MinToolResponseHandling != nil {
+		in, out := &in.MinToolResponseHandling, &out.MinToolResponseHandling
+		*out = new(float32)
+		**out = **in
+	}
+	if in.MinTaskCompletion != nil {
+		in, out := &in.MinTaskCompletion, &out.MinTaskCompletion
+		*out = new(float32)
+		**out = **in
+	}
 	if in.MaxPolicyViolations != nil {
 		in, out := &in.MaxPolicyViolations, &out.MaxPolicyViolations
 		*out = new(int32)

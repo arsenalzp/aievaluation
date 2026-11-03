@@ -190,11 +190,30 @@ spec:
                                                 format: int32
                                                 minimum: 0
                                                 type: integer
+                                            minTaskCompletion:
+                                                description: |-
+                                                    Minimum average task completion of single-turn agent cases: did the user get the expected result?
+                                                    A Phoenix LLM judge (custom ClassificationEvaluator) compares the final answer with the case's expectedOutput;
+                                                    a case with expectedOutputPattern is checked with a regular expression instead (no LLM).
+                                                    Cases without either are not scored.
+                                                    Single-turn only; multi-turn suites use outcome.minGoalCompletion.
+                                                maximum: 1
+                                                minimum: 0
+                                                type: number
                                             minToolExecution:
                                                 maximum: 1
                                                 minimum: 0
                                                 type: number
                                             minToolInvocation:
+                                                maximum: 1
+                                                minimum: 0
+                                                type: number
+                                            minToolResponseHandling:
+                                                description: |-
+                                                    Minimum average tool response handling of single-turn agent cases (Phoenix ToolResponseHandlingEvaluator,
+                                                    LLM judge): is the final answer grounded in what the tools returned (no invented or misreported data,
+                                                    tool errors handled)? Needs tool outputs in the trace. Cases without tool calls/outputs are not scored.
+                                                    Single-turn only.
                                                 maximum: 1
                                                 minimum: 0
                                                 type: number

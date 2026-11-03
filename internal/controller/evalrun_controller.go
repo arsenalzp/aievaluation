@@ -63,10 +63,12 @@ type gateSummaryJSON struct {
 type suiteAgentConfigJSON struct {
 	Metrics struct {
 		Agent struct {
-			MinToolSelection    *float32 `json:"minToolSelection,omitempty"`
-			MinToolInvocation   *float32 `json:"minToolInvocation,omitempty"`
-			MinToolExecution    *float32 `json:"minToolExecution,omitempty"`
-			MaxPolicyViolations *int32   `json:"maxPolicyViolations,omitempty"`
+			MinToolSelection        *float32 `json:"minToolSelection,omitempty"`
+			MinToolInvocation       *float32 `json:"minToolInvocation,omitempty"`
+			MinToolExecution        *float32 `json:"minToolExecution,omitempty"`
+			MinToolResponseHandling *float32 `json:"minToolResponseHandling,omitempty"`
+			MinTaskCompletion       *float32 `json:"minTaskCompletion,omitempty"`
+			MaxPolicyViolations     *int32   `json:"maxPolicyViolations,omitempty"`
 
 			// Multi-turn sections; nil (omitted) for single-turn suites so their rendering is unchanged.
 			Outcome      *aieval.AgentOutcome      `json:"outcome,omitempty"`
@@ -651,6 +653,8 @@ func renderSuiteConfigJSON(suite *aieval.EvalSuite) ([]byte, error) {
 			cfg.Metrics.Agent.MinToolSelection = agent.MinToolSelection
 			cfg.Metrics.Agent.MinToolInvocation = agent.MinToolInvocation
 			cfg.Metrics.Agent.MinToolExecution = agent.MinToolExecution
+			cfg.Metrics.Agent.MinToolResponseHandling = agent.MinToolResponseHandling
+			cfg.Metrics.Agent.MinTaskCompletion = agent.MinTaskCompletion
 			cfg.Metrics.Agent.Outcome = agent.Outcome
 			cfg.Metrics.Agent.Conversation = agent.Conversation
 			cfg.Metrics.Agent.Tools = agent.Tools
@@ -709,6 +713,12 @@ func validateSuite(suite *aieval.EvalSuite) error {
 	// The task type is spec.execution.mode; when unset it is inferred from the metrics section (as for single-turn suites).
 	if mode := suite.Spec.Execution.Mode; mode == "rag" || (mode == "" && suite.Spec.Metrics.Agent == nil && suite.Spec.Metrics.Rag != nil) {
 		return fmt.Errorf("spec.evaluation.interactionMode: MultiTurn is only supported for agent evaluation (spec.execution.mode is %q, metrics: rag)", mode)
+	}
+	if a := suite.Spec.Metrics.Agent; a != nil && a.MinTaskCompletion != nil {
+		return fmt.Errorf("spec.metrics.agent.minTaskCompletion applies to single-turn agent suites; use spec.metrics.agent.outcome.minGoalCompletion for MultiTurn")
+	}
+	if a := suite.Spec.Metrics.Agent; a != nil && a.MinToolResponseHandling != nil {
+		return fmt.Errorf("spec.metrics.agent.minToolResponseHandling applies to single-turn agent suites; multi-turn suites have no tool-response judge")
 	}
 	if suite.Spec.Execution.Mode == "agent" && suite.Spec.Metrics.Agent == nil && suite.Spec.Metrics.Rag != nil {
 		return fmt.Errorf("spec.execution.mode is agent but only spec.metrics.rag is set")

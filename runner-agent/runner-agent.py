@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import traceback
 import asyncio
@@ -11,11 +12,15 @@ from phoenix.evals import evaluate_dataframe
 from phoenix.evals.metrics import (
   ToolInvocationEvaluator, 
   ToolSelectionEvaluator, 
+  ToolResponseHandlingEvaluator,
+  MatchesRegex,
   CorrectnessEvaluator,
   HallucinationEvaluator
 )
 import requests
 from llm import base_llm
+from llm.task_completion import TaskCompletionEvaluator
+from multiturn.artifacts import redact
 from multiturn.config import ConfigError, INTERACTION_MULTI, get_interaction_mode
 from multiturn.dataset import DatasetError, classify_dataset
 from multiturn.entrypoint import run_multiturn_job
@@ -55,6 +60,8 @@ class AgentDatasetCase:
     case_id: str
     input: str
     expected_output: Optional[str] = None
+    # optional regex the answer must match (preferred over exact expectedOutput for answers with variable wording)
+    expected_output_pattern: Optional[str] = None
     expected_tools: List[AgentTool] = field(default_factory=list)
     forbidden_tools: List[AgentTool] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
@@ -68,6 +75,7 @@ class AgentEvalRecord:
     actual_output: str
     expected_output: Optional[str]
     expected_tools: List[AgentTool] = field(default_factory=list)
+    expected_output_pattern: Optional[str] = None
     forbidden_tools: List[AgentTool] = field(default_factory=list)
     tools_called: List[AgentToolCall] = field(default_factory=list)
     trace: Dict[str, Any] = field(default_factory=dict)
@@ -85,6 +93,13 @@ class AgentPerCaseScore:
     tool_selection: Optional[float] = None
     tool_invocation: Optional[float] = None
     tool_execution: Optional[float] = None
+    # Phoenix ToolResponseHandlingEvaluator: is the final answer grounded in what the tools returned?
+    tool_response_handling: Optional[float] = None
+    # Task completion: does the final answer match the case's expected result (expectedOutputPattern / expectedOutput)?
+    task_completion: Optional[float] = None
+    # "scored" | "not_applicable: <why>" | "error: <why>" - not-applicable cases do not fail the threshold
+    tool_response_handling_status: Optional[str] = None
+    task_completion_status: Optional[str] = None
 
 @dataclass
 class AgentAggregatedScores:
@@ -97,6 +112,9 @@ class AgentAggregatedScores:
 
     policy_violations_total: int
     latency_ms_avg: Optional[float]
+    # means over scored cases only (not-applicable cases are excluded)
+    tool_response_handling_avg: Optional[float] = None
+    task_completion_avg: Optional[float] = None
 
 
 @dataclass
@@ -105,6 +123,8 @@ class RegressionResult:
     max_drop: Optional[float]
     drops: Dict[str, float] = field(default_factory=dict)
     failed: bool = False
+    # metrics whose drop exceeded max_drop (named in the gate root cause)
+    failed_metrics: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -192,13 +212,19 @@ class AgentThresholdConfig:
     min_tool_selection: Optional[float] = None
     min_tool_execution: Optional[float] = None
     min_tool_invocation: Optional[float] = None
+    # Phoenix ToolResponseHandling; not-applicable cases (no tool expected/called, no tool outputs) are skipped
+    min_tool_response_handling: Optional[float] = None
+    # answer vs expected result (expectedOutputPattern / expectedOutput); cases without a reference are skipped
+    min_task_completion: Optional[float] = None
     max_policy_violations: Optional[int] = 0
 
 
 @dataclass
 class TraceConfig:
     mode: str = "inline"
-    include_tool_outputs: bool = False
+    # Tool outputs are requested by default: task completion can only be judged against what the tools returned.
+    # They are redacted before details.jsonl is written.
+    include_tool_outputs: bool = True
     sanitize: bool = True
 
 
@@ -258,6 +284,8 @@ def build_runner_config() -> RunnerConfig:
         min_tool_selection=safe_float(agent_metrics.get("minToolSelection")),
         min_tool_execution=safe_float(agent_metrics.get("minToolExecution")),
         min_tool_invocation=safe_float(agent_metrics.get("minToolInvocation")),
+        min_tool_response_handling=safe_float(agent_metrics.get("minToolResponseHandling")),
+        min_task_completion=safe_float(agent_metrics.get("minTaskCompletion")),
         # The controller renders maxPolicyViolations under metrics.agent; older configs used metrics.policy.
         max_policy_violations=safe_int(
             agent_metrics.get("maxPolicyViolations", policy_metrics.get("maxPolicyViolations")), default=0),
@@ -267,7 +295,7 @@ def build_runner_config() -> RunnerConfig:
 
     trace = TraceConfig(
         mode=trace_cfg.get("mode", "inline"),
-        include_tool_outputs=bool(trace_cfg.get("includeToolOutputs", False)),
+        include_tool_outputs=bool(trace_cfg.get("includeToolOutputs", True)),
         sanitize=bool(trace_cfg.get("sanitize", True)),
     )
 
@@ -440,11 +468,23 @@ def parse_dataset_jsonl(path: str) -> Listcases:
                 for x in raw.get("forbiddenTools", []) or []
             ]
 
+            pattern = raw.get("expectedOutputPattern")
+            if pattern is not None:
+                if not isinstance(pattern, str) or not pattern:
+                    raise ValueError(f"dataset line {line_no}: caseId={case_id!r} field=expectedOutputPattern must be a non-empty string")
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    raise ValueError(
+                        f"dataset line {line_no}: caseId={case_id!r} field=expectedOutputPattern is not a valid regular expression: {exc}"
+                    ) from exc
+
             cases.append(
                 AgentDatasetCase(
                     case_id=case_id,
                     input=input_text,
                     expected_output=raw.get("expectedOutput") or raw.get("groundTruth"),
+                    expected_output_pattern=pattern,
                     expected_tools=expected_tools,
                     forbidden_tools=forbidden_tools,
                     tags=raw.get("tags", []),
@@ -598,6 +638,7 @@ def build_agent_eval_record(case: AgentDatasetCase, response_data: Dict[str, Any
         input=case.input,
         actual_output=output,
         expected_output=case.expected_output,
+        expected_output_pattern=case.expected_output_pattern,
         expected_tools=case.expected_tools,
         forbidden_tools=case.forbidden_tools,
         tools_called=trace.tool_calls,
@@ -642,7 +683,15 @@ class PhoenixAgentAdapter:
     - tool_execution:
         Deterministic runtime check based on status/error.
 
-    tool_response_handling is intentionally skipped in MVP.
+    - tool_response_handling:
+        Phoenix ToolResponseHandlingEvaluator.
+        Checks whether the final answer correctly uses the tool results (no hallucinated or
+        misreported data, errors handled). Needs trace.toolCalls[].output.
+
+    - task_completion:
+        Custom Phoenix ClassificationEvaluator (llm.task_completion.TaskCompletionEvaluator, LLM judge):
+        does the final answer deliver the same result as the case's expectedOutput?
+        A case with expectedOutputPattern is checked deterministically with Phoenix MatchesRegex instead.
     """
 
     def __init__(self, model: str, llm: LLM) -> None:
@@ -650,6 +699,8 @@ class PhoenixAgentAdapter:
         self._llm = llm
         self._tool_selection_evaluator = None
         self._tool_invocation_evaluator = None
+        self._tool_response_handling_evaluator = None
+        self._task_completion_evaluator = None
 
     # ------------------------------------------------------------
     # Phoenix lazy imports
@@ -673,6 +724,22 @@ class PhoenixAgentAdapter:
             )
 
         return self._tool_invocation_evaluator
+
+    def _get_tool_response_handling_evaluator(self):
+        if self._tool_response_handling_evaluator is None:
+            self._tool_response_handling_evaluator = ToolResponseHandlingEvaluator(
+                llm=self._get_llm()
+            )
+
+        return self._tool_response_handling_evaluator
+
+    def _get_task_completion_evaluator(self):
+        if self._task_completion_evaluator is None:
+            self._task_completion_evaluator = TaskCompletionEvaluator(
+                llm=self._get_llm()
+            )
+
+        return self._task_completion_evaluator
 
     # ------------------------------------------------------------
     # Formatting helpers
@@ -1030,6 +1097,96 @@ class PhoenixAgentAdapter:
         return value
 
     # ------------------------------------------------------------
+    # Metric 4: Phoenix Tool Response Handling
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _format_tool_results(tools_called: List[AgentToolCall]) -> str:
+        """One line per call; outputs are redacted before they reach the external judge LLM."""
+        lines = []
+        for call in tools_called:
+            name = (call.name or "").strip() or "<unknown_tool>"
+            if call.error:
+                lines.append(f"{name}: ERROR {redact(str(call.error))}")
+            else:
+                lines.append(f"{name}: {json.dumps(redact(call.output), ensure_ascii=False, default=str)}")
+        return "\n".join(lines)
+
+    def _score_tool_response_handling(
+        self,
+        record: AgentEvalRecord,
+        score: AgentPerCaseScore,
+    ) -> Optional[float]:
+        if not record.tools_called:
+            if record.expected_tools:
+                # Expected tools were never consulted, so the answer cannot be grounded in their results.
+                score.tool_response_handling_status = "scored"
+                score.notes.append("tool_response_handling=0: expected tools were not called, answer is not grounded in tool results")
+                return 0.0
+            score.tool_response_handling_status = "not_applicable: no tool calls expected or made"
+            return None
+
+        if not any(call.output is not None or call.error for call in record.tools_called):
+            score.tool_response_handling_status = "not_applicable: agent returned no tool outputs (trace.includeToolOutputs)"
+            return None
+
+        evaluator = self._get_tool_response_handling_evaluator()
+
+        eval_input = {
+            "input": f"User: {record.input}",
+            "tool_call": "\n".join(self._format_tool_call(call) for call in record.tools_called),
+            "tool_result": self._format_tool_results(record.tools_called),
+            "output": str(redact(record.actual_output)),
+        }
+
+        scores = evaluator.evaluate(eval_input)
+
+        value = self._first_score_value(scores)
+        explanation = self._first_score_explanation(scores)
+
+        if explanation:
+            score.notes.append(
+                f"phoenix_tool_response_handling_explanation={explanation}"
+            )
+
+        score.tool_response_handling_status = "scored" if value is not None else "error: no score returned by the evaluator"
+        return value
+
+    # ------------------------------------------------------------
+    # Metric 5: Task Completion (custom Phoenix LLM judge, reference-based)
+    # ------------------------------------------------------------
+
+    def _score_task_completion(
+        self,
+        record: AgentEvalRecord,
+        score: AgentPerCaseScore,
+    ) -> Optional[float]:
+        if record.expected_output_pattern:
+            # explicit deterministic check chosen by the dataset author (no LLM call)
+            scores = MatchesRegex(pattern=record.expected_output_pattern).evaluate({"output": record.actual_output or ""})
+            method = "expectedOutputPattern"
+        elif record.expected_output:
+            evaluator = self._get_task_completion_evaluator()
+            scores = evaluator.evaluate({
+                "input": f"User: {record.input}",
+                "expected_output": str(redact(record.expected_output)),
+                "output": str(redact(record.actual_output or "")),
+            })
+            method = "expectedOutput"
+            explanation = self._first_score_explanation(scores)
+            if explanation:
+                score.notes.append(f"phoenix_task_completion_explanation={explanation}")
+        else:
+            score.task_completion_status = "not_applicable: case has no expectedOutput or expectedOutputPattern"
+            return None
+
+        value = self._first_score_value(scores)
+        score.task_completion_status = "scored" if value is not None else "error: no score returned by the evaluator"
+        if value is not None and value < 1.0:
+            score.notes.append(f"task_completion=0 ({method}): answer does not match the expected result")
+        return value
+
+    # ------------------------------------------------------------
     # Metric 3: Tool Execution
     # ------------------------------------------------------------
 
@@ -1145,10 +1302,24 @@ class PhoenixAgentAdapter:
         score.policy_violations = count_policy_violations(record)
 
         # ------------------------------------------------------------
-        # 5. Task completion intentionally skipped in MVP
+        # 5. Tool response handling (Phoenix ToolResponseHandling judge)
         # ------------------------------------------------------------
-        score.task_completion = None
-        score.notes.append("task_completion_skipped=mvp_no_tool_response_handling")
+        try:
+            score.tool_response_handling = self._score_tool_response_handling(record, score)
+        except Exception as exc:
+            score.tool_response_handling = None
+            score.tool_response_handling_status = f"error: {exc!r}"
+            score.notes.append(f"phoenix_tool_response_handling_failed={repr(exc)}")
+
+        # ------------------------------------------------------------
+        # 6. Task completion (answer vs expected result, deterministic)
+        # ------------------------------------------------------------
+        try:
+            score.task_completion = self._score_task_completion(record, score)
+        except Exception as exc:
+            score.task_completion = None
+            score.task_completion_status = f"error: {exc!r}"
+            score.notes.append(f"task_completion_failed={repr(exc)}")
 
         # ------------------------------------------------------------
         # 6. Final pass/fail
@@ -1168,6 +1339,8 @@ class PhoenixAgentAdapter:
                 "tool_selection",
                 "tool_invocation",
                 "tool_execution",
+                "tool_response_handling",
+                "task_completion",
                 "policy_violations",
             ]
         }
@@ -1252,6 +1425,8 @@ def aggregate_scores(per_case: List[AgentPerCaseScore]) -> AgentAggregatedScores
 
         policy_violations_total=sum(x.policy_violations for x in per_case),
         latency_ms_avg=mean([x.latency_ms for x in per_case]),
+        tool_response_handling_avg=mean([x.tool_response_handling for x in per_case]),
+        task_completion_avg=mean([x.task_completion for x in per_case]),
     )
 
 
@@ -1303,6 +1478,26 @@ def mark_per_case_pass_fail(cfg: RunnerConfig, per_case: List[AgentPerCaseScore]
               f"min_tool_execution thresholds was assigned, but assessment score was not received from the evaluator"
             )
             
+        for label, threshold, value, status in (
+            ("tool_response_handling", cfg.thresholds.min_tool_response_handling,
+             score.tool_response_handling, score.tool_response_handling_status),
+            ("task_completion", cfg.thresholds.min_task_completion,
+             score.task_completion, score.task_completion_status),
+        ):
+            if threshold is None:
+                continue
+            if value is not None:
+                if value < threshold:
+                    passed = False
+                    notes.append(f"{label}={value:.4f} < threshold={threshold:.4f}")
+            elif (status or "").startswith("not_applicable"):
+                notes.append(f"{label} {status}")  # nothing to compare against: not a failure
+            else:
+                passed = False
+                notes.append(
+                    f"{label} threshold was assigned, but assessment score was not received from the evaluator ({status or 'unknown'})"
+                )
+
         if cfg.thresholds.max_policy_violations is not None:
           if score.policy_violations is not None:
             if score.policy_violations > cfg.thresholds.max_policy_violations:
@@ -1368,6 +1563,26 @@ def apply_threshold_policy(
             }
             notes.append(root_cause["details"])
 
+    if not failed and cfg.thresholds.min_tool_response_handling is not None and agg.tool_response_handling_avg is not None:
+        if agg.tool_response_handling_avg < cfg.thresholds.min_tool_response_handling:
+            failed = True
+            root_cause = {
+                "stage": "Tool Response Handling",
+                "metric": "tool_response_handling",
+                "details": f"tool_response_handling_avg={agg.tool_response_handling_avg:.4f} < minToolResponseHandling={cfg.thresholds.min_tool_response_handling:.4f}",
+            }
+            notes.append(root_cause["details"])
+
+    if not failed and cfg.thresholds.min_task_completion is not None and agg.task_completion_avg is not None:
+        if agg.task_completion_avg < cfg.thresholds.min_task_completion:
+            failed = True
+            root_cause = {
+                "stage": "Task Completion",
+                "metric": "task_completion",
+                "details": f"task_completion_avg={agg.task_completion_avg:.4f} < minTaskCompletion={cfg.thresholds.min_task_completion:.4f}",
+            }
+            notes.append(root_cause["details"])
+
     return failed, root_cause, notes
 
 
@@ -1390,28 +1605,37 @@ def apply_regression_policy(
 
     baseline_scores = baseline.get("aggregatedScores", {})
 
+    failed_metrics: List[str] = []
+
+    # Higher-is-better averages of AgentAggregatedScores. The baseline is a previous scores.json
+    # ("aggregatedScores" has the same snake_case keys). Policy violations are gated by
+    # maxPolicyViolations, not by maxDrop.
     metric_pairs = {
-        "tool_correctness_avg": agg.tool_correctness_avg,
+        "tool_selection_avg": agg.tool_selection_avg,
+        "tool_invocation_avg": agg.tool_invocation_avg,
+        "tool_execution_avg": agg.tool_execution_avg,
+        "tool_response_handling_avg": agg.tool_response_handling_avg,
         "task_completion_avg": agg.task_completion_avg,
-        "argument_correctness_avg": agg.argument_correctness_avg,
     }
 
     for metric_name, current_value in metric_pairs.items():
         baseline_value = safe_float(baseline_scores.get(metric_name))
         if baseline_value is None or current_value is None:
-            continue
+            continue  # metric not measured in one of the runs: nothing to compare
 
-        drop = current_value - baseline_value
+        drop = round(current_value - baseline_value, 6)
         drops[metric_name] = drop
 
         if max_drop is not None and drop < -max_drop:
             failed = True
+            failed_metrics.append(metric_name)
 
     return RegressionResult(
         baseline_used=True,
         max_drop=max_drop,
         drops=drops,
         failed=failed,
+        failed_metrics=failed_metrics,
     )
 
 
@@ -1437,8 +1661,11 @@ def build_gate_summary(
         if root_cause.get("stage") == "None":
             root_cause = {
                 "stage": "Regression",
-                "metric": "baseline",
-                "details": f"metric regression exceeded maxDrop={regression.max_drop}",
+                "metric": regression.failed_metrics[0] if regression.failed_metrics else "baseline",
+                "details": (
+                    f"metric regression exceeded maxDrop={regression.max_drop}: "
+                    + ", ".join(f"{m} drop={regression.drops[m]:.4f}" for m in regression.failed_metrics)
+                ),
             }
         summary_parts.append("Regression policy failed")
 
@@ -1493,6 +1720,7 @@ def publish_details_jsonl(
             "caseId": record.case_id,
             "input": record.input,
             "expectedOutput": record.expected_output,
+            "expectedOutputPattern": record.expected_output_pattern,
             "actualOutput": record.actual_output,
             "expectedTools": [asdict(x) for x in record.expected_tools],
             "forbiddenTools": [asdict(x) for x in record.forbidden_tools],
@@ -1502,7 +1730,8 @@ def publish_details_jsonl(
             "score": asdict(score) if score else None,
         }
 
-        lines.append(json.dumps(row, ensure_ascii=False))
+        # tool outputs and agent metadata may carry secrets: same recursive redaction as multi-turn artifacts
+        lines.append(json.dumps(redact(row), ensure_ascii=False))
 
     payload = "\n".join(lines) + "\n"
     upload_text(cfg, cfg.details_key, payload, content_type="application/x-ndjson")

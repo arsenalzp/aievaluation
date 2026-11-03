@@ -960,6 +960,14 @@ func TestValidateSuite(t *testing.T) {
 		{"mode may be omitted when metrics.agent is set (as in existing agent suites)", func(s *aieval.EvalSuite) { s.Spec.Execution.Mode = "" }, ""},
 		{"phoenix source needs endpoint", func(s *aieval.EvalSuite) { s.Spec.Evaluation.Trace.Phoenix.Endpoint = "" }, "phoenix.endpoint"},
 		{"duplicate evaluator", func(s *aieval.EvalSuite) { s.Spec.Evaluators[1].Name = "trajectory-policy" }, "duplicate"},
+		{"minTaskCompletion is single-turn only", func(s *aieval.EvalSuite) {
+			v := float32(0.8)
+			s.Spec.Metrics.Agent.MinTaskCompletion = &v
+		}, "minTaskCompletion applies to single-turn"},
+		{"minToolResponseHandling is single-turn only", func(s *aieval.EvalSuite) {
+			v := float32(0.8)
+			s.Spec.Metrics.Agent.MinToolResponseHandling = &v
+		}, "minToolResponseHandling applies to single-turn"},
 		{"deepeval is not deterministic", func(s *aieval.EvalSuite) { s.Spec.Evaluators[1].Type = "deterministic" }, "deepeval only supports"},
 		{"builtin is not multiTurn", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Type = "multiTurn" }, "builtin only supports"},
 	}
@@ -1401,5 +1409,34 @@ func TestLegacyRunWithoutObservedGenerationIsAdopted(t *testing.T) {
 	got = getRun(t, r)
 	if got.Status.Phase != aieval.PhasePending || got.Status.Verdict != "" {
 		t.Fatalf("expected a legacy run with a changed spec to be re-evaluated, got %s/%s", got.Status.Phase, got.Status.Verdict)
+	}
+}
+
+func TestRenderSuiteConfigJSONIncludesMinTaskCompletion(t *testing.T) {
+	suite := legacyAgentSuite("suite-1")
+	v, h := float32(0.8), float32(0.7)
+	suite.Spec.Metrics.Agent.MinTaskCompletion = &v
+	suite.Spec.Metrics.Agent.MinToolResponseHandling = &h
+
+	data, err := renderSuiteConfigJSON(suite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	agent := cfg["metrics"].(map[string]any)["agent"].(map[string]any)
+	if got, ok := agent["minTaskCompletion"].(float64); !ok || got < 0.79 || got > 0.81 {
+		t.Fatalf("minTaskCompletion not rendered for the runner: %v", agent)
+	}
+	if got, ok := agent["minToolResponseHandling"].(float64); !ok || got < 0.69 || got > 0.71 {
+		t.Fatalf("minToolResponseHandling not rendered for the runner: %v", agent)
+	}
+	if agent["minToolSelection"] == nil {
+		t.Fatalf("existing fields lost: %v", agent)
+	}
+	if err := validateSuite(suite); err != nil {
+		t.Fatalf("single-turn suite with minTaskCompletion must be valid: %v", err)
 	}
 }

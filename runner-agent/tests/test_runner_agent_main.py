@@ -152,3 +152,45 @@ def test_max_policy_violations_is_read_from_agent_metrics(runner, monkeypatch):
     assert runner.build_runner_config().thresholds.max_policy_violations == 2
     runner.setup({"metrics": {"policy": {"maxPolicyViolations": 3}}}, [SINGLE_LINE])  # legacy location
     assert runner.build_runner_config().thresholds.max_policy_violations == 3
+
+
+DATASET = os.path.join(os.path.dirname(RUNNER_PATH), "..", "examples", "dataset-agent-single-turn.jsonl")
+
+
+def test_single_turn_example_dataset_parses_and_every_case_has_expected_output(runner):
+    cases = runner.parse_dataset_jsonl(DATASET)
+    assert len(cases) == 11
+    assert all(c.expected_output for c in cases)  # reference answer of a *correct* agent, for task completion
+    assert all(c.expected_tools for c in cases)
+
+
+def test_runner_requests_tool_outputs_by_default_and_redacts_them_in_details(runner, monkeypatch):
+    sent = {}
+
+    class Agent:
+        def __call__(self, url, json=None, headers=None, timeout=None):
+            sent.update(json)
+
+            class R:
+                def raise_for_status(self): pass
+                def json(self_inner):
+                    return {"output": "done", "trace": {"traceId": "t", "toolCalls": [
+                        {"name": "search", "arguments": {}, "status": "OK",
+                         "output": {"flights": [1], "api_key": "sk-abcdefghijklmnopqrstuvwx"}}]}}
+            return R()
+
+    class FakeAdapter:
+        def __init__(self, model, llm): pass
+        def score_records(self, records):
+            return [runner.AgentPerCaseScore(case_id=r.case_id, tool_selection=1.0, tool_invocation=1.0,
+                                             tool_execution=1.0, passed=True) for r in records], {"metricNames": []}
+
+    monkeypatch.setattr(runner.requests, "post", Agent())
+    monkeypatch.setattr(runner, "PhoenixAgentAdapter", FakeAdapter)
+    store = runner.setup({"metrics": {"agent": {"minToolSelection": 0.9}}}, [SINGLE_LINE])
+    assert run_main(runner) == 0
+    assert sent["trace"]["includeToolOutputs"] is True
+    row = json.loads(store["runs/run1/details.jsonl"].splitlines()[0])
+    out = row["toolsCalled"][0]["output"]
+    assert out["flights"] == [1] and out["api_key"] == "[REDACTED]"
+    assert "sk-abcdefghijklmnopqrstuvwx" not in store["runs/run1/details.jsonl"]
