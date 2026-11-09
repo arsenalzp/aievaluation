@@ -114,8 +114,16 @@ def decide(inp: GateInput) -> GateDecision:
 
     # 1. runner / required evaluator failure
     if inp.runner_error:
-        fails.append({"level": VERDICT_FAIL, **_rc(STAGE_EXECUTION, evaluator="runner", code="RUNNER_FAILURE",
-                                                  details=inp.runner_error, artifactUri=inp.scores_uri)})
+        fails.append(
+            {
+                "level": VERDICT_FAIL, **_rc(
+                    STAGE_EXECUTION,
+                    evaluator="runner",
+                    code="RUNNER_FAILURE",
+                    details=inp.runner_error, artifactUri=inp.scores_uri
+                )
+            }
+        )
     for f in inp.evaluator_failures:
         entry = {"level": VERDICT_FAIL if f.required else VERDICT_WARN,
                  **_rc(STAGE_EVALUATOR, evaluator=f.evaluator, code="EVALUATOR_FAILURE", caseId=f.case_id,
