@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	aieval "github.com/arsenalzp/aievaluation/api/v1alpha1"
@@ -100,10 +101,6 @@ type suiteConfigJSON struct {
 				MinCorrectness  *float32 `json:"minCorrectness,omitempty"`
 				MinRelevancy    *float32 `json:"minRelevancy,omitempty"`
 			} `json:"generation,omitempty"`
-			Trustworthiness struct {
-				MaxStaleChunkRatio   *float32 `json:"maxStaleChunkRatio,omitempty"`
-				MaxUnknownOwnerRatio *float32 `json:"maxUnknownOwnerRatio,omitempty"`
-			} `json:"trustworthiness,omitempty"`
 		} `json:"rag,omitempty"`
 	} `json:"metrics,omitempty"`
 
@@ -491,7 +488,6 @@ func buildEvalJob(
 	}
 
 	datasetObjectKey := dataset.Spec.Source.ObjectKey
-	datasetVersionID := dataset.Spec.Source.VersionId
 
 	env := []corev1.EnvVar{
 		{Name: "EVALRUN_NAME", Value: run.Name},
@@ -507,7 +503,6 @@ func buildEvalJob(
 		// dataset location in S3
 		{Name: "DATASET_S3_BUCKET", Value: datasetBucket},
 		{Name: "DATASET_S3_KEY", Value: datasetObjectKey},
-		{Name: "DATASET_S3_VERSION_ID", Value: datasetVersionID},
 		{Name: "DATASET_FORMAT", Value: dataset.Spec.Format},
 		{Name: "S3_ENDPOINT", Value: dataset.Spec.Source.ObjectStorageEndpoint},
 
@@ -679,9 +674,6 @@ func renderSuiteConfigJSON(suite *aieval.EvalSuite) ([]byte, error) {
 		cfg.Metrics.Rag.Generation.MinCorrectness = suite.Spec.Metrics.MinCorrectness
 		cfg.Metrics.Rag.Generation.MinRelevancy = suite.Spec.Metrics.MinRelevancy
 
-		cfg.Metrics.Rag.Trustworthiness.MaxStaleChunkRatio = suite.Spec.Metrics.MaxStaleChunkRatio
-		cfg.Metrics.Rag.Trustworthiness.MaxUnknownOwnerRatio = suite.Spec.Metrics.MaxUnknownOwnerRatio
-
 		// RegressionPolicy
 		cfg.RegressionPolicy.MaxDrop = suite.Spec.RegressionPolicy.MaxDrop
 
@@ -708,6 +700,21 @@ func validateSuite(suite *aieval.EvalSuite) error {
 		if len(suite.Spec.Evaluators) > 0 {
 			return fmt.Errorf("spec.evaluators is only supported with spec.evaluation.interactionMode: MultiTurn")
 		}
+		if eval != nil && (eval.Trials != nil || eval.Trace != nil) {
+			// The single-turn runners neither replay cases nor read Phoenix traces.
+			return fmt.Errorf("spec.evaluation.trials and spec.evaluation.trace are only supported with spec.evaluation.interactionMode: MultiTurn")
+		}
+		if a := suite.Spec.Metrics.Agent; a != nil {
+			// The single-turn runner reads only the flat fields; the sections would be silently ignored.
+			for _, sec := range []struct {
+				set  bool
+				name string
+			}{{a.Outcome != nil, "outcome"}, {a.Conversation != nil, "conversation"}, {a.Tools != nil, "tools"}, {a.Policy != nil, "policy"}} {
+				if sec.set {
+					return fmt.Errorf("spec.metrics.agent.%s applies to MultiTurn suites only; set spec.evaluation.interactionMode: MultiTurn or remove it", sec.name)
+				}
+			}
+		}
 		return nil
 	}
 	// The task type is spec.execution.mode; when unset it is inferred from the metrics section (as for single-turn suites).
@@ -720,6 +727,20 @@ func validateSuite(suite *aieval.EvalSuite) error {
 	if a := suite.Spec.Metrics.Agent; a != nil && a.MinToolResponseHandling != nil {
 		return fmt.Errorf("spec.metrics.agent.minToolResponseHandling applies to single-turn agent suites; multi-turn suites have no tool-response judge")
 	}
+	if a := suite.Spec.Metrics.Agent; a != nil {
+		// Flat single-turn fields the multi-turn runner does not read. No synonyms or fallbacks: every
+		// metric has exactly one field.
+		switch {
+		case a.MinToolSelection != nil:
+			return fmt.Errorf("spec.metrics.agent.minToolSelection applies to single-turn agent suites; use spec.metrics.agent.tools.minSelectionAccuracy for MultiTurn")
+		case a.MinToolInvocation != nil:
+			return fmt.Errorf("spec.metrics.agent.minToolInvocation applies to single-turn agent suites; use spec.metrics.agent.tools.minArgumentAccuracy for MultiTurn")
+		case a.MinToolExecution != nil:
+			return fmt.Errorf("spec.metrics.agent.minToolExecution applies to single-turn agent suites; multi-turn tool errors are reported as violations (spec.metrics.agent.policy)")
+		case a.MaxPolicyViolations != nil:
+			return fmt.Errorf("spec.metrics.agent.maxPolicyViolations applies to single-turn agent suites; use spec.metrics.agent.policy.maxCriticalViolations / maxHighViolations for MultiTurn")
+		}
+	}
 	if suite.Spec.Execution.Mode == "agent" && suite.Spec.Metrics.Agent == nil && suite.Spec.Metrics.Rag != nil {
 		return fmt.Errorf("spec.execution.mode is agent but only spec.metrics.rag is set")
 	}
@@ -727,18 +748,72 @@ func validateSuite(suite *aieval.EvalSuite) error {
 		(eval.Trace.Phoenix == nil || eval.Trace.Phoenix.Endpoint == "") {
 		return fmt.Errorf("spec.evaluation.trace.phoenix.endpoint is required when trace.source is %q", eval.Trace.Source)
 	}
+	return validateEvaluators(suite)
+}
+
+// semanticThresholds lists the semantic metrics that have a threshold in spec.metrics.agent.conversation.
+// It is the single source of the metrics a provider deepeval evaluator computes.
+func semanticThresholds(suite *aieval.EvalSuite) []string {
+	var out []string
+	if a := suite.Spec.Metrics.Agent; a != nil && a.Conversation != nil {
+		c := a.Conversation
+		if c.MinKnowledgeRetention != nil {
+			out = append(out, "minKnowledgeRetention")
+		}
+		if c.MinConversationCompleteness != nil {
+			out = append(out, "minConversationCompleteness")
+		}
+		if c.MinTurnRelevancy != nil {
+			out = append(out, "minTurnRelevancy")
+		}
+	}
+	return out
+}
+
+// validateEvaluators enforces that every configured field is used (nothing is silently ignored):
+// metrics and thresholds come only from spec.metrics.agent, spec.evaluators only says how evaluators run.
+func validateEvaluators(suite *aieval.EvalSuite) error {
 	seen := map[string]bool{}
+	byProvider := map[string]int{}
 	for i, ev := range suite.Spec.Evaluators {
 		if seen[ev.Name] {
 			return fmt.Errorf("spec.evaluators[%d]: duplicate evaluator name %q", i, ev.Name)
 		}
 		seen[ev.Name] = true
-		if ev.Provider == "builtin" && ev.Type == "multiTurn" {
-			return fmt.Errorf("spec.evaluators[%d]: provider builtin only supports type deterministic", i)
+		provider := ev.Provider
+		if provider == "" {
+			provider = "builtin"
 		}
-		if ev.Provider == "deepeval" && ev.Type == "deterministic" {
-			return fmt.Errorf("spec.evaluators[%d]: provider deepeval only supports type multiTurn", i)
+		if prev, ok := byProvider[provider]; ok {
+			return fmt.Errorf("spec.evaluators[%d]: only one evaluator with provider %s is allowed (spec.evaluators[%d] is one already)", i, provider, prev)
 		}
+		byProvider[provider] = i
+		switch provider {
+		case "builtin":
+			if ev.Type == "multiTurn" {
+				return fmt.Errorf("spec.evaluators[%d]: provider builtin only supports type deterministic", i)
+			}
+			if ev.Required != nil && !*ev.Required {
+				return fmt.Errorf("spec.evaluators[%d]: the builtin evaluator is always required; remove required: false", i)
+			}
+			if ev.Model != "" || ev.Samples != nil {
+				return fmt.Errorf("spec.evaluators[%d]: model and samples apply only to provider deepeval; the builtin evaluator uses no judge", i)
+			}
+		case "deepeval":
+			if ev.Type == "deterministic" {
+				return fmt.Errorf("spec.evaluators[%d]: provider deepeval only supports type multiTurn", i)
+			}
+		}
+	}
+	thresholds := semanticThresholds(suite)
+	_, hasDeepEval := byProvider["deepeval"]
+	switch {
+	case len(thresholds) > 0 && !hasDeepEval:
+		return fmt.Errorf("spec.metrics.agent.conversation.%s is set but no evaluator computes it; add a spec.evaluators entry with provider: deepeval or remove the threshold",
+			strings.Join(thresholds, ", "))
+	case len(thresholds) == 0 && hasDeepEval:
+		return fmt.Errorf("spec.evaluators[%d] (provider deepeval) has nothing to evaluate; set at least one of spec.metrics.agent.conversation.minKnowledgeRetention, minConversationCompleteness, minTurnRelevancy or remove the evaluator",
+			byProvider["deepeval"])
 	}
 	return nil
 }

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import sys
@@ -19,8 +20,17 @@ import requests
 from llm import base_llm
 from llm.task_completion import TaskCompletionEvaluator
 from multiturn.artifacts import redact
-from multiturn.config import ConfigError, INTERACTION_MULTI, get_interaction_mode
+from multiturn.config import (
+    ConfigError,
+    INTERACTION_MULTI,
+    get_interaction_mode,
+    int_field,
+    number_field,
+    reject_unknown,
+    section,
+)
 from multiturn.dataset import DatasetError, classify_dataset
+from multiturn.models import TOOL_STATUS_OK, parse_tool_status
 from multiturn.entrypoint import run_multiturn_job
 
 # ============================================================
@@ -98,6 +108,9 @@ class AgentPerCaseScore:
     # "scored" | "not_applicable: <why>" | "error: <why>" - not-applicable cases do not fail the threshold
     tool_response_handling_status: Optional[str] = None
     task_completion_status: Optional[str] = None
+    # same convention for the Phoenix tool selection / invocation judges ("error" fails the run, see unscored_cases)
+    tool_selection_status: Optional[str] = None
+    tool_invocation_status: Optional[str] = None
 
 @dataclass
 class AgentAggregatedScores:
@@ -123,6 +136,8 @@ class RegressionResult:
     failed: bool = False
     # metrics whose drop exceeded max_drop (named in the gate root cause)
     failed_metrics: List[str] = field(default_factory=list)
+    # metrics that could not be compared, with the reason (reported in scores.json and the gate summary)
+    not_compared: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -241,13 +256,12 @@ class RunnerConfig:
     dataset_file: str
 
     s3_endpoint: str
-    s3_bucket: str
+    s3_bucket: str  # S3_SUMMARY_BUCKET: artifacts and baseline (EvalRun.spec.summaryBucket)
     s3_access_key: str
     s3_secret_key: str
 
-    dataset_s3_bucket: Optional[str]
+    dataset_s3_bucket: str  # DATASET_S3_BUCKET: only the dataset is read from here
     dataset_s3_key: str
-    dataset_s3_version_id: Optional[str]
 
     s3_baseline_key: str
     gate_summary_key: str
@@ -267,37 +281,74 @@ def load_suite_config(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-def build_runner_config() -> RunnerConfig:
-    suite_config_path = getenv_required("SUITE_CONFIG")
-    suite = load_suite_config(suite_config_path)
+SINGLE_TURN_AGENT_FIELDS = ("minToolSelection", "minToolInvocation", "minToolExecution",
+                            "minToolResponseHandling", "minTaskCompletion", "maxPolicyViolations")
+MULTI_TURN_AGENT_SECTIONS = ("outcome", "conversation", "tools", "policy")
 
-    metrics = suite.get("metrics", {})
-    agent_metrics = metrics.get("agent", {})
-    policy_metrics = metrics.get("policy", {})
-    regression = suite.get("regressionPolicy", {})
-    execution = suite.get("execution", {})
-    trace_cfg = suite.get("trace", {})
 
+def parse_single_turn_suite(suite: Dict[str, Any]) -> Tuple[AgentThresholdConfig, TraceConfig, Optional[float], int]:
+    """Strictly parse a single-turn agent suite.json.
+
+    Every field is either used or rejected with a ConfigError (rule: nothing is silently ignored);
+    each metric has exactly one field (no synonyms, no legacy locations).
+    """
+    reject_unknown(suite, ("metrics", "regressionPolicy", "execution", "evaluation", "trace"), "suite")
+    section(suite, "evaluation", "", ("interactionMode",))  # trials/trace are MultiTurn-only
+    metrics = suite.get("metrics")
+    if isinstance(metrics, dict) and "policy" in metrics:
+        raise ConfigError("metrics.policy is not supported; set metrics.agent.maxPolicyViolations")
+    metrics = section(suite, "metrics", "", ("agent",))
+    agent = metrics.get("agent")
+    if isinstance(agent, dict):
+        for name in MULTI_TURN_AGENT_SECTIONS:
+            if name in agent:
+                raise ConfigError(f"metrics.agent.{name} applies to MultiTurn suites only; "
+                                  "set evaluation.interactionMode: MultiTurn or remove it")
+    agent = section(metrics, "agent", "metrics", SINGLE_TURN_AGENT_FIELDS)
+    regression = section(suite, "regressionPolicy", "", ("maxDrop",))
+    execution = section(suite, "execution", "", ("mode", "timeoutSeconds"))
+    trace_cfg = section(suite, "trace", "", ("mode", "includeToolOutputs", "sanitize"))
+
+    path = "metrics.agent"
+    max_viol = int_field(agent, "maxPolicyViolations", path, 0)
     thresholds = AgentThresholdConfig(
-        min_tool_selection=safe_float(agent_metrics.get("minToolSelection")),
-        min_tool_execution=safe_float(agent_metrics.get("minToolExecution")),
-        min_tool_invocation=safe_float(agent_metrics.get("minToolInvocation")),
-        min_tool_response_handling=safe_float(agent_metrics.get("minToolResponseHandling")),
-        min_task_completion=safe_float(agent_metrics.get("minTaskCompletion")),
-        # The controller renders maxPolicyViolations under metrics.agent; older configs used metrics.policy.
-        max_policy_violations=safe_int(
-            agent_metrics.get("maxPolicyViolations", policy_metrics.get("maxPolicyViolations")), default=0),
-    )
-    
-    print(f"thresholds={thresholds}")
-
-    trace = TraceConfig(
-        mode=trace_cfg.get("mode", "inline"),
-        include_tool_outputs=bool(trace_cfg.get("includeToolOutputs", True)),
-        sanitize=bool(trace_cfg.get("sanitize", True)),
+        min_tool_selection=number_field(agent, "minToolSelection", path, 0, 1),
+        min_tool_execution=number_field(agent, "minToolExecution", path, 0, 1),
+        min_tool_invocation=number_field(agent, "minToolInvocation", path, 0, 1),
+        min_tool_response_handling=number_field(agent, "minToolResponseHandling", path, 0, 1),
+        min_task_completion=number_field(agent, "minTaskCompletion", path, 0, 1),
+        max_policy_violations=max_viol if max_viol is not None else 0,
     )
 
-    timeout_s = int(execution.get("timeoutSeconds", 60))
+    mode = trace_cfg.get("mode", "inline")
+    if not isinstance(mode, str) or not mode:
+        raise ConfigError(f"trace.mode must be a non-empty string, got {mode!r}")
+    flags = {}
+    for key in ("includeToolOutputs", "sanitize"):
+        value = trace_cfg.get(key, True)
+        if not isinstance(value, bool):
+            raise ConfigError(f"trace.{key} must be a boolean, got {value!r}")
+        flags[key] = value
+    trace = TraceConfig(mode=mode, include_tool_outputs=flags["includeToolOutputs"], sanitize=flags["sanitize"])
+
+    timeout_s = int_field(execution, "timeoutSeconds", "execution", 1)
+    return thresholds, trace, number_field(regression, "maxDrop", "regressionPolicy", 0, 1), timeout_s or 60
+
+
+def build_runner_config(parse_suite: bool = True) -> RunnerConfig:
+    """Build the runner configuration from the env contract and the mounted suite.json.
+
+    ``parse_suite=False`` is only used on the failure path to publish the FAIL gate summary when the suite
+    itself is invalid: it reads the env contract and skips the suite thresholds.
+    """
+    suite_config_path = getenv_required("SUITE_CONFIG")
+    thresholds, trace, regression_max_drop, timeout_s = AgentThresholdConfig(), TraceConfig(), None, 60
+    if parse_suite:
+        suite = load_suite_config(suite_config_path)
+        if get_interaction_mode(suite) != INTERACTION_MULTI:
+            thresholds, trace, regression_max_drop, timeout_s = parse_single_turn_suite(suite)
+        # MultiTurn suites are parsed strictly by multiturn.config.parse_multiturn_settings.
+        print(f"thresholds={thresholds}")
 
     return RunnerConfig(
         evalrun_name=getenv_required("EVALRUN_NAME"),
@@ -313,13 +364,13 @@ def build_runner_config() -> RunnerConfig:
         dataset_file=getenv_optional("DATASET_FILE", "/work/dataset"),
 
         s3_endpoint=getenv_required("S3_ENDPOINT"),
-        s3_bucket=getenv_required("DATASET_S3_BUCKET"),
+        # artifacts and baseline go where the controller reads gate_summary.json (EvalRun.spec.summaryBucket)
+        s3_bucket=getenv_required("S3_SUMMARY_BUCKET"),
         s3_access_key=getenv_required("S3_ACCESS_KEY"),
         s3_secret_key=getenv_required("S3_SECRET_KEY"),
 
-        dataset_s3_bucket=getenv_optional("DATASET_S3_BUCKET"),
+        dataset_s3_bucket=getenv_required("DATASET_S3_BUCKET"),
         dataset_s3_key=getenv_required("DATASET_S3_KEY"),
-        dataset_s3_version_id=getenv_optional("DATASET_S3_VERSION_ID"),
 
         s3_baseline_key=getenv_required("S3_BASELINE_KEY"),
         gate_summary_key=getenv_required("GATE_SUMMARY_KEY"),
@@ -331,7 +382,7 @@ def build_runner_config() -> RunnerConfig:
 
         thresholds=thresholds,
         trace=trace,
-        regression_max_drop=safe_float(regression.get("maxDrop")),
+        regression_max_drop=regression_max_drop,
     )
 
 
@@ -341,7 +392,7 @@ def build_runner_config() -> RunnerConfig:
 
 def download_dataset(cfg: RunnerConfig) -> str:
     print("--downloading dataset--")
-    bucket = cfg.dataset_s3_bucket or cfg.s3_bucket
+    bucket = cfg.dataset_s3_bucket
     key = cfg.dataset_s3_key
 
     ensure_dir(os.path.dirname(cfg.dataset_file))
@@ -426,19 +477,47 @@ def upload_text(cfg: RunnerConfig, key: str, text: str, content_type: str = "tex
 # Dataset parsing
 # ============================================================
 
-def parse_tool(raw: Dict[str, Any]) -> AgentTool:
+AGENT_CASE_FIELDS = ("caseId", "input", "expectedOutput", "expectedOutputPattern", "expectedTools",
+                     "forbiddenTools", "tags", "metadata")
+# Fields of the RAG dataset format; the agent format has exactly one field for each (no synonyms).
+RAG_ONLY_CASE_FIELDS = {"question": "input", "groundTruth": "expectedOutput"}
+
+
+def _dataset_error(message: str, case_id: Optional[str], field_path: Optional[str], line: int) -> DatasetError:
+    return DatasetError(message, case_id=case_id, field_path=field_path, line=line, kind="single-turn agent")
+
+
+def parse_tool(raw: Any, case_id: str, path: str, line: int) -> AgentTool:
+    if not isinstance(raw, dict):
+        raise _dataset_error("must be an object with 'name' and optional 'arguments'", case_id, path, line)
+    unknown = sorted(set(raw) - {"name", "arguments"})
+    if unknown:
+        raise _dataset_error(f"unknown field(s) {unknown}; supported: ['arguments', 'name']", case_id, path, line)
     name = raw.get("name")
-    if not name:
-        raise ValueError("tool is missing name")
+    if not isinstance(name, str) or not name.strip():
+        raise _dataset_error("is required and must be a non-empty string", case_id, f"{path}.name", line)
+    arguments = raw.get("arguments", {})
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        raise _dataset_error("must be an object", case_id, f"{path}.arguments", line)
+    return AgentTool(name=name, arguments=arguments)
 
-    return AgentTool(
-        name=name,
-        arguments=raw.get("arguments", {}) or {},
-    )
+
+def _tool_list(raw: Dict[str, Any], key: str, case_id: str, line: int) -> List[AgentTool]:
+    value = raw.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise _dataset_error("must be a list of tool objects", case_id, key, line)
+    return [parse_tool(x, case_id, f"{key}[{i}]", line) for i, x in enumerate(value)]
 
 
-def parse_dataset_jsonl(path: str) -> Listcases:
+def parse_dataset_jsonl(path: str) -> List[AgentDatasetCase]:
+    """Strictly parse a single-turn agent dataset: unknown fields, wrong types, empty values and duplicate
+    caseIds are dataset errors naming the line, caseId and field (nothing is silently ignored)."""
     cases: List[AgentDatasetCase] = []
+    seen: Dict[str, int] = {}
 
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
@@ -446,47 +525,68 @@ def parse_dataset_jsonl(path: str) -> Listcases:
             if not line:
                 continue
 
-            raw = json.loads(line)
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise _dataset_error(f"invalid JSON: {exc.msg} (column {exc.colno})", None, None, line_no) from exc
+            if not isinstance(raw, dict):
+                raise _dataset_error("each line must be a JSON object", None, None, line_no)
 
             case_id = raw.get("caseId")
-            input_text = raw.get("input") or raw.get("question")
+            if not isinstance(case_id, str) or not case_id.strip():
+                raise _dataset_error("is required and must be a non-empty string", None, "caseId", line_no)
+            if case_id in seen:
+                raise _dataset_error(f"duplicate caseId (first defined on line {seen[case_id]})", case_id, "caseId", line_no)
+            seen[case_id] = line_no
 
-            if not case_id:
-                raise ValueError(f"dataset line {line_no}: missing caseId")
-            if not input_text:
-                raise ValueError(f"dataset line {line_no}: missing input")
+            for rag_field, agent_field in RAG_ONLY_CASE_FIELDS.items():
+                if rag_field in raw:
+                    raise _dataset_error(f"is a RAG dataset field; the agent dataset uses {agent_field!r}",
+                                         case_id, rag_field, line_no)
+            unknown = sorted(set(raw) - set(AGENT_CASE_FIELDS))
+            if unknown:
+                raise _dataset_error(f"unknown field(s) {unknown}; supported: {sorted(AGENT_CASE_FIELDS)}",
+                                     case_id, unknown[0], line_no)
 
-            expected_tools = [
-                parse_tool(x)
-                for x in raw.get("expectedTools", []) or []
-            ]
+            input_text = raw.get("input")
+            if not isinstance(input_text, str) or not input_text.strip():
+                raise _dataset_error("is required and must be a non-empty string", case_id, "input", line_no)
 
-            forbidden_tools = [
-                parse_tool(x)
-                for x in raw.get("forbiddenTools", []) or []
-            ]
+            expected_output = raw.get("expectedOutput")
+            if expected_output is not None and (not isinstance(expected_output, str) or not expected_output.strip()):
+                raise _dataset_error("must be a non-empty string when present", case_id, "expectedOutput", line_no)
 
             pattern = raw.get("expectedOutputPattern")
             if pattern is not None:
                 if not isinstance(pattern, str) or not pattern:
-                    raise ValueError(f"dataset line {line_no}: caseId={case_id!r} field=expectedOutputPattern must be a non-empty string")
+                    raise _dataset_error("must be a non-empty string", case_id, "expectedOutputPattern", line_no)
                 try:
                     re.compile(pattern)
                 except re.error as exc:
-                    raise ValueError(
-                        f"dataset line {line_no}: caseId={case_id!r} field=expectedOutputPattern is not a valid regular expression: {exc}"
-                    ) from exc
+                    raise _dataset_error(f"is not a valid regular expression: {exc}",
+                                         case_id, "expectedOutputPattern", line_no) from exc
+
+            tags = raw.get("tags", [])
+            if tags is None:
+                tags = []
+            if not isinstance(tags, list) or not all(isinstance(t, str) and t.strip() for t in tags):
+                raise _dataset_error("must be a list of non-empty strings", case_id, "tags", line_no)
+            metadata = raw.get("metadata", {})
+            if metadata is None:
+                metadata = {}
+            if not isinstance(metadata, dict):
+                raise _dataset_error("must be an object", case_id, "metadata", line_no)
 
             cases.append(
                 AgentDatasetCase(
                     case_id=case_id,
                     input=input_text,
-                    expected_output=raw.get("expectedOutput") or raw.get("groundTruth"),
+                    expected_output=expected_output,
                     expected_output_pattern=pattern,
-                    expected_tools=expected_tools,
-                    forbidden_tools=forbidden_tools,
-                    tags=raw.get("tags", []),
-                    metadata=raw.get("metadata", {}),
+                    expected_tools=_tool_list(raw, "expectedTools", case_id, line_no),
+                    forbidden_tools=_tool_list(raw, "forbiddenTools", case_id, line_no),
+                    tags=tags,
+                    metadata=metadata,
                 )
             )
 
@@ -497,51 +597,96 @@ def parse_dataset_jsonl(path: str) -> Listcases:
 # Agent response / trace normalization
 # ============================================================
 
-def parse_tool_call(raw: Dict[str, Any]) -> AgentToolCall:
-    print("--parsing tool call--")
-    name = raw.get("name") or raw.get("tool")
-    if not name:
-        raise ValueError("tool call is missing name")
+class AgentResponseError(RuntimeError):
+    """The target agent's response violates the endpoint contract (README "Target Endpoint Contract")."""
 
-    status = raw.get("status")
+    def __init__(self, message: str, case_id: Optional[str] = None):
+        self.case_id = case_id
+        super().__init__(f"agent response for caseId={case_id!r} violates the endpoint contract: {message}")
+
+
+# Undocumented spellings that older code accepted. Each field has exactly one name now; these are rejected
+# explicitly because silently dropping them would read as "no tool was called" / "no output".
+RESPONSE_RENAMED_FIELDS = {"answer": "output", "toolCalls": "trace.toolCalls", "toolsCalled": "trace.toolCalls"}
+TRACE_RENAMED_FIELDS = {"tool_calls": "trace.toolCalls"}
+TOOL_CALL_RENAMED_FIELDS = {"tool": "name", "args": "arguments", "duration_ms": "durationMs"}
+
+
+def _reject_renamed(d: Dict[str, Any], renamed: Dict[str, str], path: str, case_id: Optional[str]) -> None:
+    for old, new in renamed.items():
+        if old in d:
+            raise AgentResponseError(f"{path}{old} is not supported; use {new}", case_id)
+
+
+def parse_tool_call(raw: Any, case_id: Optional[str] = None, path: str = "trace.toolCalls[]") -> AgentToolCall:
+    if not isinstance(raw, dict):
+        raise AgentResponseError(f"{path} must be an object", case_id)
+    _reject_renamed(raw, TOOL_CALL_RENAMED_FIELDS, f"{path}.", case_id)
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise AgentResponseError(f"{path}.name is required and must be a non-empty string", case_id)
+
+    arguments = raw.get("arguments", {})
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        raise AgentResponseError(f"{path}.arguments must be an object", case_id)
+
+    duration = raw.get("durationMs")
+    if duration is not None and (isinstance(duration, bool) or not isinstance(duration, (int, float))):
+        raise AgentResponseError(f"{path}.durationMs must be a number, got {duration!r}", case_id)
+
     error = raw.get("error")
-
-    if not status:
-        status = "ERROR" if error else "OK"
+    try:
+        status = parse_tool_status(raw.get("status"), error)  # exactly OK | ERROR; omitted -> derived from error
+    except ValueError as exc:
+        raise AgentResponseError(f"{path}.{exc}", case_id) from None
 
     return AgentToolCall(
         name=name,
-        arguments=raw.get("arguments", {}) or raw.get("args", {}) or {},
+        arguments=arguments,
         output=raw.get("output"),
-        duration_ms=safe_float(raw.get("durationMs") or raw.get("duration_ms")),
+        duration_ms=float(duration) if duration is not None else None,
         error=error,
         status=status,
     )
 
 
-def normalize_inline_trace(data: Dict[str, Any]) -> AgentTrace:
-    metadata = data.get("metadata", {}) or {}
-    trace = data.get("trace", {}) or {}
+def normalize_inline_trace(data: Dict[str, Any], case_id: Optional[str] = None) -> AgentTrace:
+    metadata = data.get("metadata") or {}
+    trace = data.get("trace")
+    if not isinstance(trace, dict):
+        raise AgentResponseError("trace must be an object", case_id)
+    _reject_renamed(trace, TRACE_RENAMED_FIELDS, "trace.", case_id)
 
-    tool_calls_raw = (
-        trace.get("toolCalls")
-        or trace.get("tool_calls")
-        or data.get("toolCalls")
-        or data.get("toolsCalled")
-        or []
-    )
+    # Tool calls are evaluated (selection, invocation, execution, forbidden tools), so they must be reported
+    # explicitly; an empty list means "no tool was called".
+    if "toolCalls" not in trace:
+        raise AgentResponseError("trace.toolCalls is required in evaluation mode (send [] when no tool was called)",
+                                 case_id)
+    tool_calls_raw = trace["toolCalls"]
+    if not isinstance(tool_calls_raw, list):
+        raise AgentResponseError("trace.toolCalls must be a list", case_id)
+    tool_calls = [parse_tool_call(x, case_id, f"trace.toolCalls[{i}]") for i, x in enumerate(tool_calls_raw)]
 
-    tool_calls = [
-        parse_tool_call(x)
-        for x in tool_calls_raw
-    ]
+    # One location per value: trace.* is read; metadata may repeat it only with the same value.
+    for key in ("traceId", "framework"):
+        if metadata.get(key) is not None and trace.get(key) != metadata.get(key):
+            raise AgentResponseError(f"metadata.{key}={metadata.get(key)!r} differs from trace.{key}="
+                                     f"{trace.get(key)!r}; report it in trace.{key}", case_id)
+
+    steps = trace.get("steps", [])
+    if steps is None:
+        steps = []
+    if not isinstance(steps, list):
+        raise AgentResponseError("trace.steps must be a list", case_id)
 
     return AgentTrace(
-        trace_id=trace.get("traceId") or metadata.get("traceId"),
+        trace_id=trace.get("traceId"),
         source=trace.get("source") or "inline",
-        framework=trace.get("framework") or metadata.get("framework"),
+        framework=trace.get("framework"),
         tool_calls=tool_calls,
-        steps=trace.get("steps", []) or [],
+        steps=steps,
         raw=trace,
     )
 
@@ -561,23 +706,16 @@ def resolve_trace_ref(trace_ref: Dict[str, Any]) -> AgentTrace:
     )
 
 
-def resolve_agent_trace(data: Dict[str, Any]) -> AgentTrace:
-    if data.get("trace"):
-        return normalize_inline_trace(data)
-
-    if data.get("traceRef"):
+def resolve_agent_trace(data: Dict[str, Any], case_id: Optional[str] = None) -> AgentTrace:
+    if "trace" in data and "traceRef" in data:
+        raise AgentResponseError("send either trace or traceRef, not both", case_id)
+    if "trace" in data:
+        return normalize_inline_trace(data, case_id)
+    if "traceRef" in data:
         return resolve_trace_ref(data["traceRef"])
-
-    metadata = data.get("metadata", {}) or {}
-
-    return AgentTrace(
-        trace_id=metadata.get("traceId"),
-        source="none",
-        framework=metadata.get("framework"),
-        tool_calls=[],
-        steps=[],
-        raw={},
-    )
+    # Without a trace neither tool use nor policies can be checked; that must not pass silently.
+    raise AgentResponseError("trace is missing (evaluation mode requires trace.toolCalls; "
+                             "send [] when no tool was called)", case_id)
 
 
 # ============================================================
@@ -612,22 +750,31 @@ def call_agent_endpoint_raw(cfg: RunnerConfig, case: AgentDatasetCase) -> Dict[s
     resp.raise_for_status()
     data = resp.json()
 
-    metadata = data.get("metadata", {}) or {}
-    if "latencyMs" not in metadata:
-        metadata["latencyMs"] = elapsed_ms
-    data["metadata"] = metadata
+    # The response shape is validated in build_agent_eval_record (AgentResponseError names the problem).
+    if isinstance(data, dict):
+        metadata = data.get("metadata") or {}
+        if isinstance(metadata, dict):
+            metadata.setdefault("latencyMs", elapsed_ms)
+            data["metadata"] = metadata
 
     return data
 
 
 def build_agent_eval_record(case: AgentDatasetCase, response_data: Dict[str, Any]) -> AgentEvalRecord:
-    output = response_data.get("output") or response_data.get("answer")
-    if not output:
-        raise RuntimeError(f"agent endpoint returned empty output for case={case.case_id}")
+    if not isinstance(response_data, dict):
+        raise AgentResponseError("the response body must be a JSON object", case.case_id)
+    _reject_renamed(response_data, RESPONSE_RENAMED_FIELDS, "", case.case_id)
+    output = response_data.get("output")
+    if not isinstance(output, str) or not output.strip():
+        raise AgentResponseError("output is required and must be a non-empty string", case.case_id)
+    metadata = response_data.get("metadata")
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise AgentResponseError("metadata must be an object", case.case_id)
 
-    trace = resolve_agent_trace(response_data)
+    trace = resolve_agent_trace(response_data, case.case_id)
 
-    metadata = response_data.get("metadata", {}) or {}
     if trace.trace_id and "traceId" not in metadata:
         metadata["traceId"] = trace.trace_id
 
@@ -999,7 +1146,13 @@ class PhoenixAgentAdapter:
 
         first = scores[0]
 
-        return safe_float(getattr(first, "score", None))
+        value = getattr(first, "score", None)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            # NaN/inf would pass every threshold (nan < t is False): an unusable score is an evaluator error
+            raise ValueError(f"evaluator returned a non-finite or non-numeric score: {value!r}")
+        return float(value)
 
     @staticmethod
     def _first_score_label(scores: Any) -> Optional[str]:
@@ -1195,7 +1348,7 @@ class PhoenixAgentAdapter:
 
         It is evaluated deterministically from the current agent output:
 
-        - status in OK/SUCCESS/SUCCEEDED
+        - status is OK (the contract allows exactly OK or ERROR)
         - error is empty
         """
 
@@ -1210,10 +1363,7 @@ class PhoenixAgentAdapter:
         successful = 0
 
         for tool in executable_calls:
-            status = (tool.status or "").strip().upper()
-            error = tool.error
-
-            if status in {"OK", "SUCCESS", "SUCCEEDED"} and not error:
+            if tool.status == TOOL_STATUS_OK and not tool.error:
                 successful += 1
 
         return successful / len(executable_calls)
@@ -1267,25 +1417,29 @@ class PhoenixAgentAdapter:
             latency_ms=safe_float(record.metadata.get("latencyMs")),
         )
 
-        try:
-            # --------------------------------------------------------
-            # 1. Phoenix Tool Selection
-            # --------------------------------------------------------
-            score.tool_selection = self._score_tool_selection(record, score)
-
-            # --------------------------------------------------------
-            # 2. Phoenix Tool Invocation
-            # --------------------------------------------------------
-            score.tool_invocation = self._score_tool_invocation(record, score)
-
-
-        except Exception as exc:
-            score.notes.append(f"phoenix_evals_failed={repr(exc)}")
-
-            score.tool_selection = None
-            score.tool_invocation = None
-            score.tool_correctness = None
-            score.argument_correctness = None
+        # --------------------------------------------------------
+        # 1. Phoenix Tool Selection / 2. Phoenix Tool Invocation
+        # --------------------------------------------------------
+        for attr, scorer, not_applicable in (
+            ("tool_selection", self._score_tool_selection, "case has no expectedTools or forbiddenTools"),
+            ("tool_invocation", self._score_tool_invocation, "no tool was called"),
+        ):
+            try:
+                value = scorer(record, score)
+                setattr(score, attr, value)
+                if value is not None:
+                    status = "scored"
+                elif attr == "tool_selection" and not record.expected_tools and not record.forbidden_tools:
+                    status = f"not_applicable: {not_applicable}"
+                elif attr == "tool_invocation" and not record.tools_called:
+                    status = f"not_applicable: {not_applicable}"
+                else:
+                    status = "error: no score returned by the evaluator"
+            except Exception as exc:
+                setattr(score, attr, None)
+                status = f"error: {exc!r}"
+                score.notes.append(f"phoenix_{attr}_failed={repr(exc)}")
+            setattr(score, f"{attr}_status", status)
 
         # ------------------------------------------------------------
         # 3. Deterministic Tool Execution
@@ -1513,13 +1667,60 @@ def mark_per_case_pass_fail(cfg: RunnerConfig, per_case: List[AgentPerCaseScore]
         score.notes.extend(notes)
 
 
+# (score attribute, threshold attribute, threshold field, gate stage) of the judged metrics whose per-case
+# status says whether a missing score is "not_applicable" (fine) or an "error" (must not be averaged away).
+AGENT_JUDGED_METRICS = (
+    ("tool_selection", "min_tool_selection", "minToolSelection", "Tool Selection"),
+    ("tool_invocation", "min_tool_invocation", "minToolInvocation", "Tool Invocation"),
+    ("tool_response_handling", "min_tool_response_handling", "minToolResponseHandling", "Tool Response Handling"),
+    ("task_completion", "min_task_completion", "minTaskCompletion", "Task Completion"),
+)
+
+
+def unscored_cases(cfg: RunnerConfig, per_case: List[AgentPerCaseScore]) -> Dict[str, List[str]]:
+    """Cases whose judge failed (status ``error``) for a metric that has a threshold, per metric."""
+    out: Dict[str, List[str]] = {}
+    for attr, threshold_attr, _, _ in AGENT_JUDGED_METRICS:
+        if getattr(cfg.thresholds, threshold_attr) is None:
+            continue
+        missing = [x.case_id for x in per_case
+                   if getattr(x, attr) is None and (getattr(x, f"{attr}_status") or "error").startswith("error")]
+        if missing:
+            out[attr] = missing
+    return out
+
+
 def apply_threshold_policy(
     cfg: RunnerConfig,
     agg: AgentAggregatedScores,
+    unscored: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[bool, Dict[str, Any], List[str]]:
+    """First failure wins: policy, then per metric "a judge failed for some case" before "average below threshold".
+
+    Averages cover scored cases only, so a judge error must fail the run explicitly instead of disappearing.
+    """
     failed = False
     notes: List[str] = []
     root_cause = {"stage": "None"}
+    unscored = unscored or {}
+
+    def unscored_failure(attr: str, threshold_attr: str, threshold_name: str, stage: str) -> bool:
+        nonlocal failed, root_cause
+        ids = unscored.get(attr)
+        threshold = getattr(cfg.thresholds, threshold_attr)
+        if failed or threshold is None or not ids:
+            return False
+        failed = True
+        root_cause = {
+            "stage": stage,
+            "metric": attr,
+            "details": (f"{attr} was not scored for {len(ids)} case(s) ({', '.join(ids)}): the evaluator failed; "
+                        f"{threshold_name}={threshold:.4f} is set"),
+        }
+        notes.append(root_cause["details"])
+        return True
+
+    judged = {m[0]: m for m in AGENT_JUDGED_METRICS}
 
     if cfg.thresholds.max_policy_violations is not None:
         if agg.policy_violations_total > cfg.thresholds.max_policy_violations:
@@ -1531,6 +1732,7 @@ def apply_threshold_policy(
             }
             notes.append(root_cause["details"])
 
+    unscored_failure(*judged["tool_selection"])
     if not failed and cfg.thresholds.min_tool_selection is not None and agg.tool_selection_avg is not None:
         if agg.tool_selection_avg < cfg.thresholds.min_tool_selection:
             failed = True
@@ -1551,6 +1753,7 @@ def apply_threshold_policy(
             }
             notes.append(root_cause["details"])
 
+    unscored_failure(*judged["tool_invocation"])
     if not failed and cfg.thresholds.min_tool_invocation is not None and agg.tool_invocation_avg is not None:
         if agg.tool_invocation_avg < cfg.thresholds.min_tool_invocation:
             failed = True
@@ -1561,6 +1764,7 @@ def apply_threshold_policy(
             }
             notes.append(root_cause["details"])
 
+    unscored_failure(*judged["tool_response_handling"])
     if not failed and cfg.thresholds.min_tool_response_handling is not None and agg.tool_response_handling_avg is not None:
         if agg.tool_response_handling_avg < cfg.thresholds.min_tool_response_handling:
             failed = True
@@ -1571,6 +1775,7 @@ def apply_threshold_policy(
             }
             notes.append(root_cause["details"])
 
+    unscored_failure(*judged["task_completion"])
     if not failed and cfg.thresholds.min_task_completion is not None and agg.task_completion_avg is not None:
         if agg.task_completion_avg < cfg.thresholds.min_task_completion:
             failed = True
@@ -1589,7 +1794,7 @@ def apply_regression_policy(
     agg: AgentAggregatedScores,
     baseline: Optional[Dict[str, Any]],
 ) -> RegressionResult:
-    if not baseline:
+    if baseline is None:  # 404: no baseline object (an empty or malformed one is an error below)
         return RegressionResult(
             baseline_used=False,
             max_drop=cfg.regression_max_drop,
@@ -1601,9 +1806,13 @@ def apply_regression_policy(
     drops: Dict[str, float] = {}
     failed = False
 
-    baseline_scores = baseline.get("aggregatedScores", {})
+    baseline_scores = baseline.get("aggregatedScores") if isinstance(baseline, dict) else None
+    if not isinstance(baseline_scores, dict):
+        raise ValueError(f"baseline {cfg.s3_baseline_key} has no aggregatedScores object; "
+                         "a baseline must be a previous run's scores.json")
 
     failed_metrics: List[str] = []
+    not_compared: Dict[str, str] = {}
 
     # Higher-is-better averages of AgentAggregatedScores. The baseline is a previous scores.json
     # ("aggregatedScores" has the same snake_case keys). Policy violations are gated by
@@ -1617,9 +1826,18 @@ def apply_regression_policy(
     }
 
     for metric_name, current_value in metric_pairs.items():
-        baseline_value = safe_float(baseline_scores.get(metric_name))
-        if baseline_value is None or current_value is None:
-            continue  # metric not measured in one of the runs: nothing to compare
+        raw_baseline = baseline_scores.get(metric_name)
+        if raw_baseline is not None and (isinstance(raw_baseline, bool) or not isinstance(raw_baseline, (int, float))):
+            raise ValueError(f"baseline {cfg.s3_baseline_key}: aggregatedScores.{metric_name} must be a number, "
+                             f"got {raw_baseline!r}")
+        if raw_baseline is None or current_value is None:
+            # metric not measured in one of the runs: nothing to compare, but say so
+            not_compared[metric_name] = ("not measured in the baseline" if raw_baseline is None
+                                         else "not measured in this run")
+            if raw_baseline is None and current_value is None:
+                not_compared[metric_name] = "not measured in either run"
+            continue
+        baseline_value = float(raw_baseline)
 
         drop = round(current_value - baseline_value, 6)
         drops[metric_name] = drop
@@ -1634,6 +1852,7 @@ def apply_regression_policy(
         drops=drops,
         failed=failed,
         failed_metrics=failed_metrics,
+        not_compared=not_compared,
     )
 
 
@@ -1675,6 +1894,9 @@ def build_gate_summary(
 
     if regression.baseline_used:
         summary_parts.append("Baseline comparison used")
+        if regression.not_compared:
+            summary_parts.append("Not compared with the baseline: " + ", ".join(
+                f"{m} ({reason})" for m, reason in regression.not_compared.items()))
     else:
         summary_parts.append("No baseline available")
 
@@ -1813,8 +2035,8 @@ def guard_dataset_matches_mode(dataset_path: str, multi_turn: bool) -> None:
             case_id=single_ids[0], field_path="type")
     if not multi_turn and multi_ids:
         raise DatasetError(
-            "multi-turn case found but the EvalSuite uses interactionMode=SingleTurn; "
-            "set spec.evaluation.interactionMode: MultiTurn",
+            "case has multi-turn fields ('type'/'turns') but the EvalSuite uses interactionMode=SingleTurn; "
+            "multi-turn cases need \"type\": \"multiTurn\" and spec.evaluation.interactionMode: MultiTurn",
             case_id=multi_ids[0], field_path="type")
 
 
@@ -1851,7 +2073,8 @@ async def main() -> int:
 
         agg = aggregate_scores(per_case_scores)
 
-        threshold_failed, threshold_root_cause, threshold_notes = apply_threshold_policy(cfg, agg)
+        threshold_failed, threshold_root_cause, threshold_notes = apply_threshold_policy(
+            cfg, agg, unscored_cases(cfg, per_case_scores))
 
         regression = apply_regression_policy(cfg, agg, baseline)
 
@@ -1874,7 +2097,7 @@ async def main() -> int:
 
     except Exception as e:
         try:
-            cfg = build_runner_config()
+            cfg = build_runner_config(parse_suite=False)
 
             gate = GateSummary(
                 schemaVersion="evalrun.gate_summary/v1",
@@ -1885,9 +2108,10 @@ async def main() -> int:
                     # dataset/config problems get their own stage so the cause is obvious in EvalRun.status
                     "stage": ("Dataset" if isinstance(e, DatasetError)
                               else "Configuration" if isinstance(e, ConfigError) else "Execution"),
-                    "details": (str(e) if isinstance(e, (DatasetError, ConfigError))
+                    "details": (str(e) if isinstance(e, (DatasetError, ConfigError, AgentResponseError))
                                 else traceback.format_exc()[-3000:]),
-                    **({"caseId": e.case_id} if isinstance(e, DatasetError) and e.case_id else {}),
+                    **({"caseId": e.case_id}
+                       if isinstance(e, (DatasetError, AgentResponseError)) and e.case_id else {}),
                 },
                 artifacts={
                     "gateSummaryUri": artifact_uri(cfg, cfg.gate_summary_key),
@@ -1897,8 +2121,8 @@ async def main() -> int:
             )
             publish_gate_summary(cfg, gate)
 
-        except Exception:
-            pass
+        except Exception as publish_error:  # report it; the original error is printed below
+            print(f"agent runner could not publish the FAIL gate summary: {publish_error!r}", file=sys.stderr)
 
         print("agent runner failed:", str(e), file=sys.stderr)
         traceback.print_exc()

@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from .models import ToolCall, normalize_status
+from .models import ToolCall, parse_tool_status
 
 
 class TargetError(RuntimeError):
@@ -70,32 +70,63 @@ class TargetAdapter(ABC):
         """Hook for adapters with explicit session lifecycles (no-op for stateless POST)."""
 
 
-def parse_inline_tool_calls(trace: Dict[str, Any], turn_index: int, fallback: Optional[List[Any]] = None) -> List[ToolCall]:
+# Every value has exactly one field. These undocumented spellings are rejected by name instead of being
+# dropped (a dropped ``tool_calls`` would read as "no tool was called").
+RESPONSE_RENAMED_FIELDS = {"answer": "output", "toolCalls": "trace.toolCalls", "toolsCalled": "trace.toolCalls"}
+TRACE_RENAMED_FIELDS = {"tool_calls": "trace.toolCalls"}
+TOOL_CALL_RENAMED_FIELDS = {"tool": "name", "args": "arguments", "id": "callId", "result": "output",
+                            "duration_ms": "durationMs"}
+
+
+def reject_renamed(d: Dict[str, Any], renamed: Dict[str, str], path: str) -> None:
+    for old, new in renamed.items():
+        if old in d:
+            raise ValueError(f"{path}{old} is not supported; use {new}")
+
+
+def parse_inline_tool_calls(trace: Dict[str, Any], turn_index: int) -> List[ToolCall]:
     """Normalise ``trace.toolCalls`` of a turn response into canonical ToolCalls."""
-    raw_calls = None
-    if isinstance(trace, dict):
-        raw_calls = trace.get("toolCalls") or trace.get("tool_calls")
+    if not isinstance(trace, dict):
+        return []
+    reject_renamed(trace, TRACE_RENAMED_FIELDS, "trace.")
+    raw_calls = trace.get("toolCalls")
     if raw_calls is None:
-        raw_calls = fallback
+        return []
+    if not isinstance(raw_calls, list):
+        raise ValueError("trace.toolCalls must be a list")
     calls: List[ToolCall] = []
-    for i, raw in enumerate(raw_calls or []):
+    for i, raw in enumerate(raw_calls):
+        p = f"trace.toolCalls[{i}]"
         if not isinstance(raw, dict):
-            raise ValueError(f"trace.toolCalls[{i}] must be an object")
-        name = raw.get("name") or raw.get("tool")
-        if not name or not str(name).strip():
-            raise ValueError(f"trace.toolCalls[{i}] is missing a tool name")
-        args = raw.get("arguments", raw.get("args", {})) or {}
+            raise ValueError(f"{p} must be an object")
+        reject_renamed(raw, TOOL_CALL_RENAMED_FIELDS, f"{p}.")
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{p}.name is required and must be a non-empty string")
+        args = raw.get("arguments", {})
+        if args is None:
+            args = {}
         if not isinstance(args, dict):
-            raise ValueError(f"trace.toolCalls[{i}].arguments must be an object")
+            raise ValueError(f"{p}.arguments must be an object")
+        duration = raw.get("durationMs")
+        if duration is not None and (isinstance(duration, bool) or not isinstance(duration, (int, float))):
+            raise ValueError(f"{p}.durationMs must be a number, got {duration!r}")
+        call_id = raw.get("callId")
+        if call_id is not None and (not isinstance(call_id, str) or not call_id.strip()):
+            raise ValueError(f"{p}.callId must be a non-empty string when set")
         error = raw.get("error")
+        try:
+            status = parse_tool_status(raw.get("status"), error)
+        except ValueError as exc:
+            raise ValueError(f"{p}.{exc}") from None
         calls.append(ToolCall(
-            call_id=str(raw.get("callId") or raw.get("id") or f"turn{turn_index}-call{i + 1}"),
-            name=str(name).strip(),
+            call_id=call_id or f"turn{turn_index}-call{i + 1}",
+            name=name.strip(),
             arguments=args,
-            status=normalize_status(raw.get("status"), error),
-            result=raw.get("result", raw.get("output")),
+            status=status,
+            result=raw.get("output"),
             error=str(error) if error else None,
-            duration_ms=raw.get("durationMs", raw.get("duration_ms")),
+            duration_ms=duration,
             turn_index=turn_index,
             timestamp=raw.get("timestamp"),
             source="inline",
@@ -135,21 +166,29 @@ class StatelessSessionAdapter(TargetAdapter):
 
         if not isinstance(data, dict):
             raise TargetError("response body must be a JSON object", case_id, request.turn)
-        output = data.get("output", data.get("answer"))
+        try:
+            reject_renamed(data, RESPONSE_RENAMED_FIELDS, "")
+        except ValueError as exc:
+            raise TargetError(str(exc), case_id, request.turn) from exc
+        output = data.get("output")
         if not isinstance(output, str):
             raise TargetError("response is missing the string field 'output'", case_id, request.turn)
 
-        state = data.get("state") or {}
-        if not isinstance(state, dict):
-            raise TargetError("response field 'state' must be an object", case_id, request.turn)
-        trace = data.get("trace") or {}
-        if not isinstance(trace, dict):
-            raise TargetError("response field 'trace' must be an object", case_id, request.turn)
-        metadata = dict(data.get("metadata") or {})
+        # Absent (None) -> empty; any other non-object is a contract error (``[] or {}`` would hide it).
+        objects = {}
+        for key in ("state", "trace", "metadata"):
+            value = data.get(key)
+            if value is None:
+                value = {}
+            if not isinstance(value, dict):
+                raise TargetError(f"response field '{key}' must be an object", case_id, request.turn)
+            objects[key] = value
+        state, trace = objects["state"], objects["trace"]
+        metadata = dict(objects["metadata"])
         metadata.setdefault("latencyMs", elapsed_ms)
 
         try:
-            calls = parse_inline_tool_calls(trace, request.turn, fallback=data.get("toolCalls"))
+            calls = parse_inline_tool_calls(trace, request.turn)
         except ValueError as exc:
             raise TargetError(str(exc), case_id, request.turn) from exc
 
@@ -160,7 +199,7 @@ class StatelessSessionAdapter(TargetAdapter):
             trace=trace,
             metadata=metadata,
             tool_calls=calls,
-            has_inline_trace=bool(trace) or "toolCalls" in data,
+            has_inline_trace=bool(trace),
         )
 
 

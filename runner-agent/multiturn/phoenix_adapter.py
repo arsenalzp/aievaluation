@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .canonical import tool_call_key
-from .models import ToolCall, normalize_status
+from .models import TOOL_STATUS_ERROR, TOOL_STATUS_OK, ToolCall
 
 SOURCE_INLINE = "inline"
 SOURCE_PHOENIX = "phoenix"
@@ -29,6 +29,7 @@ SOURCE_AUTO = "auto"
 TRACE_SOURCES = (SOURCE_INLINE, SOURCE_PHOENIX, SOURCE_AUTO)
 
 SPAN_KIND_TOOL = "TOOL"
+OTEL_STATUS_CODES = ("UNSET", "OK", "ERROR")
 
 # OpenInference semantic-convention attribute names.
 ATTR_SPAN_KIND = "openinference.span.kind"
@@ -117,8 +118,8 @@ def _duration_ms(span: Dict[str, Any]) -> Optional[float]:
 
 
 def _tool_call_from_span(span: Dict[str, Any], attrs: Dict[str, Any], turn_index: Optional[int]) -> Optional[ToolCall]:
-    kind = str(attrs.get(ATTR_SPAN_KIND) or span.get("span_kind") or "").upper()
-    if kind != SPAN_KIND_TOOL:
+    kind = attrs.get(ATTR_SPAN_KIND) or span.get("span_kind")
+    if kind != SPAN_KIND_TOOL:  # OpenInference span kinds are upper case; no case folding
         return None
     name = attrs.get(ATTR_TOOL_NAME) or attrs.get(ATTR_FN_NAME) or span.get("name")
     if not name:
@@ -133,13 +134,17 @@ def _tool_call_from_span(span: Dict[str, Any], attrs: Dict[str, Any], turn_index
         params = params["kwargs"]  # common LangChain-style envelope
     arguments = params if isinstance(params, dict) else ({"input": params} if params is not None else {})
 
-    status_code = str(span.get("status_code") or "").upper()
+    status_code = span.get("status_code")
+    if status_code is not None and status_code not in OTEL_STATUS_CODES:
+        raise PhoenixSpanError(f"span {span.get('name')!r}: status_code must be one of {list(OTEL_STATUS_CODES)} "
+                               f"(OpenTelemetry), got {status_code!r}")
     exception_message = attrs.get(ATTR_EXC_MESSAGE)
     if status_code == "ERROR" or exception_message:
-        status = "ERROR"
+        status = TOOL_STATUS_ERROR
         error = span.get("status_message") or exception_message or "span status ERROR"
     else:
-        status = normalize_status(status_code or None, None)
+        # Translation of the OpenTelemetry schema, not a synonym: an UNSET span finished without an error.
+        status = TOOL_STATUS_OK
         error = None
     _, span_id = _span_context(span)
     return ToolCall(
@@ -226,6 +231,10 @@ def normalize_openinference_spans(
 
 class PhoenixFetchError(RuntimeError):
     pass
+
+
+class PhoenixSpanError(PhoenixFetchError):
+    """A span does not follow the OpenTelemetry/OpenInference schema; reported as a Phoenix evaluator failure."""
 
 
 class PhoenixRestFetcher:

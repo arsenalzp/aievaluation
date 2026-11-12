@@ -12,6 +12,6 @@
   "evaluation": {"interactionMode": "MultiTurn", "trials": 1, "trace": {"source": "inline"}},
   "evaluators": [
     {"name": "trajectory-policy", "provider": "builtin", "type": "deterministic", "required": true},
-    {"name": "conversation-quality", "provider": "deepeval", "type": "multiTurn", "metrics": ["knowledgeRetention", "conversationCompleteness", "turnRelevancy"], "samples": 1}
+    {"name": "conversation-quality", "provider": "deepeval", "type": "multiTurn", "required": false, "samples": 1}
   ]
 }

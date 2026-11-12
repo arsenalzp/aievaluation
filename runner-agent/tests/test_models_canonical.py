@@ -1,7 +1,9 @@
 import json
 
+import pytest
+
 from multiturn.canonical import canonical_json, partial_match, tool_call_key, values_equal
-from multiturn.models import Conversation, ToolCall, Turn, normalize_status
+from multiturn.models import Conversation, ToolCall, Turn, parse_tool_status
 
 
 def test_canonical_json_ignores_key_order_and_numeric_representation():
@@ -48,11 +50,13 @@ def test_partial_match_lists_must_match_exactly():
     assert not partial_match({"x": [1, 2]}, {"x": [1, 2, 3]})[0]
 
 
-def test_normalize_status():
-    assert normalize_status("success") == "OK"
-    assert normalize_status(None) == "OK"
-    assert normalize_status(None, error="boom") == "ERROR"
-    assert normalize_status("timeout") == "TIMEOUT"
+def test_parse_tool_status_accepts_exactly_ok_and_error():
+    assert parse_tool_status("OK") == "OK" and parse_tool_status("ERROR") == "ERROR"
+    assert parse_tool_status(None) == "OK"
+    assert parse_tool_status(None, error="boom") == "ERROR"
+    for synonym in ("success", "SUCCESS", "SUCCEEDED", "ok", "Ok", "UNSET", "timeout", "", 200):
+        with pytest.raises(ValueError, match="status must be one of"):
+            parse_tool_status(synonym)
 
 
 def test_conversation_orders_tool_calls_by_turn_and_serialises_to_json():

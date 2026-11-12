@@ -59,8 +59,9 @@ def run_semantic_evaluators(
         try:
             provider = provider_factory(cfg) if provider_factory else get_semantic_provider(cfg)
             safe = redact(conversation) if redact else conversation
-            thresholds = {m: settings.semantic_threshold(m) for m in cfg.metrics}
-            scores = provider.evaluate(safe, list(cfg.metrics), thresholds, cfg.model or default_model, cfg.samples)
+            metrics = settings.semantic_metrics()  # single source: thresholds in metrics.agent.conversation
+            thresholds = {m: settings.semantic_threshold(m) for m in metrics}
+            scores = provider.evaluate(safe, metrics, thresholds, cfg.model or default_model, cfg.samples)
             for s in scores:
                 s.evaluator = cfg.name  # the configured evaluator name, not the library name
                 s.version = s.version or provider.version

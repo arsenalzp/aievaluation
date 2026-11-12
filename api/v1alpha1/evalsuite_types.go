@@ -7,14 +7,6 @@ import (
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-type Trustworthiness struct {
-	// +kubebuilder:validation:Optional
-	MaxStaleChunkRatio *float32 `json:"maxStaleChunkRatio,omitempty"`
-
-	// +kubebuilder:validation:Optional
-	MaxUnknownOwnerRatio *float32 `json:"maxUnknownOwnerRatio,omitempty"`
-}
-
 type Generation struct {
 	// +kubebuilder:validation:Optional
 	MinFaithfulness *float32 `json:"minFaithfulness,omitempty"`
@@ -102,7 +94,8 @@ type AgentConversation struct {
 	// +kubebuilder:validation:Minimum=1
 	MaxTurns *int32 `json:"maxTurns,omitempty"`
 
-	// Semantic thresholds are only enforced by evaluators with provider deepeval.
+	// Semantic thresholds. Each one that is set is computed by the (single) provider deepeval evaluator in
+	// spec.evaluators, which is then mandatory; setting none of them while a deepeval evaluator exists is an error.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=1
@@ -162,9 +155,6 @@ type Rag struct {
 
 	// +kubebuilder:validation:Optional
 	Generation `json:"generation,omitempty"`
-
-	// +kubebuilder:validation:Optional
-	Trustworthiness `json:"trustworthiness,omitempty"`
 }
 
 type Metrics struct {
@@ -228,8 +218,10 @@ type Evaluation struct {
 	Trace *TraceSpec `json:"trace,omitempty"`
 }
 
-// Evaluator configures one evaluator of a multi-turn evaluation.
-// The built-in deterministic evaluator always runs; semantic evaluators are optional.
+// Evaluator configures *how* one evaluator of a multi-turn evaluation runs. *What* is evaluated and the
+// thresholds live only in spec.metrics.agent: a provider deepeval evaluator computes exactly the semantic
+// metrics that have a threshold in spec.metrics.agent.conversation.
+// The built-in deterministic evaluator always runs and is always required; at most one evaluator per provider.
 type Evaluator struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
@@ -240,18 +232,15 @@ type Evaluator struct {
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Enum=deterministic;multiTurn
 	Type string `json:"type,omitempty"`
-	// When true, a failure of this evaluator (or a metric below its threshold) fails the run.
-	// When false, it is recorded and turns the verdict into WARN at most.
+	// Provider deepeval: when true, an evaluator failure or a semantic metric below its threshold fails the run;
+	// when false or omitted, it turns the verdict into WARN at most.
+	// Provider builtin: always required; only omitted or true is accepted.
 	// +kubebuilder:validation:Optional
-	Required bool `json:"required,omitempty"`
-	// Semantic metrics (provider deepeval). Defaults to all supported metrics.
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:items:Enum=knowledgeRetention;conversationCompleteness;turnRelevancy
-	Metrics []string `json:"metrics,omitempty"`
-	// Judge model; defaults to the EvalRun model.
+	Required *bool `json:"required,omitempty"`
+	// Judge model (provider deepeval only); defaults to the EvalRun model.
 	// +kubebuilder:validation:Optional
 	Model string `json:"model,omitempty"`
-	// Judge runs per conversation; the median is used.
+	// Judge runs per conversation; the median is used (provider deepeval only).
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=5

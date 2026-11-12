@@ -43,14 +43,12 @@ spec:
       provider: builtin
       type: deterministic
       required: true
+    # Computes exactly the semantic metrics that have a threshold in metrics.agent.conversation
+    # (minKnowledgeRetention, minConversationCompleteness, minTurnRelevancy); evaluators carry no metric list.
     - name: conversation-quality
       provider: deepeval
       type: multiTurn
       required: false
       samples: 1
-      metrics:
-        - knowledgeRetention
-        - conversationCompleteness
-        - turnRelevancy
   regressionPolicy:
     maxDrop: 0.03

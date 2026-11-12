@@ -20,17 +20,19 @@ SEVERITIES = (SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW)
 TOOL_STATUS_OK = "OK"
 TOOL_STATUS_ERROR = "ERROR"
 
-_OK_STATUSES = {"OK", "SUCCESS", "SUCCEEDED", "UNSET"}
+TOOL_STATUSES = (TOOL_STATUS_OK, TOOL_STATUS_ERROR)
 
 
-def normalize_status(status: Optional[str], error: Any = None) -> str:
-    """Map vendor specific tool status strings to OK / ERROR / <UPPER-CASED>."""
-    if status is None or str(status).strip() == "":
+def parse_tool_status(status: Any, error: Any = None) -> str:
+    """Tool status of the endpoint contract: exactly ``OK`` or ``ERROR`` (no synonyms, no case folding).
+
+    An omitted status (``None``) is derived from ``error``. Anything else raises ``ValueError``.
+    """
+    if status is None:
         return TOOL_STATUS_ERROR if error else TOOL_STATUS_OK
-    upper = str(status).strip().upper()
-    if upper in _OK_STATUSES:
-        return TOOL_STATUS_OK
-    return upper
+    if status not in TOOL_STATUSES:
+        raise ValueError(f"status must be one of {list(TOOL_STATUSES)}, got {status!r}")
+    return status
 
 
 @dataclass

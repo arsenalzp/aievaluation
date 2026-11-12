@@ -20,7 +20,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from multiturn.config import PROVIDER_BUILTIN  # noqa: E402
+from multiturn.config import PROVIDER_BUILTIN, SEMANTIC_THRESHOLD_FIELDS  # noqa: E402
 from multiturn.entrypoint import run_multiturn_job  # noqa: E402
 
 
@@ -52,13 +52,21 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="artifact directory (default: a temp dir)")
     ap.add_argument("--run-name", default="local-run")
     ap.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5-mini"), help="default judge model")
-    ap.add_argument("--no-semantic", action="store_true", help="skip optional semantic (DeepEval) evaluators")
+    ap.add_argument("--no-semantic", action="store_true",
+                    help="skip semantic (DeepEval) evaluation: drops the deepeval evaluator and the semantic thresholds")
     args = ap.parse_args()
 
     with open(args.suite, encoding="utf-8") as fh:
         suite = json.load(fh)
     if args.no_semantic:
+        # Metrics are selected only by their thresholds in metrics.agent.conversation, so skipping semantic
+        # evaluation means dropping both the evaluator and those thresholds (announced, never silent).
         suite["evaluators"] = [e for e in suite.get("evaluators", []) if e.get("provider", PROVIDER_BUILTIN) == PROVIDER_BUILTIN]
+        conversation = ((suite.get("metrics") or {}).get("agent") or {}).get("conversation") or {}
+        dropped = [f for f in SEMANTIC_THRESHOLD_FIELDS.values() if conversation.pop(f, None) is not None]
+        if dropped:
+            print(f"--no-semantic: semantic evaluation skipped; ignoring metrics.agent.conversation.{', '.join(dropped)}",
+                  file=sys.stderr)
 
     out = args.out or tempfile.mkdtemp(prefix="evalrun-local-")
     prefix = f"runs/{args.run_name}"

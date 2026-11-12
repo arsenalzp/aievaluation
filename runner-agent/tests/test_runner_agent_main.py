@@ -8,6 +8,7 @@ import shutil
 import pytest
 
 from fake_travel_agent import FakeTravelAgent
+from multiturn.config import ConfigError
 from conftest import suite_dict, travel_case  # noqa: F401
 
 RUNNER_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "runner-agent.py")
@@ -26,7 +27,7 @@ SINGLE_LINE = json.dumps({"caseId": "st-1", "input": "hello", "expectedTools": [
 def runner(monkeypatch, tmp_path):
     pytest.importorskip("phoenix.evals", reason="runner-agent.py needs the agent runner dependencies (make agent-runner-install-dev)")
     env = {"OPENAI_MODEL": "gpt-test", "OPENAI_API_KEY": "sk-test", "EVALRUN_NAME": "run1", "EVALSUITE_NAME": "suite1",
-           "TARGET_ENDPOINT": "http://agent/turn", "S3_ENDPOINT": "http://s3", "DATASET_S3_BUCKET": "bucket",
+           "TARGET_ENDPOINT": "http://agent/turn", "S3_ENDPOINT": "http://s3", "DATASET_S3_BUCKET": "datasets", "S3_SUMMARY_BUCKET": "bucket",
            "S3_ACCESS_KEY": "a", "S3_SECRET_KEY": "b", "DATASET_S3_KEY": "ds.jsonl", "S3_BASELINE_KEY": "baselines/s.json",
            "GATE_SUMMARY_KEY": "runs/run1/gate_summary.json", "SCORES_KEY": "runs/run1/scores.json",
            "DETAILS_KEY": "runs/run1/details.jsonl", "S3_RUN_PREFIX": "runs/run1", "WORK_DIR": str(tmp_path),
@@ -150,8 +151,9 @@ def test_single_turn_flow_is_unchanged(runner, monkeypatch):
 def test_max_policy_violations_is_read_from_agent_metrics(runner, monkeypatch):
     runner.setup({"metrics": {"agent": {"maxPolicyViolations": 2}}}, [SINGLE_LINE])
     assert runner.build_runner_config().thresholds.max_policy_violations == 2
-    runner.setup({"metrics": {"policy": {"maxPolicyViolations": 3}}}, [SINGLE_LINE])  # legacy location
-    assert runner.build_runner_config().thresholds.max_policy_violations == 3
+    runner.setup({"metrics": {"policy": {"maxPolicyViolations": 3}}}, [SINGLE_LINE])  # former location: no synonyms
+    with pytest.raises(ConfigError, match="metrics.policy is not supported; set metrics.agent.maxPolicyViolations"):
+        runner.build_runner_config()
 
 
 DATASET = os.path.join(os.path.dirname(RUNNER_PATH), "..", "examples", "dataset-agent-single-turn.jsonl")

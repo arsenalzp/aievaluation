@@ -35,11 +35,7 @@ def suite_config_file(tmp_path):
                     "generation": {
                         "minFaithfulness": 0.8,
                         "minCorrectness": 0.75,
-                        "minRelevancy:": 0.5,
-                    },
-                    "trustworthiness": {
-                        "maxStaleChunkRatio": 0.1,
-                        "maxUnknownOwnerRatio": 0.2,
+                        "minRelevancy": 0.5,
                     },
                 },
             },
@@ -77,7 +73,6 @@ def cfg(tmp_path):
 
         dataset_s3_bucket="dataset-bucket",
         dataset_s3_key="datasets/test.jsonl",
-        dataset_s3_version_id=None,
 
         s3_baseline_key="baseline.json",
         gate_summary_key="artifacts/gate-summary.json",
@@ -94,8 +89,6 @@ def cfg(tmp_path):
             min_faithfulness=0.8,
             min_correctness=0.75,
             min_relevancy=0.75,
-            max_stale_chunk_ratio=None,
-            max_unknown_owner_ratio=None,
         ),
         regression_max_drop=0.05,
     )
@@ -155,6 +148,7 @@ def test_build_runner_config(monkeypatch, suite_config_file):
 
     monkeypatch.setenv("S3_ENDPOINT", "http://s3.local")
     monkeypatch.setenv("DATASET_S3_BUCKET", "dataset-bucket")
+    monkeypatch.setenv("S3_SUMMARY_BUCKET", "eval-bucket")
     monkeypatch.setenv("DATASET_S3_KEY", "datasets/test.jsonl")
     monkeypatch.setenv("S3_ACCESS_KEY", "access")
     monkeypatch.setenv("S3_SECRET_KEY", "secret")
@@ -174,11 +168,15 @@ def test_build_runner_config(monkeypatch, suite_config_file):
     assert cfg.evalsuite_name == "suite-1"
     assert cfg.target_endpoint == "http://target.local/evaluate"
     assert cfg.request_timeout_seconds == 30
+    # one value per field: the dataset bucket and the artifact bucket (EvalRun.spec.summaryBucket) are separate
+    assert cfg.dataset_s3_bucket == "dataset-bucket"
+    assert cfg.s3_bucket == "eval-bucket"
 
     assert cfg.thresholds.min_context_recall == 0.7
     assert cfg.thresholds.min_context_precision == 0.6
     assert cfg.thresholds.min_faithfulness == 0.8
     assert cfg.thresholds.min_correctness == 0.75
+    assert cfg.thresholds.min_relevancy == 0.5
     assert cfg.regression_max_drop == 0.05
 
     assert cfg.llm_model == "gpt-test"
@@ -194,7 +192,7 @@ def test_parse_dataset_jsonl_valid_file(tmp_path):
     dataset = tmp_path / "dataset.jsonl"
     dataset.write_text(
         '{"caseId":"case-1","question":"What is RAG?","groundTruth":"Retrieval augmented generation","tags":["rag"],"metadata":{"owner":"team-a"}}\n'
-        '{"caseId":"case-2","question":"What is Kubernetes?"}\n',
+        '{"caseId":"case-2","question":"What is Kubernetes?","groundTruth":"A container orchestrator"}\n',
         encoding="utf-8",
     )
 
@@ -210,7 +208,7 @@ def test_parse_dataset_jsonl_valid_file(tmp_path):
 
     assert cases[1].case_id == "case-2"
     assert cases[1].question == "What is Kubernetes?"
-    assert cases[1].ground_truth is None
+    assert cases[1].ground_truth == "A container orchestrator"
     assert cases[1].tags == []
     assert cases[1].metadata == {}
 
@@ -218,7 +216,7 @@ def test_parse_dataset_jsonl_valid_file(tmp_path):
 def test_parse_dataset_jsonl_skips_empty_lines(tmp_path):
     dataset = tmp_path / "dataset.jsonl"
     dataset.write_text(
-        '\n{"caseId":"case-1","question":"Q1"}\n\n',
+        '\n{"caseId":"case-1","question":"Q1","groundTruth":"GT1"}\n\n',
         encoding="utf-8",
     )
 
@@ -235,7 +233,7 @@ def test_parse_dataset_jsonl_missing_case_id_raises(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="missing caseId"):
+    with pytest.raises(runner.DatasetError, match=r"line 1, caseId=<unknown>, field=caseId\): is required"):
         runner.parse_dataset_jsonl(str(dataset))
 
 
@@ -246,7 +244,7 @@ def test_parse_dataset_jsonl_missing_question_raises(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="missing question"):
+    with pytest.raises(runner.DatasetError, match=r"caseId='case-1', field=question\): is required"):
         runner.parse_dataset_jsonl(str(dataset))
 
 
@@ -377,7 +375,7 @@ def test_call_target_endpoint_success(monkeypatch, cfg):
                 {
                     "id": "doc-1",
                     "text": "RAG retrieves documents before generation.",
-                    "score": "0.95",
+                    "score": 0.95,
                     "source": "docs",
                 }
             ],
@@ -446,7 +444,7 @@ def test_call_target_endpoint_empty_answer_raises(monkeypatch, cfg):
 
     case = DatasetCase(case_id="case-1", question="Q")
 
-    with pytest.raises(RuntimeError, match="empty answer"):
+    with pytest.raises(runner.TargetResponseError, match="answer is required and must be a non-empty string"):
         runner.call_target_endpoint(cfg, case)
 
 
@@ -584,6 +582,7 @@ def test_mark_per_case_pass_fail_passes_when_all_metrics_above_thresholds(cfg):
             case_id="case-1",
             faithfulness=0.9,
             answer_relevancy=0.8,
+            answer_correctness=0.8,
             context_precision=0.8,
             context_recall=0.8,
             safety_passed=True
@@ -689,7 +688,7 @@ def test_apply_threshold_policy_fails_on_answer_relevancy_fallback(cfg):
         vulnerability_type="",
         faithfulness_avg=0.9,
         answer_relevancy_avg=0.6,
-        answer_correctness_avg=None,
+        answer_correctness_avg=0.9,  # minCorrectness is set: a missing average now fails the run
         context_precision_avg=0.9,
         context_recall_avg=0.9,
         latency_ms_avg=100,
@@ -711,7 +710,7 @@ def test_apply_threshold_policy_passes(cfg):
         vulnerability_type="",
         faithfulness_avg=0.9,
         answer_relevancy_avg=0.9,
-        answer_correctness_avg=None,
+        answer_correctness_avg=0.9,  # minCorrectness is set: a missing average now fails the run
         context_precision_avg=0.9,
         context_recall_avg=0.9,
         latency_ms_avg=100,
@@ -1076,7 +1075,7 @@ async def test_main_success_flow(monkeypatch, cfg, tmp_path):
     )
     cfg.dataset_file = str(dataset_path)
 
-    monkeypatch.setattr(runner, "build_runner_config", lambda: cfg)
+    monkeypatch.setattr(runner, "build_runner_config", lambda **kwargs: cfg)
     monkeypatch.setattr(runner, "download_dataset", lambda cfg_arg: str(dataset_path))
     monkeypatch.setattr(runner, "load_optional_baseline", lambda cfg_arg: None)
 
@@ -1109,6 +1108,7 @@ async def test_main_success_flow(monkeypatch, cfg, tmp_path):
                     case_id="case-1",
                     faithfulness=0.9,
                     answer_relevancy=0.9,
+                    answer_correctness=0.9,  # minCorrectness is set: a missing score would fail the case
                     context_precision=0.9,
                     context_recall=0.9,
                     latency_ms=100,

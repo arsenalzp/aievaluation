@@ -1,6 +1,8 @@
 """apply_regression_policy of the single-turn agent runner (previously crashed with AttributeError on any baseline)."""
 import json
 
+import pytest
+
 from test_runner_agent_main import SINGLE_LINE, run_main, runner  # noqa: F401  (fixture re-use)
 
 
@@ -14,6 +16,7 @@ def agg(runner, **over):
 def cfg(runner, max_drop=0.03):
     c = type("Cfg", (), {})()
     c.regression_max_drop = max_drop
+    c.s3_baseline_key = "baselines/suite1.json"
     return c
 
 
@@ -47,10 +50,30 @@ def test_improvement_never_fails(runner):
     assert not r.failed and r.drops["task_completion_avg"] == 0.5
 
 
-def test_metric_missing_in_either_run_is_skipped(runner):
-    old = {"aggregatedScores": {"tool_selection_avg": 0.9}}  # e.g. baseline from before task completion existed
-    r = runner.apply_regression_policy(cfg(runner), agg(runner, tool_invocation_avg=None), old)
+def test_metric_missing_in_either_run_is_not_compared_and_reported(runner):
+    old = {"aggregatedScores": {"tool_selection_avg": 0.9, "tool_execution_avg": 1.0}}  # e.g. an older baseline
+    r = runner.apply_regression_policy(cfg(runner), agg(runner, tool_invocation_avg=None, tool_execution_avg=None), old)
     assert set(r.drops) == {"tool_selection_avg"} and not r.failed
+    assert r.not_compared == {"tool_invocation_avg": "not measured in either run",
+                              "tool_execution_avg": "not measured in this run",
+                              "tool_response_handling_avg": "not measured in the baseline",
+                              "task_completion_avg": "not measured in the baseline"}
+    gate = runner.build_gate_summary(cfg=type("C", (), {"s3_endpoint": "http://s3", "s3_bucket": "b",
+                                                        "gate_summary_key": "g", "scores_key": "s", "details_key": "d"})(),
+                                     agg=agg(runner), threshold_failed=False, threshold_root_cause=None,
+                                     threshold_notes=[], regression=r)
+    assert "Not compared with the baseline: tool_invocation_avg (not measured in either run)" in gate.summary
+
+
+@pytest.mark.parametrize("baseline, fragment", [
+    ({}, "has no aggregatedScores object"),
+    ({"aggregatedScores": []}, "has no aggregatedScores object"),
+    ({"aggregatedScores": {"tool_selection_avg": "0.9"}}, r"aggregatedScores.tool_selection_avg must be a number"),
+    ({"aggregatedScores": {"task_completion_avg": True}}, r"aggregatedScores.task_completion_avg must be a number"),
+])
+def test_malformed_baseline_is_an_error_not_a_skipped_comparison(runner, baseline, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        runner.apply_regression_policy(cfg(runner), agg(runner), baseline)
 
 
 def test_without_max_drop_drops_are_reported_but_never_fail(runner):

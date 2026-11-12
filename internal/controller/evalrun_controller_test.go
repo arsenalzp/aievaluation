@@ -113,8 +113,6 @@ func testEvalSuite(name string) *aieval.EvalSuite {
 	minPrecision := float32(0.6)
 	minFaithfulness := float32(0.8)
 	minCorrectness := float32(0.75)
-	maxStaleChunkRatio := float32(0.1)
-	maxUnknownOwnerRatio := float32(0.2)
 	maxDrop := float32(0.05)
 	timeoutSeconds := int64(60)
 
@@ -136,10 +134,6 @@ func testEvalSuite(name string) *aieval.EvalSuite {
 					Generation: aieval.Generation{
 						MinFaithfulness: &minFaithfulness,
 						MinCorrectness:  &minCorrectness,
-					},
-					Trustworthiness: aieval.Trustworthiness{
-						MaxStaleChunkRatio:   &maxStaleChunkRatio,
-						MaxUnknownOwnerRatio: &maxUnknownOwnerRatio,
 					},
 				},
 			},
@@ -166,7 +160,6 @@ func testEvalDataset(name string) *aieval.EvalDataset {
 				ObjectStorageEndpoint: "http://object-storage.default.svc.cluster.local:9876",
 				Bucket:                "datasets",
 				ObjectKey:             "rag/dataset.jsonl",
-				VersionId:             "v1",
 			},
 		},
 	}
@@ -285,7 +278,6 @@ func TestRenderSuiteConfigJSON(t *testing.T) {
 	metrics := decoded["metrics"].(map[string]any)["rag"].(map[string]any)
 	retrieval := metrics["retrieval"].(map[string]any)
 	generation := metrics["generation"].(map[string]any)
-	trustworthiness := metrics["trustworthiness"].(map[string]any)
 	regressionPolicy := decoded["regressionPolicy"].(map[string]any)
 	execution := decoded["execution"].(map[string]any)
 
@@ -305,12 +297,8 @@ func TestRenderSuiteConfigJSON(t *testing.T) {
 		t.Fatalf("unexpected minCorrectness: %v", generation["minCorrectness"])
 	}
 
-	if trustworthiness["maxStaleChunkRatio"] != float64(0.1) {
-		t.Fatalf("unexpected maxStaleChunkRatio: %v", trustworthiness["maxStaleChunkRatio"])
-	}
-
-	if trustworthiness["maxUnknownOwnerRatio"] != float64(0.2) {
-		t.Fatalf("unexpected maxUnknownOwnerRatio: %v", trustworthiness["maxUnknownOwnerRatio"])
+	if _, ok := metrics["trustworthiness"]; ok {
+		t.Fatalf("trustworthiness was removed from the API and must not be rendered: %v", metrics)
 	}
 
 	if regressionPolicy["maxDrop"] != float64(0.05) {
@@ -368,28 +356,27 @@ func TestBuildEvalJobEnvironmentContract(t *testing.T) {
 	env := envMap(container.Env)
 
 	expectedEnvValues := map[string]string{
-		"EVALRUN_NAME":          "run-1",
-		"EVALSUITE_NAME":        "suite-1",
-		"GIT_SHA":               "abc123",
-		"PR_NUMBER":             "42",
-		"WORK_DIR":              "/work",
-		"DATASET_FILE":          "/work/dataset",
-		"SUITE_CONFIG":          "/config/suite.json",
-		"DATASET_S3_BUCKET":     "datasets",
-		"DATASET_S3_KEY":        "rag/dataset.jsonl",
-		"DATASET_S3_VERSION_ID": "v1",
-		"DATASET_FORMAT":        "jsonl",
-		"S3_ENDPOINT":           "http://object-storage.default.svc.cluster.local:9876",
-		"S3_RUN_PREFIX":         "runs/run-1",
-		"S3_BASELINE_KEY":       "baselines/suite-1.json",
-		"GATE_SUMMARY_KEY":      "runs/run-1/gate_summary.json",
-		"SCORES_KEY":            "runs/run-1/scores.json",
-		"DETAILS_KEY":           "runs/run-1/details.jsonl",
-		"S3_SUMMARY_BUCKET":     "eval-artifacts",
-		"S3_SUMMARY_KEY":        "runs/run-1/gate_summary.json",
-		"TARGET_ENDPOINT":       "http://rag.default.svc.cluster.local/query",
-		"OPENAI_MODEL":          "gpt-4.1-mini",
-		"OPENAI_EMBEDDER":       "text-embedding-3-small",
+		"EVALRUN_NAME":      "run-1",
+		"EVALSUITE_NAME":    "suite-1",
+		"GIT_SHA":           "abc123",
+		"PR_NUMBER":         "42",
+		"WORK_DIR":          "/work",
+		"DATASET_FILE":      "/work/dataset",
+		"SUITE_CONFIG":      "/config/suite.json",
+		"DATASET_S3_BUCKET": "datasets",
+		"DATASET_S3_KEY":    "rag/dataset.jsonl",
+		"DATASET_FORMAT":    "jsonl",
+		"S3_ENDPOINT":       "http://object-storage.default.svc.cluster.local:9876",
+		"S3_RUN_PREFIX":     "runs/run-1",
+		"S3_BASELINE_KEY":   "baselines/suite-1.json",
+		"GATE_SUMMARY_KEY":  "runs/run-1/gate_summary.json",
+		"SCORES_KEY":        "runs/run-1/scores.json",
+		"DETAILS_KEY":       "runs/run-1/details.jsonl",
+		"S3_SUMMARY_BUCKET": "eval-artifacts",
+		"S3_SUMMARY_KEY":    "runs/run-1/gate_summary.json",
+		"TARGET_ENDPOINT":   "http://rag.default.svc.cluster.local/query",
+		"OPENAI_MODEL":      "gpt-4.1-mini",
+		"OPENAI_EMBEDDER":   "text-embedding-3-small",
 	}
 
 	for name, expected := range expectedEnvValues {
@@ -734,6 +721,10 @@ func legacyAgentSuite(name string) *aieval.EvalSuite {
 func multiTurnSuite(name string) *aieval.EvalSuite {
 	suite := legacyAgentSuite(name)
 	suite.Spec.Execution.Mode = "agent" // the task type is execution.mode
+	// Flat single-turn fields the multi-turn runner does not read are rejected by validateSuite.
+	suite.Spec.Metrics.Agent.MinToolSelection = nil
+	suite.Spec.Metrics.Agent.MinToolInvocation, suite.Spec.Metrics.Agent.MinToolExecution = nil, nil
+	suite.Spec.Metrics.Agent.MaxPolicyViolations = nil
 	f32 := func(v float32) *float32 { return &v }
 	suite.Spec.Evaluation = &aieval.Evaluation{
 		InteractionMode: "MultiTurn", Trials: ptr.To[int32](2),
@@ -752,9 +743,8 @@ func multiTurnSuite(name string) *aieval.EvalSuite {
 		MaxCriticalViolations: ptr.To[int32](0), MaxHighViolations: ptr.To[int32](0), LimitsAction: "Fail",
 	}
 	suite.Spec.Evaluators = []aieval.Evaluator{
-		{Name: "trajectory-policy", Provider: "builtin", Type: "deterministic", Required: true},
-		{Name: "conversation-quality", Provider: "deepeval", Type: "multiTurn", Required: false,
-			Metrics: []string{"knowledgeRetention", "conversationCompleteness", "turnRelevancy"}, Samples: ptr.To[int32](3)},
+		{Name: "trajectory-policy", Provider: "builtin", Type: "deterministic", Required: ptr.To(true)},
+		{Name: "conversation-quality", Provider: "deepeval", Type: "multiTurn", Required: ptr.To(false), Samples: ptr.To[int32](3)},
 	}
 	return suite
 }
@@ -816,9 +806,8 @@ func TestRenderSuiteConfigJSONForMultiTurn(t *testing.T) {
 	}
 
 	agent := cfg["metrics"].(map[string]any)["agent"].(map[string]any)
-	// legacy flat fields are still rendered
-	if agent["minToolSelection"] != 0.9 || agent["maxPolicyViolations"] != float64(0) {
-		t.Fatalf("legacy agent fields lost: %v", agent)
+	if agent["minToolSelection"] != nil {
+		t.Fatalf("multi-turn suites have no flat single-turn fields: %v", agent)
 	}
 	conv := agent["conversation"].(map[string]any)
 	if conv["maxTurns"] != float64(10) || conv["minKnowledgeRetention"] != 0.85 || conv["minTurnRelevancy"] != 0.8 {
@@ -844,11 +833,11 @@ func TestRenderSuiteConfigJSONForMultiTurn(t *testing.T) {
 	if semantic["name"] != "conversation-quality" || semantic["provider"] != "deepeval" || semantic["samples"] != float64(3) {
 		t.Fatalf("unexpected semantic evaluator: %v", semantic)
 	}
-	if semantic["required"] != nil && semantic["required"] != false {
-		t.Fatalf("optional evaluator must not be required: %v", semantic)
+	if semantic["required"] != false {
+		t.Fatalf("an explicit required: false must reach the runner: %v", semantic)
 	}
-	if got := len(semantic["metrics"].([]any)); got != 3 {
-		t.Fatalf("expected 3 semantic metrics, got %d", got)
+	if _, ok := semantic["metrics"]; ok {
+		t.Fatalf("evaluators carry no metrics; they come only from spec.metrics.agent: %v", semantic)
 	}
 	if evaluators[0].(map[string]any)["required"] != true {
 		t.Fatalf("builtin evaluator should be required: %v", evaluators[0])
@@ -947,9 +936,21 @@ func TestValidateSuite(t *testing.T) {
 		mutate  func(s *aieval.EvalSuite)
 		wantErr string
 	}{
-		{"legacy suite is valid", func(s *aieval.EvalSuite) { s.Spec.Evaluation, s.Spec.Evaluators = nil, nil }, ""},
+		{"legacy suite is valid", func(s *aieval.EvalSuite) { *s = *legacyAgentSuite("s") }, ""},
 		{"multi-turn suite is valid", func(s *aieval.EvalSuite) {}, ""},
 		{"evaluators need MultiTurn", func(s *aieval.EvalSuite) { s.Spec.Evaluation = nil }, "only supported with"},
+		{"trials need MultiTurn", func(s *aieval.EvalSuite) {
+			*s = *legacyAgentSuite("s")
+			s.Spec.Evaluation = &aieval.Evaluation{InteractionMode: "SingleTurn", Trials: ptr.To[int32](3)}
+		}, "trials and spec.evaluation.trace are only supported"},
+		{"trace needs MultiTurn", func(s *aieval.EvalSuite) {
+			*s = *legacyAgentSuite("s")
+			s.Spec.Evaluation = &aieval.Evaluation{Trace: &aieval.TraceSpec{Source: "inline"}}
+		}, "trials and spec.evaluation.trace are only supported"},
+		{"explicit SingleTurn is valid", func(s *aieval.EvalSuite) {
+			*s = *legacyAgentSuite("s")
+			s.Spec.Evaluation = &aieval.Evaluation{InteractionMode: "SingleTurn"}
+		}, ""},
 		{"mode rag cannot be multi-turn", func(s *aieval.EvalSuite) { s.Spec.Execution.Mode = "rag" }, "only supported for agent"},
 		{"rag metrics without mode cannot be multi-turn", func(s *aieval.EvalSuite) {
 			s.Spec.Execution.Mode, s.Spec.Metrics = "", aieval.Metrics{Rag: &aieval.Rag{}}
@@ -970,6 +971,51 @@ func TestValidateSuite(t *testing.T) {
 		}, "minToolResponseHandling applies to single-turn"},
 		{"deepeval is not deterministic", func(s *aieval.EvalSuite) { s.Spec.Evaluators[1].Type = "deterministic" }, "deepeval only supports"},
 		{"builtin is not multiTurn", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Type = "multiTurn" }, "builtin only supports"},
+		{"builtin cannot be optional", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Required = ptr.To(false) }, "always required"},
+		{"builtin may omit required", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Required = nil }, ""},
+		{"builtin uses no judge model", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Model = "gpt" }, "only to provider deepeval"},
+		{"builtin uses no judge samples", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Samples = ptr.To[int32](2) }, "only to provider deepeval"},
+		{"provider defaults to builtin", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Provider = "" }, ""},
+		{"one evaluator per provider", func(s *aieval.EvalSuite) {
+			s.Spec.Evaluators = append(s.Spec.Evaluators, aieval.Evaluator{Name: "second-judge", Provider: "deepeval"})
+		}, "only one evaluator with provider deepeval"},
+		{"one builtin evaluator", func(s *aieval.EvalSuite) {
+			s.Spec.Evaluators = append(s.Spec.Evaluators, aieval.Evaluator{Name: "policy-2"})
+		}, "only one evaluator with provider builtin"},
+		{"semantic threshold without a deepeval evaluator", func(s *aieval.EvalSuite) { s.Spec.Evaluators = s.Spec.Evaluators[:1] },
+			"minKnowledgeRetention, minConversationCompleteness, minTurnRelevancy is set but no evaluator computes it"},
+		{"deterministic-only suite needs no deepeval evaluator", func(s *aieval.EvalSuite) {
+			s.Spec.Evaluators = s.Spec.Evaluators[:1]
+			c := s.Spec.Metrics.Agent.Conversation
+			c.MinKnowledgeRetention, c.MinConversationCompleteness, c.MinTurnRelevancy = nil, nil, nil
+		}, ""},
+		{"deepeval evaluator without semantic thresholds", func(s *aieval.EvalSuite) {
+			c := s.Spec.Metrics.Agent.Conversation
+			c.MinKnowledgeRetention, c.MinConversationCompleteness, c.MinTurnRelevancy = nil, nil, nil
+		}, "has nothing to evaluate"},
+		{"one semantic threshold is enough", func(s *aieval.EvalSuite) {
+			c := s.Spec.Metrics.Agent.Conversation
+			c.MinConversationCompleteness, c.MinTurnRelevancy = nil, nil
+		}, ""},
+		{"minToolInvocation is single-turn only", func(s *aieval.EvalSuite) {
+			s.Spec.Metrics.Agent.MinToolInvocation = ptr.To[float32](0.9)
+		}, "minToolInvocation applies to single-turn"},
+		{"minToolExecution is single-turn only", func(s *aieval.EvalSuite) {
+			s.Spec.Metrics.Agent.MinToolExecution = ptr.To[float32](0.9)
+		}, "minToolExecution applies to single-turn"},
+		{"maxPolicyViolations is single-turn only", func(s *aieval.EvalSuite) {
+			s.Spec.Metrics.Agent.MaxPolicyViolations = ptr.To[int32](0)
+		}, "maxPolicyViolations applies to single-turn"},
+		{"minToolSelection is single-turn only (no fallback for tools.minSelectionAccuracy)", func(s *aieval.EvalSuite) {
+			s.Spec.Metrics.Agent.MinToolSelection = ptr.To[float32](0.9)
+		}, "minToolSelection applies to single-turn"},
+		{"multi-turn sections need MultiTurn", func(s *aieval.EvalSuite) {
+			s.Spec.Evaluation, s.Spec.Evaluators = nil, nil
+		}, "spec.metrics.agent.outcome applies to MultiTurn suites only"},
+		{"single-turn conversation section is rejected", func(s *aieval.EvalSuite) {
+			s.Spec.Evaluation, s.Spec.Evaluators = nil, nil
+			s.Spec.Metrics.Agent.Outcome = nil
+		}, "spec.metrics.agent.conversation applies to MultiTurn suites only"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

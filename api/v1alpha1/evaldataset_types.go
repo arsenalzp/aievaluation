@@ -28,7 +28,6 @@ type DatasetObjectSource struct {
 	Bucket string `json:"bucket,omitempty"`
 	// +kubebuilder:validation:Required
 	ObjectKey string `json:"objectKey,omitempty"`
-	VersionId string `json:"versionId,omitempty"`
 }
 
 // EvalDatasetSpec defines the desired state of EvalDataset.

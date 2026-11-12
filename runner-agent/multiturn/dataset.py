@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 CASE_TYPE_MULTI_TURN = "multiTurn"
-_MULTI_TURN_TYPE_ALIASES = {"multiturn", "multi_turn", "multi-turn"}
 
 DEFAULT_CANCELLATION_EVENTS = ["cancellation"]
 
@@ -26,7 +25,7 @@ class DatasetError(ValueError):
     """Malformed dataset record. Always names the case and the offending field."""
 
     def __init__(self, message: str, case_id: Optional[str] = None, field_path: Optional[str] = None,
-                 line: Optional[int] = None):
+                 line: Optional[int] = None, kind: str = "multi-turn"):
         self.case_id = case_id
         self.field_path = field_path
         self.line = line
@@ -36,7 +35,7 @@ class DatasetError(ValueError):
         prefix.append(f"caseId={case_id!r}" if case_id else "caseId=<unknown>")
         if field_path:
             prefix.append(f"field={field_path}")
-        super().__init__(f"invalid multi-turn dataset record ({', '.join(prefix)}): {message}")
+        super().__init__(f"invalid {kind} dataset record ({', '.join(prefix)}): {message}")
         self.message = message
 
 
@@ -126,10 +125,9 @@ _EXPECTED_KEYS = {
 
 
 def is_multi_turn_record(raw: Dict[str, Any]) -> bool:
-    t = raw.get("type")
-    if isinstance(t, str) and t.strip().lower() in _MULTI_TURN_TYPE_ALIASES:
-        return True
-    return "turns" in raw and "input" not in raw
+    """A record with ``type`` or ``turns`` is parsed as multi-turn; the parser then requires exactly
+    ``"type": "multiTurn"`` (single-turn records have neither field)."""
+    return "type" in raw or "turns" in raw
 
 
 def classify_dataset(lines: Iterable[str]) -> Tuple[List[str], List[str]]:
@@ -307,8 +305,8 @@ def parse_multiturn_record(raw: Dict[str, Any], line: Optional[int] = None) -> M
         raise _fail(case_id, unknown[0], f"unknown field(s) {unknown}; allowed: {sorted(_TOP_LEVEL_KEYS)}", line)
 
     t = raw.get("type")
-    if t is not None and (not isinstance(t, str) or t.strip().lower() not in _MULTI_TURN_TYPE_ALIASES):
-        raise _fail(case_id, "type", f"must be {CASE_TYPE_MULTI_TURN!r}", line)
+    if t != CASE_TYPE_MULTI_TURN:  # exactly one spelling, required
+        raise _fail(case_id, "type", f"is required and must be {CASE_TYPE_MULTI_TURN!r}, got {t!r}", line)
 
     session_id = raw.get("sessionId")
     if session_id is not None and (not isinstance(session_id, str) or not session_id.strip()):

@@ -136,7 +136,6 @@ spec:
     objectStorageEndpoint: http://object-storage.default.svc.cluster.local:9876
     bucket: datasets
     objectKey: rag/dataset.jsonl
-    versionId: v1
 ```
 
 Important fields:
@@ -146,7 +145,6 @@ spec.format
 spec.source.objectStorageEndpoint
 spec.source.bucket
 spec.source.objectKey
-spec.source.versionId
 ```
 
 ---
@@ -184,6 +182,13 @@ spec:
   regressionPolicy:
     maxDrop: 0.05
 ```
+
+The RAG runner reads its suite strictly, like the agent runners: an unknown field (a typo such as `minRelevancy:`) or a
+non-numeric or out-of-range threshold is a configuration error (`rootCause.stage: Configuration`). A metric with a
+threshold that was not scored for a case (evaluator error, or a
+`NaN`/`inf` score - `NaN` would otherwise pass every threshold) fails that case and the run (`rootCause.details` lists
+the cases); averaging over the scored cases only would hide it. The Safety Judge is fail-closed: a case without a
+verdict fails.
 
 #### Agent suite
 ```yaml
@@ -232,15 +237,29 @@ Agent metrics (single-turn):
 | `minTaskCompletion` | Did the user get the expected result (answer vs the case's `expectedOutput`, Phoenix LLM judge with an EvalRun prompt)? |
 | `maxPolicyViolations` | Maximum number of forbidden-tool calls (deterministic). |
 
+Each metric has exactly one field, and the runner reads the suite strictly: an unknown field (for example a typo such as
+`minToolSelecton`), a non-numeric or out-of-range value, the former location `metrics.policy.maxPolicyViolations`, the
+multi-turn sections (`outcome`, `conversation`, `tools`, `policy`) or `evaluation.trials` / `evaluation.trace` in a
+single-turn suite are configuration errors (`rootCause.stage: Configuration`); the controller rejects the same suites
+(`SuiteInvalid`) before a Job is created.
+
+Every judged metric has a per-case status in `scores.json` / `details.jsonl` (`tool_selection_status`,
+`tool_invocation_status`, `tool_response_handling_status`, `task_completion_status`: `scored` | `not_applicable: ...` |
+`error: ...`). A judge error (including a `NaN`/`inf` or non-numeric score) for a metric with a threshold fails the run
+with that metric's stage and the affected `caseId`s, even if the average of the other cases passes; `not_applicable`
+never fails.
+
 
 #### Regression against a baseline (single-turn agent)
 
 `regressionPolicy.maxDrop` compares this run with a baseline object `baselines/<evalsuite-name>.json` (env
-`S3_BASELINE_KEY`) in the artifact bucket. The baseline has the format of a previous run's `scores.json`; its
+`S3_BASELINE_KEY`) in the artifact bucket (`S3_SUMMARY_BUCKET` = `EvalRun.spec.summaryBucket`). The baseline has the format of a previous run's `scores.json`; its
 `aggregatedScores` averages `tool_selection_avg`, `tool_invocation_avg`, `tool_execution_avg`,
 `tool_response_handling_avg` and `task_completion_avg` are compared with the current run. A metric that dropped by more
-than `maxDrop` fails the run with `rootCause.stage: "Regression"` and `metric: <name>`; metrics missing in either run are
-skipped. No baseline -> no regression check. The runner does not write baselines: promote a known-good run by copying its
+than `maxDrop` fails the run with `rootCause.stage: "Regression"` and `metric: <name>`. A metric missing in either run is
+not compared; it is listed with the reason in `scores.json` (`regression.not_compared`) and in the gate summary
+("Not compared with the baseline: ..."). A baseline without an `aggregatedScores` object or with a non-numeric value is an
+error, not a skipped comparison. No baseline -> no regression check ("No baseline available" in the gate summary). The runner does not write baselines: promote a known-good run by copying its
 `scores.json` to the baseline key.
 
 #### Tool response handling and task completion (single-turn)
@@ -411,7 +430,6 @@ SUITE_CONFIG
 
 DATASET_S3_BUCKET
 DATASET_S3_KEY
-DATASET_S3_VERSION_ID
 DATASET_FORMAT
 S3_ENDPOINT
 
@@ -421,8 +439,8 @@ GATE_SUMMARY_KEY
 SCORES_KEY
 DETAILS_KEY
 
-S3_SUMMARY_BUCKET
-S3_SUMMARY_KEY
+S3_SUMMARY_BUCKET     # EvalRun.spec.summaryBucket: artifacts and baseline are written/read here (DATASET_S3_BUCKET: dataset only)
+S3_SUMMARY_KEY        # same value as GATE_SUMMARY_KEY; the bundled runners use GATE_SUMMARY_KEY
 
 TARGET_ENDPOINT
 OPENAI_MODEL
@@ -493,25 +511,35 @@ Required fields for RAG:
 ```text
 caseId
 question
+groundTruth     # answer correctness, context precision and context recall need a reference for every case
 ```
 
 Optional fields for an Agent:
 
 ```text
-forbiddenTools
-tags
-expectedOutput
+forbiddenTools          # list of {name, arguments}
+tags                    # list of strings
+metadata                # object
+expectedOutput          # non-empty string
 expectedOutputPattern
-expectedTools
+expectedTools           # list of {name, arguments}
 ```
+
+The agent runner parses its dataset strictly: an unknown field (for example a typo such as `expectedTool`), a wrong type,
+an empty required value, a duplicate `caseId` or the RAG field names `question` / `groundTruth` (the agent format uses
+`input` / `expectedOutput`) are dataset errors naming line, `caseId` and field, e.g.
+`invalid single-turn agent dataset record (line 3, caseId='c-1', field=expectedTool): unknown field(s) ['expectedTool'] ...`.
 
 Optional fields for RAG:
 
 ```text
-groundTruth
-tags
-metadata
+tags            # list of strings
+metadata        # object
 ```
+
+The RAG runner parses its dataset strictly too: unknown fields, wrong types, empty values, duplicate `caseId`s and the
+agent field names `input` / `expectedOutput` (the RAG format uses `question` / `groundTruth`) are dataset errors naming
+line, `caseId` and field (`rootCause.stage: Dataset`).
 
 Scripted multi-turn agent conversations use a different case type (`"type": "multiTurn"`); see
 [Multi-turn Agent Evaluation](#multi-turn-agent-evaluation).
@@ -595,9 +623,16 @@ Tool outputs end up in `details.jsonl` and are passed through the same recursive
 Required response fields:
 
 ```text
-output
-trace
+output              # non-empty string
+trace.toolCalls     # list; [] when no tool was called
+trace.toolCalls[].name
 ```
+
+Without `trace.toolCalls` neither tool use nor policies can be checked, so a missing trace is an error, not an empty
+trajectory. Each value has exactly one field: `answer`, top-level `toolCalls` / `toolsCalled`, `trace.tool_calls`,
+`toolCalls[].tool`, `toolCalls[].args` and `toolCalls[].duration_ms` are rejected (use `output`, `trace.toolCalls`, `name`,
+`arguments`, `durationMs`), and `metadata.traceId` / `metadata.framework` may only repeat the `trace` values. A contract
+violation fails the run with `rootCause.stage: Execution`, the `caseId` and a message naming the field.
 
 Optional response fields:
 
@@ -605,6 +640,10 @@ Optional response fields:
 metadata
 trace.toolCalls[].output     # tool result (requested via includeToolOutputs)
 trace.toolCalls[].callId
+trace.toolCalls[].arguments  # object
+trace.toolCalls[].status     # exactly "OK" or "ERROR" (no other spelling); derived from error when omitted
+trace.toolCalls[].durationMs # number
+trace.traceId, trace.framework, trace.steps (list)
 ```
 
 ### Demo agent (single-turn, LangGraph, no LLM)
@@ -669,15 +708,22 @@ handled correctly).
 Required response fields:
 
 ```text
-answer
+answer              # non-empty string
+contexts            # list; [] when nothing was retrieved
+contexts[].text     # non-empty string
 ```
 
 Optional response fields:
 
 ```text
-contexts
-metadata
+contexts[].id       # string (default ctx-<index>)
+contexts[].score    # number (a string such as "0.95" is rejected)
+contexts[].source   # string
+metadata            # object
 ```
+
+The retrieval metrics are computed from `contexts`, so a missing `contexts` field is a contract error rather than "nothing
+retrieved"; unknown fields inside a context are rejected (`rootCause.stage: Execution` with the `caseId`).
 
 ---
 
@@ -774,8 +820,7 @@ spec:
       policy:       {maxCriticalViolations: 0, maxHighViolations: 0, limitsAction: Fail}
   evaluators:
     - {name: trajectory-policy,   provider: builtin,  type: deterministic, required: true}
-    - {name: conversation-quality, provider: deepeval, type: multiTurn, required: false, samples: 1,
-       metrics: [knowledgeRetention, conversationCompleteness, turnRelevancy]}
+    - {name: conversation-quality, provider: deepeval, type: multiTurn, required: false, samples: 1}
   regressionPolicy:
     maxDrop: 0.03
 ```
@@ -786,23 +831,38 @@ Notes:
   and the runner image decide which runner does the work; `spec.execution.mode` is optional (besides the `dummy` test mode
   the controller only uses it to validate consistency). `spec.evaluation` only says *how* an agent is driven
   (`interactionMode`, `trials`, `trace`). Multi-turn is rejected for RAG suites.
-- The existing flat fields (`metrics.agent.minToolSelection`, `maxPolicyViolations`, ...) keep working.
-  `metrics.agent.tools.minSelectionAccuracy` falls back to `minToolSelection` when unset.
+- **`spec.metrics` is the only place where metrics are listed.** `spec.evaluators` only says *how* an evaluator runs
+  (`provider`, `type`, `required`, `model`, `samples`) and carries no metric list.
+- Which section is used by which evaluator:
+
+  | `metrics.agent` field | Evaluated by |
+  |---|---|
+  | `outcome.*`, `tools.*`, `policy.*`, `conversation.maxTurns` | built-in deterministic evaluator (`provider: builtin`) |
+  | `conversation.minKnowledgeRetention`, `minConversationCompleteness`, `minTurnRelevancy` | the `provider: deepeval` evaluator |
+
+  The `deepeval` evaluator computes exactly the semantic metrics that have a threshold. A semantic threshold without a
+  `deepeval` evaluator, or a `deepeval` evaluator without any semantic threshold, is rejected (nothing is silently ignored).
+- Every metric has exactly one field; there are no synonyms or fallbacks. The flat single-turn fields
+  (`minToolSelection`, `minToolInvocation`, `minToolExecution`, `maxPolicyViolations`, `minToolResponseHandling`,
+  `minTaskCompletion`) are rejected for `MultiTurn` - use `tools.minSelectionAccuracy`, `tools.minArgumentAccuracy`,
+  `policy.*` and `outcome.minGoalCompletion` - and the sections `outcome`, `conversation`, `tools`, `policy` are rejected
+  for single-turn suites: the other runner would not read them.
 - `maxTurns`, `maxToolCalls` and `maxRepeatedCalls` can also be set per case in the dataset (`expectedBehavior`);
   the stricter value wins. `limitsAction: Warn` records a `MEDIUM` violation (verdict `WARN`) instead of a `HIGH` one.
 - `maxRepeatedCalls: N` means: at most `N` identical calls (same tool and canonical JSON arguments) per session.
-- `required` on an evaluator: when `true`, an evaluator failure *or* a metric below its threshold fails the run;
-  when `false` it is recorded and at most turns the verdict into `WARN`. The built-in evaluator is always required.
-- Semantic thresholds (`min*Retention`, ...) are only enforced for `deepeval` evaluators. A metric without a threshold
-  is reported but not gated.
-- `evaluators[].model` selects the judge model (default: `EvalRun.spec.model`); `samples` runs the judge several times
-  and uses the median. DeepEval needs `OPENAI_API_KEY`, which the Job already receives.
-- The controller rejects inconsistent suites (for example `trace.source: phoenix` without an endpoint, or evaluators
-  without `MultiTurn`) and keeps the `EvalRun` `PENDING` with a `SuiteInvalid` condition.
+- At most one evaluator per provider. The built-in evaluator always runs (listing it only names it) and is always
+  required: `required: false`, `model` or `samples` on it are rejected.
+- `required` on the `deepeval` evaluator: when `true`, an evaluator failure *or* a semantic metric below its threshold
+  fails the run; when `false` or omitted it is recorded and at most turns the verdict into `WARN`.
+- `model` on the `deepeval` evaluator selects the judge model (default: `EvalRun.spec.model`); `samples` runs the judge
+  several times and uses the median. DeepEval needs `OPENAI_API_KEY`, which the Job already receives.
+- The controller rejects inconsistent suites (for example `trace.source: phoenix` without an endpoint, evaluators
+  without `MultiTurn`, or any of the cases above) and keeps the `EvalRun` `PENDING` with a `SuiteInvalid` condition.
 
 ### Dataset format
 
-A multi-turn dataset is JSONL with one case per line and `"type": "multiTurn"`. A dataset is either entirely single-turn
+A multi-turn dataset is JSONL with one case per line and `"type": "multiTurn"` (required, exactly this spelling; a record
+with `type` or `turns` is parsed as multi-turn). A dataset is either entirely single-turn
 or entirely multi-turn; mixing is rejected with an error naming the offending `caseId`.
 Scripted cases contain **user turns only** - the agent produces its own replies.
 
@@ -873,7 +933,10 @@ and expects:
 ```
 
 `output` is required. `state` is what the agent *chooses to report* (used for latest-value, stale-state and final-state checks).
-`trace.toolCalls` is the inline observation (`name`, `arguments`, `status`, `error`, `result`/`output`, `durationMs`, `callId`).
+`trace.toolCalls` is the inline observation (`name`, `arguments`, `status`, `error`, `output`, `durationMs`, `callId`).
+Every value has exactly one spelling, as in the single-turn contract: `status` is exactly `OK` or `ERROR` (omitted ->
+derived from `error`), and `answer`, top-level `toolCalls`, `trace.tool_calls`, `tool`, `args`, `id`, `result` and
+`duration_ms` are rejected (`TARGET_ERROR` naming the field).
 A different `sessionId` in the response is reported as `SESSION_ID_MISMATCH`. A failing request ends that conversation with
 `TARGET_ERROR` (a case failure, not a crash); other cases continue. The runner is built on a target-adapter interface
 (`multiturn/target.py`): stateless `POST` with `sessionId` is implemented today; `POST /sessions/{id}/turns` and external
@@ -889,6 +952,10 @@ trace retrieval by `traceId` are reserved modes that fail loudly instead of fall
 | `inline` (default) | Use `trace.toolCalls` from the agent response. A turn without a `trace` is reported as `TRACE_MISSING` (`MEDIUM`). |
 | `phoenix` | Use Phoenix spans only. A turn with no spans is `TRACE_MISSING` (`HIGH`); an unreachable Phoenix fails the run (required evaluator failure). |
 | `auto` | Per turn: Phoenix spans win when spans exist for the turn's `traceId`, otherwise inline is used. If both exist and differ, Phoenix is used and a `TRACE_SOURCE_CONFLICT` (`MEDIUM`, both observations as evidence) is recorded. Observations are **never merged**. An unreachable Phoenix downgrades to inline plus a `WARN`. |
+
+Phoenix spans must follow OpenTelemetry/OpenInference exactly: span kind `TOOL` (no case folding) and `status_code`
+`UNSET`, `OK` or `ERROR` (`UNSET` means finished without error). Any other status code is a `phoenix` evaluator failure
+(`FAIL` with `source: phoenix`, `WARN` with `auto`), never a guessed status.
 
 The adapter groups spans by `session.id`, maps each trace to a turn through the `traceId` the agent returned in that turn
 (authoritative), falls back to start-time order, and reads OpenInference attributes: `openinference.span.kind == TOOL`,
@@ -1033,8 +1100,9 @@ required) and `make test` (Go).
 - The Job exits `0` for quality failures (the verdict is in `gate_summary.json`); `run_local.py` exits `1` on `FAIL` for convenience.
 - `execution.timeoutSeconds` is applied to **each turn request**, not to the whole Job: the Job has no overall deadline, so
   total runtime is roughly `cases x trials x turns x` per-turn latency. Keep `maxTurns` and `trials` modest.
-- As in single-turn runs, the runner writes artifacts to the dataset bucket (`DATASET_S3_BUCKET`) while the controller reads
-  `gate_summary.json` from `EvalRun.spec.summaryBucket`; the two must point to the same bucket.
+- As in single-turn runs, the runner reads the dataset from `DATASET_S3_BUCKET` and writes artifacts (and reads the
+  baseline) in `S3_SUMMARY_BUCKET` = `EvalRun.spec.summaryBucket`, where the controller reads `gate_summary.json`; the two
+  buckets may differ.
 - Baseline comparison covers goal completion and tool selection/argument accuracy plus comparable semantic scores; the runner does not yet write baselines itself.
 
 ---
@@ -1143,6 +1211,7 @@ docker run --network isolated_network --rm --name runner -v ./test-suite:/test-s
 -e S3_ENDPOINT=https://object-storage-endpoint:9876 \
 -e DATASET_S3_BUCKET=eval-artifacts \
 -e DATASET_S3_KEY=dataset.json \
+-e S3_SUMMARY_BUCKET=eval-artifacts \
 -e GATE_SUMMARY_KEY=summary-test.json \
 -e SCORES_KEY=scores-test.json \
 -e DETAILS_KEY=details_key.json \

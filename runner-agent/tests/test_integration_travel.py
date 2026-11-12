@@ -155,7 +155,7 @@ class _Judge(SemanticProvider):
 def semantic_settings(required, **extra):
     s = suite_dict(**{"metrics.agent.conversation.minKnowledgeRetention": 0.85, **extra})
     s["evaluators"].append({"name": "conversation-quality", "provider": "deepeval", "type": "multiTurn",
-                            "required": required, "metrics": ["knowledgeRetention", "conversationCompleteness"]})
+                            "required": required})
     return parse_multiturn_settings(s)
 
 

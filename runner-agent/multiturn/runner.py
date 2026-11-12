@@ -282,7 +282,7 @@ def evaluate_run(
 def _semantic_aggregates(cases: List[CaseResult], settings: MultiTurnSettings) -> List[gatemod.SemanticAggregate]:
     out: List[gatemod.SemanticAggregate] = []
     for ev in settings.semantic_evaluators():
-        for metric in ev.metrics:
+        for metric in settings.semantic_metrics():
             per_case: Dict[str, float] = {}
             model = version = None
             for cr in cases:
@@ -358,7 +358,7 @@ def _scores_payload(run_info: Dict[str, Any], settings: MultiTurnSettings, cases
                 "gitSha": run_info.get("gitSha"), "prNumber": run_info.get("prNumber"), "trials": settings.trials},
         "engine": {"name": RUNNER_NAME, "version": RUNNER_VERSION,
                    "evaluators": [{"name": builtin_name, "provider": "builtin", "version": EVALUATOR_VERSION}] +
-                                 [{"name": e.name, "provider": e.provider, "required": e.required, "metrics": e.metrics,
+                                 [{"name": e.name, "provider": e.provider, "required": e.required, "metrics": settings.semantic_metrics(),
                                    "model": e.model, "samples": e.samples} for e in settings.semantic_evaluators()]},
         "aggregatedScores": {
             "total_cases": len(cases),

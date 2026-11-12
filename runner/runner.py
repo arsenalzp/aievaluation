@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import sys
 import time
@@ -148,6 +149,8 @@ class RegressionResult:
     max_drop: Optional[float]
     drops: Dict[str, float] = field(default_factory=dict)
     failed: bool = False
+    # metrics that could not be compared, with the reason (reported in scores.json and the gate summary)
+    not_compared: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -182,6 +185,68 @@ def safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def finite_or_none(value: Any) -> Optional[float]:
+    """A metric score as float; NaN/inf/non-numeric -> None (an unscored case, never a silent pass:
+    ``nan < threshold`` is False, so a NaN would otherwise pass every threshold)."""
+    v = safe_float(value)
+    if v is None or math.isnan(v) or math.isinf(v):
+        return None
+    return v
+
+
+class ConfigError(ValueError):
+    """Invalid suite configuration or runner environment (rootCause.stage Configuration)."""
+
+
+class DatasetError(ValueError):
+    """Malformed dataset record (rootCause.stage Dataset); names line, caseId and field."""
+
+    def __init__(self, message: str, case_id: Optional[str] = None, field_path: Optional[str] = None,
+                 line: Optional[int] = None):
+        self.case_id = case_id
+        prefix = []
+        if line is not None:
+            prefix.append(f"line {line}")
+        prefix.append(f"caseId={case_id!r}" if case_id else "caseId=<unknown>")
+        if field_path:
+            prefix.append(f"field={field_path}")
+        super().__init__(f"invalid RAG dataset record ({', '.join(prefix)}): {message}")
+
+
+class TargetResponseError(RuntimeError):
+    """The target's response violates the RAG endpoint contract (rootCause.stage Execution)."""
+
+    def __init__(self, message: str, case_id: Optional[str] = None):
+        self.case_id = case_id
+        super().__init__(f"target response for caseId={case_id!r} violates the endpoint contract: {message}")
+
+
+def _section(parent: Dict[str, Any], key: str, path: str, allowed: Tuple[str, ...]) -> Dict[str, Any]:
+    value = parent.get(key)
+    full = f"{path}.{key}" if path else key
+    if value is None:
+        return {}
+    _reject_unknown(value, allowed, full)
+    return value
+
+
+def _reject_unknown(d: Any, allowed: Tuple[str, ...], path: str) -> None:
+    if not isinstance(d, dict):
+        raise ConfigError(f"{path} must be an object, got {type(d).__name__}")
+    unknown = sorted(set(d) - set(allowed))
+    if unknown:
+        raise ConfigError(f"{path}: unknown field(s) {unknown}; supported: {sorted(allowed)}")
+
+
+def _ratio(d: Dict[str, Any], key: str, path: str) -> Optional[float]:
+    v = d.get(key)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or math.isnan(v) or not 0 <= v <= 1:
+        raise ConfigError(f"{path}.{key} must be a number in [0, 1], got {v!r}")
+    return float(v)
+
+
 def now_epoch_ms() -> int:
     return int(time.time() * 1000)
 
@@ -208,8 +273,6 @@ class ThresholdConfig:
     min_faithfulness: Optional[float] = None
     min_relevancy: Optional[float] = None
     min_correctness: Optional[float] = None
-    max_stale_chunk_ratio: Optional[float] = None
-    max_unknown_owner_ratio: Optional[float] = None
 
 
 @dataclass
@@ -227,13 +290,12 @@ class RunnerConfig:
     dataset_file: str
 
     s3_endpoint: str
-    s3_bucket: str
+    s3_bucket: str  # S3_SUMMARY_BUCKET: artifacts and baseline (EvalRun.spec.summaryBucket)
     s3_access_key: str
     s3_secret_key: str
 
-    dataset_s3_bucket: Optional[str]
+    dataset_s3_bucket: str  # DATASET_S3_BUCKET: only the dataset is read from here
     dataset_s3_key: str
-    dataset_s3_version_id: Optional[str]
 
     s3_baseline_key: str
     gate_summary_key: str
@@ -253,28 +315,39 @@ def load_suite_config(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-def build_runner_config() -> RunnerConfig:
-    suite_config_path = getenv_required("SUITE_CONFIG")
-    suite = load_suite_config(suite_config_path)
-    metrics = suite.get("metrics", {})
-    rag_metrics = metrics.get("rag", {})
-    retrieval = rag_metrics.get("retrieval", {})
-    generation = rag_metrics.get("generation", {})
-    trust = rag_metrics.get("trustworthiness", {})
-    regression = suite.get("regressionPolicy", {})
-    execution = suite.get("execution", {})
+def parse_rag_suite(suite: Dict[str, Any]) -> Tuple[ThresholdConfig, Optional[float], int]:
+    """Strictly parse the rendered suite.json: every field is used or rejected (nothing is silently ignored)."""
+    _reject_unknown(suite, ("metrics", "regressionPolicy", "execution", "evaluation"), "suite")
+    evaluation = _section(suite, "evaluation", "", ("interactionMode",))
+    if evaluation.get("interactionMode", "SingleTurn") != "SingleTurn":
+        raise ConfigError(f"evaluation.interactionMode must be SingleTurn for RAG suites, got {evaluation['interactionMode']!r}")
+    metrics = _section(suite, "metrics", "", ("rag",))
+    rag = _section(metrics, "rag", "metrics", ("retrieval", "generation"))
+    retrieval = _section(rag, "retrieval", "metrics.rag", ("minContextRecall", "minContextPrecision"))
+    generation = _section(rag, "generation", "metrics.rag", ("minFaithfulness", "minRelevancy", "minCorrectness"))
+    regression = _section(suite, "regressionPolicy", "", ("maxDrop",))
+    execution = _section(suite, "execution", "", ("mode", "timeoutSeconds"))
 
     thresholds = ThresholdConfig(
-        min_context_recall=safe_float(retrieval.get("minContextRecall", None)),
-        min_context_precision=safe_float(retrieval.get("minContextPrecision", None)),
-        min_faithfulness=safe_float(generation.get("minFaithfulness", None)),
-        min_relevancy=safe_float(generation.get("minRelevancy", None)),
-        min_correctness=safe_float(generation.get("minCorrectness", None)),
-        max_stale_chunk_ratio=safe_float(trust.get("maxStaleChunkRatio", None)),
-        max_unknown_owner_ratio=safe_float(trust.get("maxUnknownOwnerRatio", None)),
+        min_context_recall=_ratio(retrieval, "minContextRecall", "metrics.rag.retrieval"),
+        min_context_precision=_ratio(retrieval, "minContextPrecision", "metrics.rag.retrieval"),
+        min_faithfulness=_ratio(generation, "minFaithfulness", "metrics.rag.generation"),
+        min_relevancy=_ratio(generation, "minRelevancy", "metrics.rag.generation"),
+        min_correctness=_ratio(generation, "minCorrectness", "metrics.rag.generation"),
     )
+    timeout = execution.get("timeoutSeconds", 60)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
+        raise ConfigError(f"execution.timeoutSeconds must be an integer >= 1, got {timeout!r}")
+    return thresholds, _ratio(regression, "maxDrop", "regressionPolicy"), timeout
 
-    timeout_s = int(execution.get("timeoutSeconds", 60))
+
+def build_runner_config(parse_suite: bool = True) -> RunnerConfig:
+    """``parse_suite=False`` is only used on the failure path to publish the FAIL gate summary when the suite
+    itself is invalid: it reads the env contract and skips the suite thresholds."""
+    suite_config_path = getenv_required("SUITE_CONFIG")
+    thresholds, regression_max_drop, timeout_s = ThresholdConfig(), None, 60
+    if parse_suite:
+        thresholds, regression_max_drop, timeout_s = parse_rag_suite(load_suite_config(suite_config_path))
 
     return RunnerConfig(
         evalrun_name=getenv_required("EVALRUN_NAME"),
@@ -290,13 +363,13 @@ def build_runner_config() -> RunnerConfig:
         dataset_file=getenv_optional("DATASET_FILE", "/work/dataset"),
 
         s3_endpoint=getenv_required("S3_ENDPOINT"),
-        s3_bucket=getenv_required("DATASET_S3_BUCKET"),
+
+        s3_bucket=getenv_required("S3_SUMMARY_BUCKET"),
         s3_access_key=getenv_required("S3_ACCESS_KEY"),
         s3_secret_key=getenv_required("S3_SECRET_KEY"),
 
-        dataset_s3_bucket=getenv_optional("DATASET_S3_BUCKET"),
+        dataset_s3_bucket=getenv_required("DATASET_S3_BUCKET"),
         dataset_s3_key=getenv_required("DATASET_S3_KEY"),
-        dataset_s3_version_id=getenv_optional("DATASET_S3_VERSION_ID"),
 
         s3_baseline_key=getenv_required("S3_BASELINE_KEY"),
         gate_summary_key=getenv_required("GATE_SUMMARY_KEY"),
@@ -304,7 +377,7 @@ def build_runner_config() -> RunnerConfig:
         details_key=getenv_required("DETAILS_KEY"),
 
         thresholds=thresholds,
-        regression_max_drop=safe_float(regression.get("maxDrop")),
+        regression_max_drop=regression_max_drop,
 
         llm_model=getenv_required("OPENAI_MODEL"),
         llm_embedder=getenv_required("OPENAI_EMBEDDER"),
@@ -317,7 +390,7 @@ def build_runner_config() -> RunnerConfig:
 # ============================================================
 
 def download_dataset(cfg: RunnerConfig) -> str:
-    bucket = cfg.dataset_s3_bucket or cfg.s3_bucket
+    bucket = cfg.dataset_s3_bucket
     key = cfg.dataset_s3_key
 
     ensure_dir(os.path.dirname(cfg.dataset_file))
@@ -392,8 +465,16 @@ def upload_text(cfg: RunnerConfig, key: str, text: str, content_type: str = "tex
 # ============================================================
 # Dataset parsing
 # ============================================================
+RAG_CASE_FIELDS = ("caseId", "question", "groundTruth", "tags", "metadata")
+# Fields of the agent dataset format; the RAG format has exactly one field for each (no synonyms).
+AGENT_ONLY_CASE_FIELDS = {"input": "question", "expectedOutput": "groundTruth"}
+
+
 def parse_dataset_jsonl(path: str) -> List[DatasetCase]:
+    """Strictly parse a RAG dataset. ``groundTruth`` is required: answer correctness, context precision and
+    context recall are computed for every case and need a reference."""
     cases: List[DatasetCase] = []
+    seen: Dict[str, int] = {}
 
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
@@ -401,24 +482,52 @@ def parse_dataset_jsonl(path: str) -> List[DatasetCase]:
             if not line:
                 continue
 
-            raw = json.loads(line)
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise DatasetError(f"invalid JSON: {exc.msg} (column {exc.colno})", line=line_no) from exc
+            if not isinstance(raw, dict):
+                raise DatasetError("each line must be a JSON object", line=line_no)
 
             case_id = raw.get("caseId")
-            question = raw.get("question")
-            ground_truth = raw.get("groundTruth")
+            if not isinstance(case_id, str) or not case_id.strip():
+                raise DatasetError("is required and must be a non-empty string", None, "caseId", line_no)
+            if case_id in seen:
+                raise DatasetError(f"duplicate caseId (first defined on line {seen[case_id]})", case_id, "caseId", line_no)
+            seen[case_id] = line_no
 
-            if not case_id:
-                raise ValueError(f"dataset line {line_no}: missing caseId")
-            if not question:
-                raise ValueError(f"dataset line {line_no}: missing question")
+            for agent_field, rag_field in AGENT_ONLY_CASE_FIELDS.items():
+                if agent_field in raw:
+                    raise DatasetError(f"is an agent dataset field; the RAG dataset uses {rag_field!r}",
+                                       case_id, agent_field, line_no)
+            unknown = sorted(set(raw) - set(RAG_CASE_FIELDS))
+            if unknown:
+                raise DatasetError(f"unknown field(s) {unknown}; supported: {sorted(RAG_CASE_FIELDS)}",
+                                   case_id, unknown[0], line_no)
+
+            for key in ("question", "groundTruth"):
+                value = raw.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    raise DatasetError("is required and must be a non-empty string", case_id, key, line_no)
+
+            tags = raw.get("tags", [])
+            if tags is None:
+                tags = []
+            if not isinstance(tags, list) or not all(isinstance(t, str) and t.strip() for t in tags):
+                raise DatasetError("must be a list of non-empty strings", case_id, "tags", line_no)
+            metadata = raw.get("metadata", {})
+            if metadata is None:
+                metadata = {}
+            if not isinstance(metadata, dict):
+                raise DatasetError("must be an object", case_id, "metadata", line_no)
 
             cases.append(
                 DatasetCase(
                     case_id=case_id,
-                    question=question,
-                    ground_truth=ground_truth,
-                    tags=raw.get("tags", []),
-                    metadata=raw.get("metadata", {}),
+                    question=raw["question"],
+                    ground_truth=raw["groundTruth"],
+                    tags=tags,
+                    metadata=metadata,
                 )
             )
 
@@ -449,26 +558,56 @@ def call_target_endpoint(cfg: RunnerConfig, case: DatasetCase) -> EvalRecord:
 
     resp.raise_for_status()
     data = resp.json()
+    if not isinstance(data, dict):
+        raise TargetResponseError("the response body must be a JSON object", case.case_id)
 
     answer = data.get("answer")
-    if not answer:
-        raise RuntimeError(f"target endpoint returned empty answer for case={case.case_id}")
+    if not isinstance(answer, str) or not answer.strip():
+        raise TargetResponseError("answer is required and must be a non-empty string", case.case_id)
 
-    contexts_raw = data.get("contexts", []) or []
+    # Retrieval metrics are computed from the contexts, so they must be reported explicitly
+    # ([] = nothing retrieved); a missing field would read as "nothing retrieved".
+    if "contexts" not in data:
+        raise TargetResponseError("contexts is required (send [] when nothing was retrieved)", case.case_id)
+    contexts_raw = data["contexts"]
+    if not isinstance(contexts_raw, list):
+        raise TargetResponseError("contexts must be a list", case.case_id)
     contexts: List[RetrievedContext] = []
     for idx, item in enumerate(contexts_raw):
+        p = f"contexts[{idx}]"
+        if not isinstance(item, dict):
+            raise TargetResponseError(f"{p} must be an object", case.case_id)
+        unknown = sorted(set(item) - {"id", "text", "score", "source"})
+        if unknown:
+            raise TargetResponseError(f"{p}: unknown field(s) {unknown}; supported: ['id', 'score', 'source', 'text']",
+                                      case.case_id)
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise TargetResponseError(f"{p}.text is required and must be a non-empty string", case.case_id)
+        ctx_id = item.get("id")
+        if ctx_id is not None and (not isinstance(ctx_id, str) or not ctx_id.strip()):
+            raise TargetResponseError(f"{p}.id must be a non-empty string when set", case.case_id)
+        score = item.get("score")
+        if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))):
+            raise TargetResponseError(f"{p}.score must be a number, got {score!r}", case.case_id)
+        source = item.get("source")
+        if source is not None and not isinstance(source, str):
+            raise TargetResponseError(f"{p}.source must be a string, got {source!r}", case.case_id)
         contexts.append(
             RetrievedContext(
-                id=item.get("id") or f"ctx-{idx}",
-                text=item.get("text", ""),
-                score=safe_float(item.get("score")),
-                source=item.get("source"),
+                id=ctx_id or f"ctx-{idx}",
+                text=text,
+                score=float(score) if score is not None else None,
+                source=source,
             )
         )
 
-    metadata = data.get("metadata", {}) or {}
-    if "latencyMs" not in metadata:
-        metadata["latencyMs"] = elapsed_ms
+    metadata = data.get("metadata")
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise TargetResponseError("metadata must be an object", case.case_id)
+    metadata.setdefault("latencyMs", elapsed_ms)
 
     return EvalRecord(
         case_id=case.case_id,
@@ -587,7 +726,7 @@ class RagasAdapter:
         metric_names = [
             "faithfulness",
             "answer_relevancy",
-            "answer_correctness,",
+            "answer_correctness",
             "context_precision",
             "context_recall",
             "safety_passed",
@@ -684,18 +823,21 @@ class RagasAdapter:
                 if not safety_passed:
                     notes.append(f"[Security Fail - {vulnerability_type}]: {safety_reason}")
             
+            if sec_verdict is None:
+                notes.append("safety_judge: no verdict returned for this case (fail-closed)")
+            # NaN/inf from a metric means "not scored" (finite_or_none), never a value that passes a threshold.
             pcs = PerCaseScore(
                 case_id=row.get("case_id"),
-                faithfulness=safe_float(row.get("faithfulness")),
-                answer_relevancy=safe_float(row.get("answer_relevancy")),
-                answer_correctness=safe_float(row.get("answer_correctness")) if "answer_correctness" in row else None,
-                context_precision=safe_float(row.get("context_precision")) if "context_precision" in row else None,
-                context_recall=safe_float(row.get("context_recall")) if "context_recall" in row else None,
+                faithfulness=finite_or_none(row.get("faithfulness")),
+                answer_relevancy=finite_or_none(row.get("answer_relevancy")),
+                answer_correctness=finite_or_none(row.get("answer_correctness")) if "answer_correctness" in row else None,
+                context_precision=finite_or_none(row.get("context_precision")) if "context_precision" in row else None,
+                context_recall=finite_or_none(row.get("context_recall")) if "context_recall" in row else None,
                 safety_passed=safety_passed,
                 safety_reason=safety_reason if not safety_passed else None,
                 vulnerability_type=vulnerability_type if not safety_passed else None,
                 latency_ms=latency_ms,
-                notes=[],
+                notes=notes,
             )
 
             per_case_scores.append(pcs)
@@ -715,7 +857,8 @@ def aggregate_scores(per_case: List[PerCaseScore]) -> AggregatedScores:
         passed_cases=sum(1 for x in per_case if x.passed),
         
         vulnerability_type="; ".join(x.vulnerability_type for x in per_case if x.vulnerability_type is not None),
-        safety_passed=True if len([x.safety_passed for x in per_case if x.safety_passed is False]) == 0 else False,
+        # fail-closed: only an explicit True verdict counts (None = no verdict)
+        safety_passed=all(x.safety_passed is True for x in per_case),
         faithfulness_avg=mean([x.faithfulness for x in per_case]),
         answer_relevancy_avg=mean([x.answer_relevancy for x in per_case]),
         answer_correctness_avg=mean([x.answer_correctness for x in per_case]),
@@ -726,65 +869,77 @@ def aggregate_scores(per_case: List[PerCaseScore]) -> AggregatedScores:
     )
 
 
+# (score attribute, threshold attribute, threshold field, gate stage, rootCause metric, aggregate attribute),
+# in gate order: retrieval before generation.
+RAG_GATED_METRICS = (
+    ("context_recall", "min_context_recall", "minContextRecall", "Retrieval", "context_recall", "context_recall_avg"),
+    ("context_precision", "min_context_precision", "minContextPrecision", "Retrieval", "context_precision",
+     "context_precision_avg"),
+    ("faithfulness", "min_faithfulness", "minFaithfulness", "Generation", "faithfulness", "faithfulness_avg"),
+    ("answer_correctness", "min_correctness", "minCorrectness", "Generation", "correctness", "answer_correctness_avg"),
+    ("answer_relevancy", "min_relevancy", "minRelevancy", "Generation", "relevancy", "answer_relevancy_avg"),
+)
+
+
 def mark_per_case_pass_fail(cfg: RunnerConfig, per_case: List[PerCaseScore]) -> None:
     """
     Simple per-case pass/fail marking based on available thresholds.
-    Final verdict is still computed at run level.
+    Final verdict is still computed at run level. A metric with a threshold but no score (evaluator error,
+    NaN) fails the case - it is never skipped.
     """
     for score in per_case:
         notes: List[str] = []
         passed = True
-        
+
         if not score.safety_passed:
             passed = False
             notes.append(
                 f"vulnerability_type={score.vulnerability_type}"
             )
-        
-        if cfg.thresholds.min_faithfulness is not None and score.faithfulness is not None:
-            if score.faithfulness < cfg.thresholds.min_faithfulness:
-                passed = False
-                notes.append(
-                    f"faithfulness={score.faithfulness:.4f} < minFaithfulness={cfg.thresholds.min_faithfulness:.4f}"
-                )
 
-        if cfg.thresholds.min_correctness is not None and score.answer_correctness is not None:
-            if score.answer_correctness < cfg.thresholds.min_correctness:
+        for attr, threshold_attr, threshold_name, _, _, _ in RAG_GATED_METRICS:
+            threshold = getattr(cfg.thresholds, threshold_attr)
+            if threshold is None:
+                continue
+            value = getattr(score, attr)
+            if value is None:
                 passed = False
-                notes.append(
-                    f"answer_correctness={score.answer_correctness:.4f} < minCorrectness={cfg.thresholds.min_correctness:.4f}"
-                )
-                
-        if cfg.thresholds.min_relevancy is not None and score.answer_relevancy is not None:
-            if score.answer_relevancy < cfg.thresholds.min_relevancy:
+                notes.append(f"{attr} was not scored by the evaluator but {threshold_name} is set")
+            elif value < threshold:
                 passed = False
-                notes.append(
-                    f"answer_relevancy={score.answer_relevancy:.4f} < minRelevancy={cfg.thresholds.min_relevancy:.4f}"
-                )
-          
-        if cfg.thresholds.min_context_precision is not None and score.context_precision is not None:
-            if score.context_precision < cfg.thresholds.min_context_precision:
-                passed = False
-                notes.append(
-                    f"context_precision={score.context_precision:.4f} < minContextPrecision={cfg.thresholds.min_context_precision:.4f}"
-                )
-
-        if cfg.thresholds.min_context_recall is not None and score.context_recall is not None:
-            if score.context_recall < cfg.thresholds.min_context_recall:
-                passed = False
-                notes.append(
-                    f"context_recall={score.context_recall:.4f} < minContextRecall={cfg.thresholds.min_context_recall:.4f}"
-                )
+                notes.append(f"{attr}={value:.4f} < {threshold_name}={threshold:.4f}")
 
         score.passed = passed
         score.notes.extend(notes)
 
 
-def apply_threshold_policy(cfg: RunnerConfig, agg: AggregatedScores) -> Tuple[bool, Dict[str, Any], List[str]]:
+def unscored_cases(cfg: RunnerConfig, per_case: List[PerCaseScore]) -> Dict[str, List[str]]:
+    """Cases without a score for a metric that has a threshold, per score attribute."""
+    out: Dict[str, List[str]] = {}
+    for attr, threshold_attr, _, _, _, _ in RAG_GATED_METRICS:
+        if getattr(cfg.thresholds, threshold_attr) is None:
+            continue
+        missing = [x.case_id for x in per_case if getattr(x, attr) is None]
+        if missing:
+            out[attr] = missing
+    return out
+
+
+def apply_threshold_policy(
+    cfg: RunnerConfig,
+    agg: AggregatedScores,
+    unscored: Optional[Dict[str, List[str]]] = None,
+) -> Tuple[bool, Dict[str, Any], List[str]]:
+    """Safety first, then retrieval, then generation; the first failure is the root cause.
+
+    A metric with a threshold fails the run when any case was not scored (``unscored``) or no case was scored at
+    all - averaging over the scored cases only would let evaluator failures pass silently.
+    """
     failed = False
     notes: List[str] = []
     root_cause = {"stage": "None"}
-    
+    unscored = unscored or {}
+
     if not agg.safety_passed:
         failed = True
         root_cause = {
@@ -793,58 +948,25 @@ def apply_threshold_policy(cfg: RunnerConfig, agg: AggregatedScores) -> Tuple[bo
               "details": f"vulnerability_type={agg.vulnerability_type}"
         }
         notes.append(root_cause["details"])
-        
-    # Retrieval stage checks
-    if cfg.thresholds.min_context_recall is not None and agg.context_recall_avg is not None:
-        if agg.context_recall_avg < cfg.thresholds.min_context_recall:
-            failed = True
-            root_cause = {
-              "stage": "Retrieval",
-              "metric": "context_recall",
-              "details": f"context_recall_avg={agg.context_recall_avg:.4f} < minContextRecall={cfg.thresholds.min_context_recall:.4f}",
-            }
-            notes.append(root_cause["details"])
 
-    if not failed and cfg.thresholds.min_context_precision is not None and agg.context_precision_avg is not None:
-        if agg.context_precision_avg < cfg.thresholds.min_context_precision:
-            failed = True
-            root_cause = {
-              "stage": "Retrieval",
-              "metric": "context_precision",
-              "details": f"context_precision_avg={agg.context_precision_avg:.4f} < minContextPrecision={cfg.thresholds.min_context_precision:.4f}",
-            }
-            notes.append(root_cause["details"])
-
-    # Generation stage checks
-    if not failed and cfg.thresholds.min_faithfulness is not None and agg.faithfulness_avg is not None:
-        if agg.faithfulness_avg < cfg.thresholds.min_faithfulness:
-            failed = True
-            root_cause = {
-              "stage": "Generation",
-              "metric": "faithfulness",
-              "details": f"faithfulness_avg={agg.faithfulness_avg:.4f} < minFaithfulness={cfg.thresholds.min_faithfulness:.4f}",
-            }
-            notes.append(root_cause["details"])
-
-    if not failed and cfg.thresholds.min_correctness is not None and agg.answer_correctness_avg is not None:
-        if agg.answer_correctness_avg < cfg.thresholds.min_correctness:
-            failed = True
-            root_cause = {
-              "stage": "Generation",
-              "metric": "correctness",
-              "details": f"answer_correctness_avg={agg.answer_correctness_avg:.4f} < minCorrectness={cfg.thresholds.min_correctness:.4f}",
-            }
-            notes.append(root_cause["details"])
-      
-    if not failed and cfg.thresholds.min_relevancy is not None and agg.answer_relevancy_avg is not None:
-        if agg.answer_relevancy_avg < cfg.thresholds.min_relevancy:
-            failed = True
-            root_cause = {
-              "stage": "Generation",
-              "metric": "relevancy",
-              "details": f"answer_relevancy_avg={agg.answer_relevancy_avg:.4f} < minFaithfulness={cfg.thresholds.min_relevancy:.4f}",
-            }
-            notes.append(root_cause["details"])
+    for attr, threshold_attr, threshold_name, stage, metric, avg_attr in RAG_GATED_METRICS:
+        threshold = getattr(cfg.thresholds, threshold_attr)
+        if failed or threshold is None:
+            continue
+        avg = getattr(agg, avg_attr)
+        if unscored.get(attr):
+            ids = unscored[attr]
+            details = (f"{attr} was not scored for {len(ids)} case(s) ({', '.join(ids)}) "
+                       f"but {threshold_name}={threshold:.4f} is set")
+        elif avg is None:
+            details = f"{attr} was not scored for any case but {threshold_name}={threshold:.4f} is set"
+        elif avg < threshold:
+            details = f"{avg_attr}={avg:.4f} < {threshold_name}={threshold:.4f}"
+        else:
+            continue
+        failed = True
+        root_cause = {"stage": stage, "metric": metric, "details": details}
+        notes.append(details)
 
     return failed, root_cause, notes
 
@@ -854,7 +976,7 @@ def apply_regression_policy(
     agg: AggregatedScores,
     baseline: Optional[Dict[str, Any]],
 ) -> RegressionResult:
-    if not baseline:
+    if baseline is None:  # 404: no baseline object (an empty or malformed one is an error below)
         return RegressionResult(
             baseline_used=False,
             max_drop=cfg.regression_max_drop,
@@ -865,8 +987,12 @@ def apply_regression_policy(
     max_drop = cfg.regression_max_drop
     drops: Dict[str, float] = {}
     failed = False
+    not_compared: Dict[str, str] = {}
 
-    baseline_scores = baseline.get("aggregatedScores", {})
+    baseline_scores = baseline.get("aggregatedScores") if isinstance(baseline, dict) else None
+    if not isinstance(baseline_scores, dict):
+        raise ValueError(f"baseline {cfg.s3_baseline_key} has no aggregatedScores object; "
+                         "a baseline must be a previous run's scores.json")
 
     metric_pairs = {
         "faithfulness_avg": agg.faithfulness_avg,
@@ -877,11 +1003,21 @@ def apply_regression_policy(
     }
 
     for metric_name, current_value in metric_pairs.items():
-        baseline_value = safe_float(baseline_scores.get(metric_name))
-        if baseline_value is None or current_value is None:
+        raw_baseline = baseline_scores.get(metric_name)
+        if raw_baseline is not None and (isinstance(raw_baseline, bool) or not isinstance(raw_baseline, (int, float))):
+            raise ValueError(f"baseline {cfg.s3_baseline_key}: aggregatedScores.{metric_name} must be a number, "
+                             f"got {raw_baseline!r}")
+        if raw_baseline is None or current_value is None:
+            # not measured in one of the runs: nothing to compare, but say so
+            if raw_baseline is None and current_value is None:
+                not_compared[metric_name] = "not measured in either run"
+            elif raw_baseline is None:
+                not_compared[metric_name] = "not measured in the baseline"
+            else:
+                not_compared[metric_name] = "not measured in this run"
             continue
 
-        drop = current_value - baseline_value
+        drop = current_value - float(raw_baseline)
         drops[metric_name] = drop
         if max_drop is not None and drop < -max_drop:
             failed = True
@@ -891,6 +1027,7 @@ def apply_regression_policy(
         max_drop=max_drop,
         drops=drops,
         failed=failed,
+        not_compared=not_compared,
     )
 
 
@@ -934,6 +1071,9 @@ def build_gate_summary(
 
     if regression.baseline_used:
         summary_parts.append("Baseline comparison used")
+        if regression.not_compared:
+            summary_parts.append("Not compared with the baseline: " + ", ".join(
+                f"{m} ({reason})" for m, reason in regression.not_compared.items()))
     else:
         summary_parts.append("No baseline available")
 
@@ -1050,7 +1190,8 @@ async def main() -> int:
         agg = aggregate_scores(per_case_scores)
 
         # 8) Threshold policy
-        threshold_failed, threshold_root_cause, threshold_notes = apply_threshold_policy(cfg, agg)
+        threshold_failed, threshold_root_cause, threshold_notes = apply_threshold_policy(
+            cfg, agg, unscored_cases(cfg, per_case_scores))
 
         # 9) Regression policy
         regression = apply_regression_policy(cfg, agg, baseline)
@@ -1076,14 +1217,19 @@ async def main() -> int:
     except Exception as e:
         # Best-effort publish of execution failure summary
         try:
-            cfg = build_runner_config()
+            # parse_suite=False: an invalid suite must not prevent publishing why the run failed
+            cfg = build_runner_config(parse_suite=False)
 
+            known = (DatasetError, ConfigError, TargetResponseError)
             gate = GateSummary(
                 verdict="FAIL",
                 summary=f"Execution failure: {str(e)}",
                 rootCause={
-                    "stage": "Execution",
-                    "details": traceback.format_exc()[-3000:],
+                    "stage": ("Dataset" if isinstance(e, DatasetError)
+                              else "Configuration" if isinstance(e, ConfigError) else "Execution"),
+                    "details": str(e) if isinstance(e, known) else traceback.format_exc()[-3000:],
+                    **({"caseId": e.case_id}
+                       if isinstance(e, (DatasetError, TargetResponseError)) and e.case_id else {}),
                 },
                 artifacts={
                     "gateSummaryUri": f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.gate_summary_key}",
@@ -1092,8 +1238,8 @@ async def main() -> int:
                 },
             )
             publish_gate_summary(cfg, gate)
-        except Exception:
-            pass
+        except Exception as publish_error:  # report it; the original error is printed below
+            print(f"runner could not publish the FAIL gate summary: {publish_error!r}", file=sys.stderr)
 
         print("runner failed:", str(e), file=sys.stderr)
         traceback.print_exc()

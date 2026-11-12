@@ -24,7 +24,7 @@ def settings(required=False, **o):
     suite = suite_dict(**{"metrics.agent.conversation.minKnowledgeRetention": 0.8,
                           "metrics.agent.conversation.minTurnRelevancy": 0.7, **o})
     suite["evaluators"].append({"name": "quality", "provider": "deepeval", "type": "multiTurn", "required": required,
-                                "metrics": ["knowledgeRetention", "turnRelevancy"], "samples": 3, "model": "judge-x"})
+                                "samples": 3, "model": "judge-x"})
     return parse_multiturn_settings(suite)
 
 

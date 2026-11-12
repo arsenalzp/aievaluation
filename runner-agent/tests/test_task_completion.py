@@ -176,7 +176,7 @@ def test_reference_and_answer_are_redacted_before_the_judge(runner, adapter, mon
 def test_invalid_expected_output_pattern_is_a_dataset_error(runner, tmp_path):
     bad = tmp_path / "d.jsonl"
     bad.write_text(json.dumps({"caseId": "c-bad", "input": "x", "expectedOutputPattern": "("}) + "\n")
-    with pytest.raises(ValueError, match=r"caseId='c-bad' field=expectedOutputPattern"):
+    with pytest.raises(ValueError, match=r"line 1, caseId='c-bad', field=expectedOutputPattern\): is not a valid regular expression"):
         runner.parse_dataset_jsonl(str(bad))
 
 
