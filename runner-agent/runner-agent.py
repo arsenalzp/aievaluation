@@ -13,9 +13,7 @@ from phoenix.evals.metrics import (
   ToolInvocationEvaluator, 
   ToolSelectionEvaluator, 
   ToolResponseHandlingEvaluator,
-  MatchesRegex,
-  CorrectnessEvaluator,
-  HallucinationEvaluator
+  MatchesRegex
 )
 import requests
 from llm import base_llm
