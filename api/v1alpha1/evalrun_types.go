@@ -63,12 +63,46 @@ type EvalRunSpec struct {
 	// RAG endpoint
 	// +kubebuilder:validation:Required
 	TargetEndpoint string `json:"targetEndpoint,omitempty"`
-	// LLM Model name
+	// LLM used by every LLM judge of the run (RAG metrics and Safety Judge, single-turn agent judges,
+	// multi-turn semantic evaluator). Required when the EvalSuite uses a judge, rejected otherwise.
+	// +kubebuilder:validation:Optional
+	LLM *LLMSpec `json:"llm,omitempty"`
+}
+
+// LLMSpec selects the LLM provider, the models and how to reach them.
+type LLMSpec struct {
+	// Provider protocol. openai: the OpenAI API, or any OpenAI-compatible server when url is set
+	// (vLLM, Ollama, TGI, KServe, Azure OpenAI v1, LLM gateways such as LiteLLM proxy).
 	// +kubebuilder:validation:Required
-	Model string `json:"model,omitempty"`
-	// Embedder model name
+	// +kubebuilder:validation:Enum=openai
+	Provider string `json:"provider"`
+	// Judge model name.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Model string `json:"model"`
+	// Embedding model name. RAG suites only (required there, rejected for agent suites).
+	// It is served by the same provider, url and API key as the judge model.
+	// +kubebuilder:validation:Optional
 	Embedder string `json:"embedder,omitempty"`
+	// Base URL of an OpenAI-compatible API, e.g. http://vllm.models.svc:8000/v1.
+	// Omitted: the provider's public API.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^https?://`
+	URL string `json:"url,omitempty"`
+	// Secret key holding the API key, in the EvalRun namespace.
+	// Required without url; optional with url (a server without authentication).
+	// +kubebuilder:validation:Optional
+	APIKeySecretRef *SecretKeyRef `json:"apiKeySecretRef,omitempty"`
+}
+
+// SecretKeyRef references one key of a Secret in the EvalRun namespace.
+type SecretKeyRef struct {
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Key string `json:"key"`
 }
 
 type ExecutionFailure struct {

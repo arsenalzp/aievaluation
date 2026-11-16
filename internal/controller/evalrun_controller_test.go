@@ -102,8 +102,12 @@ func testEvalRun(name string) *aieval.EvalRun {
 			},
 			SummaryBucket:  "eval-artifacts",
 			TargetEndpoint: "http://rag.default.svc.cluster.local/query",
-			Model:          "gpt-4.1-mini",
-			Embedder:       "text-embedding-3-small",
+			LLM: &aieval.LLMSpec{
+				Provider:        "openai",
+				Model:           "gpt-4.1-mini",
+				Embedder:        "text-embedding-3-small",
+				APIKeySecretRef: &aieval.SecretKeyRef{Name: "openai-credentials", Key: "apiKey"},
+			},
 		},
 	}
 }
@@ -375,8 +379,12 @@ func TestBuildEvalJobEnvironmentContract(t *testing.T) {
 		"S3_SUMMARY_BUCKET": "eval-artifacts",
 		"S3_SUMMARY_KEY":    "runs/run-1/gate_summary.json",
 		"TARGET_ENDPOINT":   "http://rag.default.svc.cluster.local/query",
+		"LLM_PROVIDER":      "openai",
 		"OPENAI_MODEL":      "gpt-4.1-mini",
 		"OPENAI_EMBEDDER":   "text-embedding-3-small",
+	}
+	if _, ok := env["OPENAI_BASE_URL"]; ok {
+		t.Fatalf("OPENAI_BASE_URL must be omitted when spec.llm.url is not set")
 	}
 
 	for name, expected := range expectedEnvValues {
@@ -887,7 +895,7 @@ func TestBuildEvalJobProvidesMultiTurnArtifactKeys(t *testing.T) {
 			t.Fatalf("env %s: expected %q, got %q", name, value, env[name].Value)
 		}
 	}
-	// no additional Secret is required for multi-turn: judge LLM calls reuse OPENAI_API_KEY
+	// no additional Secret is required for multi-turn: judge LLM calls reuse the EvalRun's spec.llm API key
 	for name, e := range env {
 		if e.ValueFrom != nil && name != "S3_ACCESS_KEY" && name != "S3_SECRET_KEY" && name != "OPENAI_API_KEY" {
 			t.Fatalf("unexpected secret env var %s", name)
@@ -898,6 +906,7 @@ func TestBuildEvalJobProvidesMultiTurnArtifactKeys(t *testing.T) {
 func TestReconcileCreatesJobAndConfigMapForMultiTurnEvalRun(t *testing.T) {
 	ctx := context.Background()
 	run, suite, dataset := testEvalRun("run-1"), multiTurnSuite("suite-1"), testEvalDataset("dataset-1")
+	run.Spec.LLM.Embedder = "" // only RAG suites use an embedding model
 	r := newTestReconciler(t, run, suite, dataset)
 
 	if _, err := r.Reconcile(ctx, reconcileRequest("run-1")); err != nil {
@@ -973,8 +982,7 @@ func TestValidateSuite(t *testing.T) {
 		{"builtin is not multiTurn", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Type = "multiTurn" }, "builtin only supports"},
 		{"builtin cannot be optional", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Required = ptr.To(false) }, "always required"},
 		{"builtin may omit required", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Required = nil }, ""},
-		{"builtin uses no judge model", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Model = "gpt" }, "only to provider deepeval"},
-		{"builtin uses no judge samples", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Samples = ptr.To[int32](2) }, "only to provider deepeval"},
+		{"builtin uses no judge samples", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Samples = ptr.To[int32](2) }, "applies only to provider deepeval"},
 		{"provider defaults to builtin", func(s *aieval.EvalSuite) { s.Spec.Evaluators[0].Provider = "" }, ""},
 		{"one evaluator per provider", func(s *aieval.EvalSuite) {
 			s.Spec.Evaluators = append(s.Spec.Evaluators, aieval.Evaluator{Name: "second-judge", Provider: "deepeval"})
@@ -1096,6 +1104,7 @@ func reconcileFinishedRun(t *testing.T, gateJSON string) aieval.EvalRun {
 	t.Helper()
 	ctx := context.Background()
 	run, suite, dataset := testEvalRun("run-1"), multiTurnSuite("suite-1"), testEvalDataset("dataset-1")
+	run.Spec.LLM.Embedder = "" // only RAG suites use an embedding model
 	run.Status.Phase = aieval.PhaseRunning
 	run.Status.SuiteSpecHash = hashSuiteSpec(suite)
 	run.Status.JobRef = v1.LocalObjectReference{Name: "evalrun-run-1"}
@@ -1243,11 +1252,26 @@ func TestMultiTurnExampleManifestsDecode(t *testing.T) {
 		t.Fatalf("example manifests reference each other incorrectly: run->%s suite->%s",
 			run.Spec.SuiteRef.Name, suite.Spec.DatasetRef.Name)
 	}
+	if err := validateRunLLM(&run, &suite); err != nil {
+		t.Fatalf("example multi-turn EvalRun spec.llm does not fit its suite: %v", err)
+	}
+
+	var ragSuite aieval.EvalSuite
+	read("evalsuite-rag.yaml", &ragSuite)
+	var ragRun aieval.EvalRun
+	read("evalrun.yaml", &ragRun)
+	if ragRun.Spec.SuiteRef.Name != ragSuite.Name {
+		t.Fatalf("examples/evalrun.yaml references %s, not the RAG example suite %s", ragRun.Spec.SuiteRef.Name, ragSuite.Name)
+	}
+	if err := validateRunLLM(&ragRun, &ragSuite); err != nil {
+		t.Fatalf("example RAG EvalRun spec.llm does not fit its suite: %v", err)
+	}
 }
 
 func TestFailedJobKeepsTheRunnersPublishedRootCause(t *testing.T) {
 	ctx := context.Background()
 	run, suite, dataset := testEvalRun("run-1"), multiTurnSuite("suite-1"), testEvalDataset("dataset-1")
+	run.Spec.LLM.Embedder = "" // only RAG suites use an embedding model
 	run.Status.Phase = aieval.PhaseRunning
 	run.Status.SuiteSpecHash = hashSuiteSpec(suite)
 	run.Status.JobRef = v1.LocalObjectReference{Name: "evalrun-run-1"}
@@ -1484,5 +1508,138 @@ func TestRenderSuiteConfigJSONIncludesMinTaskCompletion(t *testing.T) {
 	}
 	if err := validateSuite(suite); err != nil {
 		t.Fatalf("single-turn suite with minTaskCompletion must be valid: %v", err)
+	}
+}
+
+// ============================================================
+// EvalRun.spec.llm
+// ============================================================
+
+func TestValidateRunLLM(t *testing.T) {
+	ragSuite := testEvalSuite("suite-1")
+	agentSuite := legacyAgentSuite("suite-1")
+	deepEvalSuite := multiTurnSuite("suite-1")
+	deterministicSuite := multiTurnSuite("suite-1")
+	deterministicSuite.Spec.Metrics.Agent.Conversation = &aieval.AgentConversation{MaxTurns: ptr.To[int32](10)}
+	deterministicSuite.Spec.Evaluators = deterministicSuite.Spec.Evaluators[:1]
+	dummySuite := testEvalSuite("suite-1")
+	dummySuite.Spec.Execution.Mode = "dummy"
+	if err := validateSuite(deterministicSuite); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+
+	withLLM := func(mutate func(l *aieval.LLMSpec)) *aieval.EvalRun {
+		run := testEvalRun("run-1")
+		if mutate != nil {
+			mutate(run.Spec.LLM)
+		}
+		return run
+	}
+	noLLM := func() *aieval.EvalRun {
+		run := testEvalRun("run-1")
+		run.Spec.LLM = nil
+		return run
+	}
+	noEmbedder := func(l *aieval.LLMSpec) { l.Embedder = "" }
+
+	cases := []struct {
+		name    string
+		run     *aieval.EvalRun
+		suite   *aieval.EvalSuite
+		wantErr string
+	}{
+		{"RAG with judge, embedder and key", withLLM(nil), ragSuite, ""},
+		{"RAG needs spec.llm", noLLM(), ragSuite, "spec.llm is required"},
+		{"RAG needs an embedder", withLLM(noEmbedder), ragSuite, "spec.llm.embedder is required"},
+		{"single-turn agent needs spec.llm", noLLM(), agentSuite, "single-turn agent judges"},
+		{"single-turn agent rejects an embedder", withLLM(nil), agentSuite, "embedder is set but nothing uses it"},
+		{"single-turn agent without embedder", withLLM(noEmbedder), agentSuite, ""},
+		{"multi-turn deepeval needs spec.llm", noLLM(), deepEvalSuite, "deepeval evaluator"},
+		{"multi-turn deepeval with judge", withLLM(noEmbedder), deepEvalSuite, ""},
+		{"deterministic multi-turn rejects spec.llm", withLLM(noEmbedder), deterministicSuite, "nothing uses it"},
+		{"deterministic multi-turn without spec.llm", noLLM(), deterministicSuite, ""},
+		{"dummy mode rejects spec.llm", withLLM(nil), dummySuite, "dummy"},
+		{"dummy mode without spec.llm", noLLM(), dummySuite, ""},
+		{"public API needs a key", withLLM(func(l *aieval.LLMSpec) { l.APIKeySecretRef = nil }), ragSuite, "apiKeySecretRef is required"},
+		{"internal server without a key", withLLM(func(l *aieval.LLMSpec) {
+			l.APIKeySecretRef, l.URL = nil, "http://vllm.models.svc:8000/v1"
+		}), ragSuite, ""},
+		{"internal server with a key", withLLM(func(l *aieval.LLMSpec) { l.URL = "https://gateway.example.com/v1" }), ragSuite, ""},
+		{"url needs a scheme", withLLM(func(l *aieval.LLMSpec) { l.URL = "vllm:8000/v1" }), ragSuite, "must start with http"},
+		{"unknown provider", withLLM(func(l *aieval.LLMSpec) { l.Provider = "anthropic" }), ragSuite, "provider must be openai"},
+		{"model is required", withLLM(func(l *aieval.LLMSpec) { l.Model = "" }), ragSuite, "spec.llm.model is required"},
+		{"secret ref needs a key", withLLM(func(l *aieval.LLMSpec) { l.APIKeySecretRef.Key = "" }), ragSuite, "name and key"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRunLLM(tc.run, tc.suite)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestLLMEnvRendersURLAndSecretRef(t *testing.T) {
+	env := map[string]corev1.EnvVar{}
+	for _, e := range llmEnv(&aieval.LLMSpec{
+		Provider: "openai", Model: "llama-3.3-70b-instruct", URL: "http://vllm.models.svc:8000/v1",
+		APIKeySecretRef: &aieval.SecretKeyRef{Name: "judge-credentials", Key: "token"},
+	}) {
+		env[e.Name] = e
+	}
+	for name, want := range map[string]string{
+		"LLM_PROVIDER": "openai", "OPENAI_MODEL": "llama-3.3-70b-instruct", "OPENAI_BASE_URL": "http://vllm.models.svc:8000/v1",
+	} {
+		if env[name].Value != want {
+			t.Fatalf("env %s: expected %q, got %q", name, want, env[name].Value)
+		}
+	}
+	if _, ok := env["OPENAI_EMBEDDER"]; ok {
+		t.Fatalf("OPENAI_EMBEDDER must be omitted without spec.llm.embedder")
+	}
+	ref := env["OPENAI_API_KEY"].ValueFrom
+	if ref == nil || ref.SecretKeyRef == nil || ref.SecretKeyRef.Name != "judge-credentials" || ref.SecretKeyRef.Key != "token" {
+		t.Fatalf("OPENAI_API_KEY must come from the referenced Secret key, got %+v", ref)
+	}
+
+	keyless := llmEnv(&aieval.LLMSpec{Provider: "openai", Model: "m", URL: "http://ollama:11434/v1"})
+	for _, e := range keyless {
+		if e.Name == "OPENAI_API_KEY" {
+			t.Fatalf("OPENAI_API_KEY must be omitted without spec.llm.apiKeySecretRef")
+		}
+	}
+	if llmEnv(nil) != nil {
+		t.Fatalf("no LLM variables without spec.llm")
+	}
+}
+
+func TestReconcileSetsPendingWhenLLMIsInvalid(t *testing.T) {
+	ctx := context.Background()
+	run := testEvalRun("run-1")
+	run.Spec.LLM = nil
+	r := newTestReconciler(t, run, testEvalSuite("suite-1"), testEvalDataset("dataset-1"))
+
+	if _, err := r.Reconcile(ctx, reconcileRequest("run-1")); err != nil {
+		t.Fatal(err)
+	}
+	var updated aieval.EvalRun
+	if err := r.Get(ctx, types.NamespacedName{Name: "run-1", Namespace: "default"}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, "LLMInvalid")
+	if updated.Status.Phase != aieval.PhasePending || cond == nil || !strings.Contains(cond.Message, "spec.llm is required") {
+		t.Fatalf("expected Pending/LLMInvalid, got phase=%s cond=%v", updated.Status.Phase, cond)
+	}
+	var jobs batchv1.JobList
+	_ = r.List(ctx, &jobs, client.InNamespace("default"))
+	if len(jobs.Items) != 0 {
+		t.Fatalf("no Job must be created for an invalid spec.llm")
 	}
 }

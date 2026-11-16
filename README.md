@@ -324,8 +324,13 @@ spec:
 
   summaryBucket: eval-artifacts
   targetEndpoint: http://rag-service.default.svc.cluster.local/query
-  model: gpt-4.1-mini
-  embedder: text-embedding-3-small
+  llm:
+    provider: openai
+    model: gpt-4.1-mini
+    embedder: text-embedding-3-small
+    apiKeySecretRef:
+      name: openai-credentials
+      key: apiKey
 ```
 
 Important fields:
@@ -336,9 +341,46 @@ spec.revision.gitSHA
 spec.revision.prNumber
 spec.summaryBucket
 spec.targetEndpoint
-spec.model
-spec.embedder
+spec.llm.provider
+spec.llm.model
+spec.llm.embedder
+spec.llm.url
+spec.llm.apiKeySecretRef
 ```
+
+#### Judge LLM (`spec.llm`)
+
+`spec.llm` selects the LLM used by every LLM judge of the run: the RAG metrics and the Safety Judge, the single-turn
+agent judges, and the multi-turn `deepeval` evaluator. The user chooses the model and where it runs.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `provider` | yes | Provider protocol. `openai`: the OpenAI API, or any OpenAI-compatible server when `url` is set. |
+| `model` | yes | Judge model name. |
+| `embedder` | RAG only | Embedding model, served by the same provider, `url` and key as the judge. Rejected for agent suites. |
+| `url` | no | Base URL of an OpenAI-compatible API. Omitted: the provider's public API. |
+| `apiKeySecretRef` | without `url` | `name`/`key` of a Secret in the `EvalRun` namespace. Optional with `url` (a server without authentication). |
+
+`spec.llm` is required exactly when the suite calls a judge: always for RAG suites and single-turn agent suites, for
+multi-turn suites only with a `provider: deepeval` evaluator. A multi-turn suite without one, and the `dummy` mode, must
+omit it. Any mismatch (missing `spec.llm`, an unused one, an embedder for an agent suite, no key for the public API)
+keeps the `EvalRun` `PENDING` with an `LLMInvalid` condition instead of starting a Job.
+
+The OpenAI-compatible protocol covers self-hosted models (vLLM, Ollama, TGI, KServe, NVIDIA NIM) and LLM gateways
+(for example LiteLLM proxy) that give access to other providers:
+
+```yaml
+  llm:                                   # self-hosted vLLM, no authentication
+    provider: openai
+    model: meta-llama/Llama-3.3-70B-Instruct
+    url: http://vllm.models.svc:8000/v1
+```
+
+Before evaluating any case the runner sends a short test request (RAG: judge, embedder and structured outputs, which
+the Safety Judge needs; agents: one chat completion), so a wrong URL, key or model name fails the run at once with
+`rootCause.stage: Configuration`. Other features a judge library relies on (tool calling, JSON modes) are not probed;
+their failures surface as judge errors of the cases. The judge prompts were written for OpenAI models; calibrate the
+thresholds when you switch to another model.
 
 ---
 
@@ -443,16 +485,26 @@ S3_SUMMARY_BUCKET     # EvalRun.spec.summaryBucket: artifacts and baseline are w
 S3_SUMMARY_KEY        # same value as GATE_SUMMARY_KEY; the bundled runners use GATE_SUMMARY_KEY
 
 TARGET_ENDPOINT
-OPENAI_MODEL
-OPENAI_EMBEDDER
+```
+
+Judge LLM (`EvalRun.spec.llm`; all omitted when the run has no `spec.llm`, `OPENAI_EMBEDDER` and `OPENAI_BASE_URL`
+omitted when the field is not set). The `OPENAI_*` names are the ones the OpenAI SDK reads, so a custom runner image
+works with any OpenAI-compatible server unchanged:
+
+```text
+LLM_PROVIDER          # spec.llm.provider (openai)
+OPENAI_MODEL          # spec.llm.model
+OPENAI_EMBEDDER       # spec.llm.embedder
+OPENAI_BASE_URL       # spec.llm.url
+OPENAI_API_KEY        # from spec.llm.apiKeySecretRef
 ```
 
 Secrets are injected through Kubernetes `SecretKeyRef`:
 
 ```text
-S3_ACCESS_KEY
-S3_SECRET_KEY
-OPENAI_API_KEY
+S3_ACCESS_KEY         # Secret eval-s3-credentials, key accessKey
+S3_SECRET_KEY         # Secret eval-s3-credentials, key secretKey
+OPENAI_API_KEY        # the Secret and key named in EvalRun.spec.llm.apiKeySecretRef
 ```
 
 Expected secrets:
@@ -462,6 +514,7 @@ kubectl create secret generic eval-s3-credentials \
   --from-literal=accessKey=minioadmin \
   --from-literal=secretKey=minioadmin
 
+# only when spec.llm.apiKeySecretRef points at it
 kubectl create secret generic openai-credentials \
   --from-literal=apiKey="$OPENAI_API_KEY"
 ```
@@ -832,7 +885,7 @@ Notes:
   the controller only uses it to validate consistency). `spec.evaluation` only says *how* an agent is driven
   (`interactionMode`, `trials`, `trace`). Multi-turn is rejected for RAG suites.
 - **`spec.metrics` is the only place where metrics are listed.** `spec.evaluators` only says *how* an evaluator runs
-  (`provider`, `type`, `required`, `model`, `samples`) and carries no metric list.
+  (`provider`, `type`, `required`, `samples`) and carries no metric list.
 - Which section is used by which evaluator:
 
   | `metrics.agent` field | Evaluated by |
@@ -851,11 +904,11 @@ Notes:
   the stricter value wins. `limitsAction: Warn` records a `MEDIUM` violation (verdict `WARN`) instead of a `HIGH` one.
 - `maxRepeatedCalls: N` means: at most `N` identical calls (same tool and canonical JSON arguments) per session.
 - At most one evaluator per provider. The built-in evaluator always runs (listing it only names it) and is always
-  required: `required: false`, `model` or `samples` on it are rejected.
+  required: `required: false` or `samples` on it are rejected.
 - `required` on the `deepeval` evaluator: when `true`, an evaluator failure *or* a semantic metric below its threshold
   fails the run; when `false` or omitted it is recorded and at most turns the verdict into `WARN`.
-- `model` on the `deepeval` evaluator selects the judge model (default: `EvalRun.spec.model`); `samples` runs the judge
-  several times and uses the median. DeepEval needs `OPENAI_API_KEY`, which the Job already receives.
+- The judge of the `deepeval` evaluator is `EvalRun.spec.llm` (see [Judge LLM](#judge-llm-specllm)); there is one judge
+  model per run, so `spec.evaluators[]` has no `model` field. `samples` runs the judge several times and uses the median.
 - The controller rejects inconsistent suites (for example `trace.source: phoenix` without an endpoint, evaluators
   without `MultiTurn`, or any of the cases above) and keeps the `EvalRun` `PENDING` with a `SuiteInvalid` condition.
 
@@ -1081,7 +1134,9 @@ python run_local.py --dataset ../examples/dataset-agent-multiturn.jsonl \
 python tests/fake_travel_agent.py --port 8080 --flags stale_destination
 ```
 
-Drop `--no-semantic` (and export `OPENAI_API_KEY` / `OPENAI_MODEL`) to include the DeepEval evaluator.
+Drop `--no-semantic` to include the DeepEval evaluator; its judge comes from the same variables the controller renders
+from `EvalRun.spec.llm`: `LLM_PROVIDER=openai`, `OPENAI_MODEL` and `OPENAI_API_KEY` and/or `OPENAI_BASE_URL` (for example
+`OPENAI_BASE_URL=http://127.0.0.1:11434/v1` for a local Ollama without a key).
 The example scenario maps to the four scripted user turns of `travel-correction-001`: NYC->Paris request (1), the date (2),
 the correction to London (3, the agent must search again with `destination=London`) and "Don't book yet" (4, `book_flight`
 is forbidden). A stale destination yields `STALE_VALUE_IN_TOOL_CALL`; booking without approval yields `ACTION_WITHOUT_APPROVAL`;
@@ -1219,6 +1274,7 @@ docker run --network isolated_network --rm --name runner -v ./test-suite:/test-s
 -e S3_ACCESS_KEY="test-access" \
 -e S3_SECRET_KEY="test-secret" \
 -e S3_BASELINE_KEY="baseline.json" \
+-e LLM_PROVIDER=openai \
 -e OPENAI_API_KEY="KEY" \
 -e OPENAI_MODEL="gpt-5-mini" \
 -e OPENAI_EMBEDDER="text-embedding-3-small" \
@@ -1259,7 +1315,8 @@ kubectl create secret generic eval-s3-credentials \
   --from-literal=secretKey=minioadmin
 ```
 
-Create OpenAI credentials:
+Create the judge LLM API key referenced by `EvalRun.spec.llm.apiKeySecretRef` (not needed for a server without
+authentication, see [Judge LLM](#judge-llm-specllm)):
 
 ```sh
 kubectl create secret generic openai-credentials \

@@ -107,9 +107,6 @@ spec:
                                         metrics that have a threshold in spec.metrics.agent.conversation.
                                         The built-in deterministic evaluator always runs and is always required; at most one evaluator per provider.
                                     properties:
-                                        model:
-                                            description: Judge model (provider deepeval only); defaults to the EvalRun model.
-                                            type: string
                                         name:
                                             minLength: 1
                                             type: string

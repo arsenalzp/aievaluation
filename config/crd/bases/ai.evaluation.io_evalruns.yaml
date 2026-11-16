@@ -55,12 +55,52 @@ spec:
           spec:
             description: EvalRunSpec defines the desired state of EvalRun.
             properties:
-              embedder:
-                description: Embedder model name
-                type: string
-              model:
-                description: LLM Model name
-                type: string
+              llm:
+                description: |-
+                  LLM used by every LLM judge of the run (RAG metrics and Safety Judge, single-turn agent judges,
+                  multi-turn semantic evaluator). Required when the EvalSuite uses a judge, rejected otherwise.
+                properties:
+                  apiKeySecretRef:
+                    description: |-
+                      Secret key holding the API key, in the EvalRun namespace.
+                      Required without url; optional with url (a server without authentication).
+                    properties:
+                      key:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  embedder:
+                    description: |-
+                      Embedding model name. RAG suites only (required there, rejected for agent suites).
+                      It is served by the same provider, url and API key as the judge model.
+                    type: string
+                  model:
+                    description: Judge model name.
+                    minLength: 1
+                    type: string
+                  provider:
+                    description: |-
+                      Provider protocol. openai: the OpenAI API, or any OpenAI-compatible server when url is set
+                      (vLLM, Ollama, TGI, KServe, Azure OpenAI v1, LLM gateways such as LiteLLM proxy).
+                    enum:
+                    - openai
+                    type: string
+                  url:
+                    description: |-
+                      Base URL of an OpenAI-compatible API, e.g. http://vllm.models.svc:8000/v1.
+                      Omitted: the provider's public API.
+                    pattern: ^https?://
+                    type: string
+                required:
+                - model
+                - provider
+                type: object
               revision:
                 description: |-
                   EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -94,8 +134,6 @@ spec:
                 description: RAG endpoint
                 type: string
             required:
-            - embedder
-            - model
             - revision
             - suiteRef
             - summaryBucket

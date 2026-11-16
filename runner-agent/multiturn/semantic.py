@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional
 
 from .config import EvaluatorConfig, MultiTurnSettings
+from .llm_settings import LLMSettings
 from .models import Conversation, SemanticResult, SemanticScore
 
 
@@ -20,8 +21,9 @@ class SemanticProvider(ABC):
 
     @abstractmethod
     def evaluate(self, conversation: Conversation, metrics: List[str],
-                 thresholds: Dict[str, Optional[float]], model: Optional[str], samples: int) -> List[SemanticScore]:
-        """Return one :class:`SemanticScore` per metric. Raise on provider-level failure."""
+                 thresholds: Dict[str, Optional[float]], llm: Optional[LLMSettings], samples: int) -> List[SemanticScore]:
+        """Return one :class:`SemanticScore` per metric, judged by ``llm`` (EvalRun.spec.llm).
+        Raise on provider-level failure."""
 
 
 ProviderFactory = Callable[[EvaluatorConfig], SemanticProvider]
@@ -32,7 +34,7 @@ def register_semantic_provider(name: str, factory: ProviderFactory) -> None:
     _PROVIDERS[name] = factory
 
 
-def get_semantic_provider(config: EvaluatorConfig, default_model: Optional[str] = None) -> SemanticProvider:
+def get_semantic_provider(config: EvaluatorConfig) -> SemanticProvider:
     try:
         factory = _PROVIDERS[config.provider]
     except KeyError:
@@ -45,7 +47,7 @@ def run_semantic_evaluators(
     conversation: Conversation,
     settings: MultiTurnSettings,
     *,
-    default_model: Optional[str] = None,
+    llm: Optional[LLMSettings] = None,
     provider_factory: Optional[ProviderFactory] = None,
     redact: Optional[Callable[[Conversation], Conversation]] = None,
 ) -> List[SemanticResult]:
@@ -61,7 +63,7 @@ def run_semantic_evaluators(
             safe = redact(conversation) if redact else conversation
             metrics = settings.semantic_metrics()  # single source: thresholds in metrics.agent.conversation
             thresholds = {m: settings.semantic_threshold(m) for m in metrics}
-            scores = provider.evaluate(safe, metrics, thresholds, cfg.model or default_model, cfg.samples)
+            scores = provider.evaluate(safe, metrics, thresholds, llm, cfg.samples)
             for s in scores:
                 s.evaluator = cfg.name  # the configured evaluator name, not the library name
                 s.version = s.version or provider.version

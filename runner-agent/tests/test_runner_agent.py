@@ -27,6 +27,7 @@ from multiturn.config import ConfigError, get_interaction_mode, parse_multiturn_
 from multiturn.dataset import DatasetError, classify_dataset, parse_multiturn_lines
 from multiturn.deepeval_provider import DeepEvalProvider
 from multiturn.gate import EvaluatorFailure, GateInput, SemanticAggregate, decide
+from multiturn.llm_settings import LLMSettings, llm_settings_from_env, probe_llm
 from multiturn.models import Conversation, SemanticScore, ToolCall, Turn, Violation, parse_tool_status
 from multiturn.phoenix_adapter import (
     ObservedTurn,
@@ -62,7 +63,7 @@ SINGLE_LINE = json.dumps({"caseId": "st-1", "input": "hello", "expectedTools": [
 @pytest.fixture
 def runner(monkeypatch, tmp_path):
     pytest.importorskip("phoenix.evals", reason="runner-agent.py needs the agent runner dependencies (make agent-runner-install-dev)")
-    env = {"OPENAI_MODEL": "gpt-test", "OPENAI_API_KEY": "sk-test", "EVALRUN_NAME": "run1", "EVALSUITE_NAME": "suite1",
+    env = {"LLM_PROVIDER": "openai", "OPENAI_MODEL": "gpt-test", "OPENAI_API_KEY": "sk-test", "EVALRUN_NAME": "run1", "EVALSUITE_NAME": "suite1",
            "TARGET_ENDPOINT": "http://agent/turn", "S3_ENDPOINT": "http://s3", "DATASET_S3_BUCKET": "datasets", "S3_SUMMARY_BUCKET": "bucket",
            "S3_ACCESS_KEY": "a", "S3_SECRET_KEY": "b", "DATASET_S3_KEY": "ds.jsonl", "S3_BASELINE_KEY": "baselines/s.json",
            "GATE_SUMMARY_KEY": "runs/run1/gate_summary.json", "SCORES_KEY": "runs/run1/scores.json",
@@ -78,6 +79,8 @@ def runner(monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "upload_json", lambda cfg, key, payload: store.__setitem__(key, json.loads(json.dumps(payload))) or {})
     monkeypatch.setattr(mod, "upload_text", lambda cfg, key, text, content_type="text/plain": store.__setitem__(key, text) or {})
     monkeypatch.setattr(mod, "load_optional_baseline", lambda cfg: None)
+    probes = []  # the judge LLM probe never reaches the network in tests
+    monkeypatch.setattr(mod, "probe_llm", lambda settings: probes.append(settings))
 
     def setup(suite, dataset_lines):
         (tmp_path / "suite.json").write_text(json.dumps(suite))
@@ -86,7 +89,12 @@ def runner(monkeypatch, tmp_path):
         monkeypatch.setattr(mod, "download_dataset", lambda cfg: shutil.copy(src, cfg.dataset_file))
         return store
 
-    mod.setup, mod.store = setup, store
+    def without_llm():
+        # EvalRun.spec.llm must be omitted for a suite that calls no judge (multi-turn without deepeval)
+        for name in ("LLM_PROVIDER", "OPENAI_MODEL", "OPENAI_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+
+    mod.setup, mod.store, mod.probes, mod.without_llm = setup, store, probes, without_llm
     return mod
 
 
@@ -95,6 +103,7 @@ def run_main(mod):
 
 
 def test_multi_turn_suite_runs_the_multi_turn_path(runner, monkeypatch):
+    runner.without_llm()
     agent = FakeTravelAgent()
     monkeypatch.setattr(runner.requests, "post", agent.post)
     store = runner.setup(suite_dict(), [MULTI_LINE])
@@ -112,6 +121,7 @@ def test_multi_turn_suite_runs_the_multi_turn_path(runner, monkeypatch):
 
 
 def test_failing_multi_turn_run_still_exits_zero_and_reports_fail_in_the_gate(runner, monkeypatch):
+    runner.without_llm()
     monkeypatch.setattr(runner.requests, "post", FakeTravelAgent(["stale_destination"]).post)
     store = runner.setup(suite_dict(), [MULTI_LINE])
     assert run_main(runner) == 0
@@ -120,6 +130,7 @@ def test_failing_multi_turn_run_still_exits_zero_and_reports_fail_in_the_gate(ru
 
 
 def test_malformed_multi_turn_dataset_publishes_a_dataset_failure(runner):
+    runner.without_llm()
     bad = json.dumps({"caseId": "broken-1", "type": "multiTurn", "turns": [{"role": "assistant", "content": "x"}]})
     store = runner.setup(suite_dict(), [bad])
     assert run_main(runner) == 1
@@ -148,6 +159,103 @@ def test_invalid_multi_turn_configuration_is_reported_as_configuration_error(run
     store = runner.setup(suite_dict(**{"evaluation.trials": 99}), [MULTI_LINE])
     assert run_main(runner) == 1
     assert store["runs/run1/gate_summary.json"]["rootCause"]["stage"] == "Configuration"
+
+
+def _single_turn_agent(calls=None):
+    def post(url, json=None, headers=None, timeout=None):
+        if calls is not None:
+            calls.append(json)
+
+        class R:
+            def raise_for_status(self): pass
+            def json(self_inner):
+                return {"output": "done", "trace": {"traceId": "t", "toolCalls": [{"name": "search", "arguments": {}}]}}
+        return R()
+    return post
+
+
+_ST_SUITE = {"metrics": {"agent": {"minToolSelection": 0.9}}}
+
+
+def test_single_turn_run_probes_and_uses_the_judge_llm_of_the_evalrun(runner, monkeypatch):
+    """EvalRun.spec.llm with an internal OpenAI-compatible server and no API key."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://vllm.models.svc:8000/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "llama-3.3-70b-instruct")
+    monkeypatch.delenv("OPENAI_API_KEY")
+    used = {}
+
+    class FakeAdapter:
+        def __init__(self, model, llm):
+            used["model"], used["base_url"] = model, str(llm._sync_client.base_url)
+
+        def score_records(self, records):
+            return [runner.AgentPerCaseScore(case_id=r.case_id, tool_selection=1.0, tool_invocation=1.0,
+                                             tool_execution=1.0, passed=True) for r in records], {"metricNames": []}
+
+    monkeypatch.setattr(runner.requests, "post", _single_turn_agent())
+    monkeypatch.setattr(runner, "PhoenixAgentAdapter", FakeAdapter)
+    store = runner.setup(_ST_SUITE, [SINGLE_LINE])
+    assert run_main(runner) == 0
+    (probed,) = runner.probes
+    assert (probed.provider, probed.model, probed.base_url, probed.api_key) == (
+        "openai", "llama-3.3-70b-instruct", "http://vllm.models.svc:8000/v1", None)
+    assert used == {"model": "llama-3.3-70b-instruct", "base_url": "http://vllm.models.svc:8000/v1/"}
+    assert store["runs/run1/gate_summary.json"]["verdict"] == "PASS"
+
+
+def test_no_silent_ignore_single_turn_run_without_llm_publishes_a_configuration_failure(runner, monkeypatch):
+    runner.without_llm()
+    calls = []
+    monkeypatch.setattr(runner.requests, "post", _single_turn_agent(calls))
+    store = runner.setup(_ST_SUITE, [SINGLE_LINE])
+    assert run_main(runner) == 1
+    rc = store["runs/run1/gate_summary.json"]["rootCause"]
+    assert rc["stage"] == "Configuration" and "EvalRun.spec.llm" in rc["details"]
+    assert calls == [] and runner.probes == []
+
+
+def test_judge_llm_probe_failure_stops_the_run_before_the_agent_is_called(runner, monkeypatch):
+    def failing_probe(settings):
+        raise ConfigError(f"the judge LLM is not usable: model {settings.model!r}")
+
+    calls = []
+    monkeypatch.setattr(runner.requests, "post", _single_turn_agent(calls))
+    monkeypatch.setattr(runner, "probe_llm", failing_probe)
+    store = runner.setup(_ST_SUITE, [SINGLE_LINE])
+    assert run_main(runner) == 1
+    rc = store["runs/run1/gate_summary.json"]["rootCause"]
+    assert rc["stage"] == "Configuration" and "'gpt-test'" in rc["details"] and calls == []
+
+
+def test_no_silent_ignore_llm_of_a_multi_turn_suite_without_deepeval_is_a_configuration_error(runner, monkeypatch):
+    monkeypatch.setattr(runner.requests, "post", FakeTravelAgent().post)
+    store = runner.setup(suite_dict(), [MULTI_LINE])  # the fixture env carries an EvalRun.spec.llm
+    assert run_main(runner) == 1
+    rc = store["runs/run1/gate_summary.json"]["rootCause"]
+    assert rc["stage"] == "Configuration" and "nothing uses it" in rc["details"]
+
+
+def test_multi_turn_deepeval_suite_needs_the_judge_llm(runner, monkeypatch):
+    runner.without_llm()
+    monkeypatch.setattr(runner.requests, "post", FakeTravelAgent().post)
+    suite = suite_dict(**{"metrics.agent.conversation.minTurnRelevancy": 0.7})
+    suite["evaluators"].append({"name": "quality", "provider": "deepeval", "type": "multiTurn"})
+    store = runner.setup(suite, [MULTI_LINE])
+    assert run_main(runner) == 1
+    rc = store["runs/run1/gate_summary.json"]["rootCause"]
+    assert rc["stage"] == "Configuration" and "'quality'" in rc["details"] and "EvalRun.spec.llm" in rc["details"]
+
+
+def test_multi_turn_deepeval_suite_probes_the_judge_llm(runner, monkeypatch):
+    monkeypatch.setattr(runner.requests, "post", FakeTravelAgent().post)
+    suite = suite_dict(**{"metrics.agent.conversation.minTurnRelevancy": 0.7})
+    suite["evaluators"].append({"name": "quality", "provider": "deepeval", "type": "multiTurn"})
+    store = runner.setup(suite, [MULTI_LINE])
+    monkeypatch.setitem(sys.modules, "deepeval", None)  # the evaluator fails (optional -> WARN), no LLM call
+    assert run_main(runner) == 0
+    (probed,) = runner.probes
+    assert probed.model == "gpt-test"
+    assert store["runs/run1/scores.json"]["engine"]["evaluators"][1]["model"] == "gpt-test"
 
 
 def test_single_turn_flow_is_unchanged(runner, monkeypatch):
@@ -851,14 +959,14 @@ def test_full_multi_turn_suite():
         "regressionPolicy": {"maxDrop": 0.03},
     })
     suite["evaluators"].append({"name": "conversation-quality", "provider": "deepeval", "type": "multiTurn",
-                                "samples": 3, "model": "judge-1"})
+                                "samples": 3})
     s = parse_multiturn_settings(suite)
     assert s.is_multi_turn and s.trials == 3 and s.trace_source == "auto"
     assert (s.phoenix_endpoint, s.phoenix_project) == ("http://phoenix:6006", "travel")
     assert (s.max_turns, s.max_tool_calls, s.max_repeated_calls) == (10, 20, 1)
     assert s.semantic_threshold("turnRelevancy") == 0.8 and s.regression_max_drop == 0.03
     (sem,) = s.semantic_evaluators()
-    assert (sem.required, sem.samples, sem.model) == (False, 3, "judge-1")
+    assert (sem.required, sem.samples) == (False, 3)
     # metrics come only from the thresholds in metrics.agent.conversation
     assert s.semantic_metrics() == ["knowledgeRetention", "conversationCompleteness", "turnRelevancy"]
     assert s.builtin_evaluator().required is True
@@ -911,7 +1019,7 @@ _KR = {"metrics.agent.conversation": {"minKnowledgeRetention": 0.8}}
     ({**_KR, "evaluators": [_DEEPEVAL, {**_DEEPEVAL, "name": "q2"}]}, "only one evaluator with provider deepeval"),
     ({"evaluators": [_BUILTIN, {"name": "b"}]}, "only one evaluator with provider builtin"),
     ({"evaluators": [{**_BUILTIN, "required": False}]}, "always required"),
-    ({"evaluators": [{**_BUILTIN, "model": "gpt"}]}, "only to provider deepeval"),
+    ({"evaluators": [{**_BUILTIN, "model": "gpt"}]}, "the judge model is EvalRun.spec.llm.model"),
     ({"evaluators": [{**_BUILTIN, "samples": 2}]}, "only to provider deepeval"),
     ({**_KR, "evaluators": [_BUILTIN]}, "minKnowledgeRetention is set but no evaluator computes it"),
     ({"evaluators": [_BUILTIN, _DEEPEVAL]}, "nothing to evaluate"),
@@ -1358,6 +1466,97 @@ def test_trials_require_every_run_to_pass(uploader, layout):
 
 
 # ====================================================================================================================
+# llm_settings: multiturn/llm_settings.py - the EvalRun.spec.llm env contract and the judge LLM probe.
+# ====================================================================================================================
+
+LLM_ENV_OK = {"LLM_PROVIDER": "openai", "OPENAI_MODEL": "gpt-5-mini", "OPENAI_API_KEY": "sk-test"}
+
+
+def test_llm_settings_read_the_evalrun_llm_contract():
+    s = llm_settings_from_env({**LLM_ENV_OK, "OPENAI_BASE_URL": "https://gateway.example.com/v1"}, required=True, user="x")
+    assert (s.provider, s.model, s.base_url, s.api_key) == ("openai", "gpt-5-mini", "https://gateway.example.com/v1", "sk-test")
+    assert s.client_kwargs() == {"api_key": "sk-test", "base_url": "https://gateway.example.com/v1"}
+    assert llm_settings_from_env(LLM_ENV_OK, required=True, user="x").client_kwargs() == {"api_key": "sk-test"}
+
+
+def test_llm_settings_server_without_authentication_needs_no_key():
+    s = llm_settings_from_env({"LLM_PROVIDER": "openai", "OPENAI_MODEL": "llama", "OPENAI_BASE_URL": "http://ollama:11434/v1"},
+                              required=True, user="x")
+    assert s.api_key is None and s.client_kwargs() == {"api_key": "no-api-key", "base_url": "http://ollama:11434/v1"}
+    assert s.endpoint == "http://ollama:11434/v1"
+
+
+def test_llm_settings_are_none_when_no_judge_runs():
+    assert llm_settings_from_env({}, required=False, user="x") is None
+    # an API key alone (e.g. exported in a local shell) is not an EvalRun.spec.llm
+    assert llm_settings_from_env({"OPENAI_API_KEY": "sk-local"}, required=False, user="x") is None
+
+
+@pytest.mark.parametrize("env,required,message", [
+    ({}, True, "no LLM is configured"),
+    ({**LLM_ENV_OK, "LLM_PROVIDER": "anthropic"}, True, "must be one of ['openai']"),
+    ({"LLM_PROVIDER": "openai", "OPENAI_API_KEY": "k"}, True, "OPENAI_MODEL"),
+    ({**LLM_ENV_OK, "OPENAI_EMBEDDER": "text-embedding-3-small"}, True, "only RAG suites use an embedding model"),
+    ({**LLM_ENV_OK, "OPENAI_BASE_URL": "vllm:8000/v1"}, True, "must start with http"),
+    ({"LLM_PROVIDER": "openai", "OPENAI_MODEL": "m"}, True, "OPENAI_API_KEY (EvalRun.spec.llm.apiKeySecretRef) is required"),
+    (LLM_ENV_OK, False, "nothing uses it"),
+])
+def test_no_silent_ignore_llm_settings_are_validated(env, required, message):
+    with pytest.raises(ConfigError) as err:
+        llm_settings_from_env(env, required=required, user="the test")
+    assert message in str(err.value)
+
+
+class _FakeCompletions:
+    def __init__(self, calls, fail=None):
+        self.calls, self.fail = calls, fail
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.fail:
+            raise self.fail
+
+
+def _fake_openai(calls, fail=None):
+    def factory(**kwargs):
+        calls.append(kwargs)
+        client = type("Client", (), {})()
+        client.chat = type("Chat", (), {})()
+        client.chat.completions = _FakeCompletions(calls, fail)
+        return client
+    return factory
+
+
+def test_llm_probe_sends_one_chat_completion_to_the_configured_server():
+    calls = []
+    s = LLMSettings(provider="openai", model="llama", base_url="http://vllm:8000/v1")
+    probe_llm(s, client_factory=_fake_openai(calls))
+    client_kwargs, request = calls
+    assert client_kwargs["base_url"] == "http://vllm:8000/v1" and client_kwargs["api_key"] == "no-api-key"
+    assert request["model"] == "llama" and len(request["messages"]) == 1
+
+
+def test_llm_probe_failure_is_an_actionable_configuration_error_without_the_key():
+    key = "sk-" + "a" * 40
+    s = LLMSettings(provider="openai", model="gpt-typo", api_key=key)
+    with pytest.raises(ConfigError) as err:
+        probe_llm(s, client_factory=_fake_openai([], RuntimeError(f"Error code: 404 - model not found (key {key})")))
+    msg = str(err.value)
+    assert "'gpt-typo'" in msg and "openai public API" in msg and "404" in msg and key not in msg
+
+
+def test_llm_probe_failure_hides_a_key_of_any_format():
+    s = LLMSettings(provider="openai", model="m", base_url="http://vllm:8000/v1", api_key="internal-token-123")
+
+    def factory(**kwargs):
+        raise RuntimeError(f"401 unauthorized for token {kwargs['api_key']}")
+
+    with pytest.raises(ConfigError) as err:
+        probe_llm(s, client_factory=factory)
+    assert "internal-token-123" not in str(err.value) and "<redacted>" in str(err.value)
+
+
+# ====================================================================================================================
 # models_canonical: multiturn/models.py and multiturn/canonical.py - canonical model and JSON canonicalisation.
 # ====================================================================================================================
 
@@ -1436,8 +1635,8 @@ def test_deterministic_core_imports_no_framework_libraries():
     code = (
         "import sys; sys.path.insert(0, %r);"
         "import multiturn.models, multiturn.canonical, multiturn.dataset, multiturn.checks, multiturn.gate,"
-        "multiturn.runner, multiturn.artifacts, multiturn.phoenix_adapter, multiturn.entrypoint;"
-        "bad = [m for m in sys.modules if m.split('.')[0] in ('phoenix', 'deepeval', 'openinference', 'requests')];"
+        "multiturn.runner, multiturn.artifacts, multiturn.phoenix_adapter, multiturn.entrypoint, multiturn.llm_settings;"
+        "bad = [m for m in sys.modules if m.split('.')[0] in ('phoenix', 'deepeval', 'openinference', 'requests', 'openai')];"
         "assert not bad, bad"
     ) % root
     subprocess.run([sys.executable, "-W", "ignore", "-c", code], check=True)
@@ -1835,8 +2034,11 @@ def deepeval_settings(required=False, **o):
     suite = suite_dict(**{"metrics.agent.conversation.minKnowledgeRetention": 0.8,
                           "metrics.agent.conversation.minTurnRelevancy": 0.7, **o})
     suite["evaluators"].append({"name": "quality", "provider": "deepeval", "type": "multiTurn", "required": required,
-                                "samples": 3, "model": "judge-x"})
+                                "samples": 3})
     return parse_multiturn_settings(suite)
+
+
+JUDGE = LLMSettings(provider="openai", model="judge-x", api_key="sk-test")  # EvalRun.spec.llm of the tests
 
 
 def test_builds_a_deepeval_conversational_test_case_from_the_canonical_model():
@@ -1874,13 +2076,14 @@ def patched_provider(monkeypatch, **classes):
     provider = DeepEvalProvider()
     for name, cls in classes.items():
         monkeypatch.setattr(provider._metrics, name, cls)
+    monkeypatch.setattr(provider, "judge_model", lambda llm: llm.model)  # FakeMetric records the model name
     return provider
 
 
 def test_median_spread_reason_and_model_are_recorded(monkeypatch):
     FakeMetric.scores = iter([0.6, 0.9, 0.8, 0.5, 0.5, 0.5])
     provider = patched_provider(monkeypatch, KnowledgeRetentionMetric=FakeMetric, TurnRelevancyMetric=FakeMetric)
-    res = run_semantic_evaluators(conv(), deepeval_settings(), provider_factory=lambda cfg: provider)
+    res = run_semantic_evaluators(conv(), deepeval_settings(), llm=JUDGE, provider_factory=lambda cfg: provider)
     (r,) = res
     assert r.error is None
     ret, rel = r.scores
@@ -1892,7 +2095,7 @@ def test_median_spread_reason_and_model_are_recorded(monkeypatch):
 
 def test_provider_error_is_captured_not_raised(monkeypatch):
     provider = patched_provider(monkeypatch, KnowledgeRetentionMetric=ExplodingMetric, TurnRelevancyMetric=ExplodingMetric)
-    (r,) = run_semantic_evaluators(conv(), deepeval_settings(required=True), provider_factory=lambda cfg: provider)
+    (r,) = run_semantic_evaluators(conv(), deepeval_settings(required=True), llm=JUDGE, provider_factory=lambda cfg: provider)
     assert r.required and "rate limited" in r.error
     assert all(s.score is None and s.error for s in r.scores)
 
@@ -1901,6 +2104,20 @@ def test_missing_deepeval_is_an_evaluator_error_not_a_crash(monkeypatch):
     monkeypatch.setitem(sys.modules, "deepeval", None)  # makes `import deepeval` raise ImportError
     (r,) = run_semantic_evaluators(conv(), deepeval_settings())
     assert r.error and "deepeval is not installed" in r.error
+
+
+def test_deepeval_judge_is_built_from_the_evalrun_llm():
+    pytest.importorskip("deepeval")
+    llm = LLMSettings(provider="openai", model="llama-3.3-70b-instruct", base_url="http://vllm:8000/v1")
+    judge = DeepEvalProvider().judge_model(llm)  # real DeepEval GPTModel; building it makes no request
+    assert judge.get_model_name() == "llama-3.3-70b-instruct"
+    assert str(judge.load_model(async_mode=False).base_url) == "http://vllm:8000/v1/"
+
+
+def test_deepeval_without_a_judge_llm_is_an_evaluator_error():
+    pytest.importorskip("deepeval")
+    (r,) = run_semantic_evaluators(conv(), deepeval_settings())
+    assert r.error and "EvalRun.spec.llm" in r.error
 
 
 def test_unknown_provider_name_is_reported():
@@ -2092,10 +2309,10 @@ def test_task_completion_is_judged_against_the_reference_answer(runner, adapter,
 
 
 def test_judge_input_and_prompt_match_the_real_evaluator(runner, adapter, monkeypatch):
-    from llm import base_llm
+    from llm import build_phoenix_llm
     from llm.task_completion import TaskCompletionEvaluator
 
-    ev = TaskCompletionEvaluator(llm=base_llm)  # builds without calling the LLM
+    ev = TaskCompletionEvaluator(llm=build_phoenix_llm(JUDGE))  # builds without calling the LLM
     _, judge = tc(runner, adapter, monkeypatch, output="x")
     TaskCompletionEvaluator.TaskCompletionInputSchema(**judge.inputs[0])
     assert set(ev.prompt_template.variables) == set(judge.inputs[0]) == {"input", "expected_output", "output"}
@@ -2200,3 +2417,12 @@ def test_end_to_end_gate_fails_on_task_completion(runner, monkeypatch):
     assert agg["tool_response_handling_avg"] == 1.0 and agg["task_completion_avg"] == 0.0
     names = store["runs/run1/scores.json"]["engine"]["metricNames"]
     assert "tool_response_handling" in names and "task_completion" in names
+
+
+def test_phoenix_judge_llm_uses_the_evalrun_llm_url_and_key(runner):
+    from llm import build_phoenix_llm
+
+    llm = build_phoenix_llm(LLMSettings(provider="openai", model="llama", base_url="http://vllm:8000/v1", api_key="sk-x"))
+    assert llm.model == "llama"  # building the LLM makes no request
+    for client in (llm._sync_client, llm._async_client):
+        assert str(client.base_url) == "http://vllm:8000/v1/" and client.api_key == "sk-x"

@@ -17,7 +17,7 @@ from phoenix.evals.metrics import (
   MatchesRegex
 )
 import requests
-from llm import base_llm
+from llm import build_phoenix_llm
 from llm.task_completion import TaskCompletionEvaluator
 from multiturn.artifacts import redact
 from multiturn.config import (
@@ -32,6 +32,7 @@ from multiturn.config import (
 from multiturn.dataset import DatasetError, classify_dataset
 from multiturn.models import TOOL_STATUS_OK, parse_tool_status
 from multiturn.entrypoint import run_multiturn_job
+from multiturn.llm_settings import LLMSettings, llm_settings_from_env, probe_llm
 
 # ============================================================
 # Data models
@@ -268,8 +269,9 @@ class RunnerConfig:
     scores_key: str
     details_key: str
 
-    llm_model: str
-    llm_api_key: str
+    # EvalRun.spec.llm; None for MultiTurn suites (their deepeval evaluator reads it in multiturn.entrypoint)
+    # and on the failure path, which must publish the FAIL gate even when the LLM configuration is the problem.
+    llm: Optional[LLMSettings]
 
     thresholds: AgentThresholdConfig
     trace: TraceConfig
@@ -343,10 +345,13 @@ def build_runner_config(parse_suite: bool = True) -> RunnerConfig:
     """
     suite_config_path = getenv_required("SUITE_CONFIG")
     thresholds, trace, regression_max_drop, timeout_s = AgentThresholdConfig(), TraceConfig(), None, 60
+    llm: Optional[LLMSettings] = None
     if parse_suite:
         suite = load_suite_config(suite_config_path)
         if get_interaction_mode(suite) != INTERACTION_MULTI:
             thresholds, trace, regression_max_drop, timeout_s = parse_single_turn_suite(suite)
+            # The Phoenix judges score every case, so a single-turn agent run always needs the judge LLM.
+            llm = llm_settings_from_env(os.environ, required=True, user="the single-turn agent judges")
         # MultiTurn suites are parsed strictly by multiturn.config.parse_multiturn_settings.
         print(f"thresholds={thresholds}")
 
@@ -377,8 +382,7 @@ def build_runner_config(parse_suite: bool = True) -> RunnerConfig:
         scores_key=getenv_required("SCORES_KEY"),
         details_key=getenv_required("DETAILS_KEY"),
 
-        llm_model=getenv_required("OPENAI_MODEL"),
-        llm_api_key=getenv_required("OPENAI_API_KEY"),
+        llm=llm,
 
         thresholds=thresholds,
         trace=trace,
@@ -2021,7 +2025,8 @@ def run_multi_turn(cfg: RunnerConfig, suite: Dict[str, Any], dataset_path: str) 
         target_endpoint=cfg.target_endpoint,
         uploader=_ObjectStoreUploader(cfg),
         baseline=load_optional_baseline(cfg),
-        llm_model=cfg.llm_model,
+        # probe_llm is looked up at call time so tests can replace it (no network)
+        llm_probe=lambda settings: probe_llm(settings),
     )
 
 
@@ -2059,6 +2064,9 @@ async def main() -> int:
         if not cases:
             raise RuntimeError("dataset is empty")
 
+        probe_llm(cfg.llm)  # fail fast on a wrong URL, key or model name, before the agent is called
+        print(f"judge LLM: provider={cfg.llm.provider} model={cfg.llm.model} endpoint={cfg.llm.endpoint}")
+
         baseline = load_optional_baseline(cfg)
 
         records: List[AgentEvalRecord] = []
@@ -2066,7 +2074,7 @@ async def main() -> int:
             record = call_agent_endpoint(cfg, case)
             records.append(record)
         
-        adapter = PhoenixAgentAdapter(model=cfg.llm_model, llm=base_llm)
+        adapter = PhoenixAgentAdapter(model=cfg.llm.model, llm=build_phoenix_llm(cfg.llm))
         per_case_scores, deepeval_meta = adapter.score_records(records)
 
         mark_per_case_pass_fail(cfg, per_case_scores)

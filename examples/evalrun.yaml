@@ -3,11 +3,18 @@ kind: EvalRun
 metadata:
   name: demo-run-1
 spec:
-  model: "gpt-5-mini"
-  embedder: "text-embedding-3-small"
+  # LLM for the RAG metrics and the Safety Judge (judge + embedder from the same provider).
+  llm:
+    provider: openai
+    model: "gpt-5-mini"
+    embedder: "text-embedding-3-small"
+    # url: "http://vllm.models.svc:8000/v1"   # optional: any OpenAI-compatible server
+    apiKeySecretRef:                          # optional when url is set (server without authentication)
+      name: openai-credentials
+      key: apiKey
   summaryBucket: "eval-artifacts"
   suiteRef:
-    name: demo-suite
+    name: demo-suite-rag
   revision:
     gitSHA: "abc123"
     prNumber: 1

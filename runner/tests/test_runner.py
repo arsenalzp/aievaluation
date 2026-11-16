@@ -15,7 +15,22 @@ from runner import (
     AggregatedScores,
     RegressionResult,
     GateSummary,
+    LLMSettings,
 )
+
+REAL_PROBE_LLM = runner.probe_llm
+
+
+@pytest.fixture(autouse=True)
+def no_llm_probe(monkeypatch):
+    """main() probes the judge LLM before evaluating; tests never reach the network."""
+    probes = []
+
+    async def fake_probe(llm):
+        probes.append(llm)
+
+    monkeypatch.setattr(runner, "probe_llm", fake_probe)
+    return probes
 
 
 # ============================================================
@@ -80,9 +95,7 @@ def cfg(tmp_path):
         scores_key="artifacts/scores.json",
         details_key="artifacts/details.jsonl",
 
-        llm_model="gpt-test",
-        llm_embedder="embed-test",
-        llm_api_key="test-key",
+        llm=LLMSettings(provider="openai", model="gpt-test", embedder="embed-test", api_key="test-key"),
 
         thresholds=ThresholdConfig(
             min_context_recall=0.7,
@@ -159,9 +172,11 @@ def test_build_runner_config(monkeypatch, suite_config_file):
     monkeypatch.setenv("SCORES_KEY", "scores.json")
     monkeypatch.setenv("DETAILS_KEY", "details.jsonl")
 
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
     monkeypatch.setenv("OPENAI_MODEL", "gpt-test")
     monkeypatch.setenv("OPENAI_EMBEDDER", "embed-test")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
 
     cfg = runner.build_runner_config()
 
@@ -180,9 +195,7 @@ def test_build_runner_config(monkeypatch, suite_config_file):
     assert cfg.thresholds.min_relevancy == 0.5
     assert cfg.regression_max_drop == 0.05
 
-    assert cfg.llm_model == "gpt-test"
-    assert cfg.llm_embedder == "embed-test"
-    assert cfg.llm_api_key == "test-key"
+    assert cfg.llm == LLMSettings(provider="openai", model="gpt-test", embedder="embed-test", api_key="test-key")
 
 
 # ============================================================
@@ -1062,7 +1075,7 @@ def test_publish_gate_summary(monkeypatch, cfg):
 # ============================================================
 
 @pytest.mark.asyncio
-async def test_main_success_flow(monkeypatch, cfg, tmp_path):
+async def test_main_success_flow(monkeypatch, cfg, tmp_path, no_llm_probe):
     uploaded = {
         "details": False,
         "scores": False,
@@ -1095,10 +1108,8 @@ async def test_main_success_flow(monkeypatch, cfg, tmp_path):
     monkeypatch.setattr(runner, "call_target_endpoint", fake_call_target_endpoint)
 
     class FakeRagasAdapter:
-        def __init__(self, model_name, embedder_name, api_key):
-            self.model_name = model_name
-            self.embedder_name = embedder_name
-            self.api_key = api_key
+        def __init__(self, llm):
+            assert llm is cfg.llm
 
         async def score_records(self, records):
             assert len(records) == 1
@@ -1144,6 +1155,7 @@ async def test_main_success_flow(monkeypatch, cfg, tmp_path):
     exit_code = await runner.main()
 
     assert exit_code == 0
+    assert no_llm_probe == [cfg.llm]  # the judge LLM is probed before any case is evaluated
     assert uploaded == {
         "details": True,
         "scores": True,
@@ -1162,7 +1174,8 @@ NSI_ENV = {
     "S3_ENDPOINT": "http://s3", "DATASET_S3_BUCKET": "datasets", "S3_SUMMARY_BUCKET": "bucket", "DATASET_S3_KEY": "ds.jsonl",
     "S3_ACCESS_KEY": "a", "S3_SECRET_KEY": "b", "S3_BASELINE_KEY": "baselines/suite-1.json",
     "GATE_SUMMARY_KEY": "runs/run-1/gate_summary.json", "SCORES_KEY": "runs/run-1/scores.json",
-    "DETAILS_KEY": "runs/run-1/details.jsonl", "OPENAI_MODEL": "m", "OPENAI_EMBEDDER": "e", "OPENAI_API_KEY": "k",
+    "DETAILS_KEY": "runs/run-1/details.jsonl", "LLM_PROVIDER": "openai", "OPENAI_MODEL": "m", "OPENAI_EMBEDDER": "e",
+    "OPENAI_API_KEY": "k",
 }
 NSI_SUITE = {"metrics": {"rag": {"retrieval": {"minContextRecall": 0.7}, "generation": {"minFaithfulness": 0.8}}},
              "regressionPolicy": {"maxDrop": 0.05}, "execution": {"mode": "rag", "timeoutSeconds": 30}}
@@ -1172,6 +1185,7 @@ NSI_SUITE = {"metrics": {"rag": {"retrieval": {"minContextRecall": 0.7}, "genera
 def nsi_env(monkeypatch, tmp_path):
     for k, v in NSI_ENV.items():
         monkeypatch.setenv(k, v)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setenv("WORK_DIR", str(tmp_path))
 
     def write_suite(suite):
@@ -1412,3 +1426,101 @@ def test_no_silent_ignore_metric_missing_in_a_run_is_reported_not_skipped():
 def test_no_silent_ignore_malformed_baseline_is_an_error(baseline, fragment):
     with pytest.raises(ValueError, match=fragment):
         runner.apply_regression_policy(nsi_regression_cfg(), nsi_agg(), baseline)
+
+
+# ---------------------------------------------------------------- judge LLM (EvalRun.spec.llm)
+
+def test_llm_settings_with_an_internal_server_and_no_key(nsi_env, monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://vllm.models.svc:8000/v1")
+    monkeypatch.delenv("OPENAI_API_KEY")
+    llm = runner.build_runner_config().llm
+    assert (llm.base_url, llm.api_key, llm.endpoint) == ("http://vllm.models.svc:8000/v1", None, "http://vllm.models.svc:8000/v1")
+    assert llm.client_kwargs() == {"api_key": "no-api-key", "base_url": "http://vllm.models.svc:8000/v1"}
+
+
+@pytest.mark.parametrize("unset, extra, fragment", [
+    ("LLM_PROVIDER", {}, "no LLM is configured"),
+    (None, {"LLM_PROVIDER": "anthropic"}, "must be one of ['openai']"),
+    ("OPENAI_MODEL", {}, "OPENAI_MODEL (EvalRun.spec.llm.model) is required"),
+    ("OPENAI_EMBEDDER", {}, "the RAG metrics use an embedding model"),
+    ("OPENAI_API_KEY", {}, "OPENAI_API_KEY (EvalRun.spec.llm.apiKeySecretRef) is required"),
+    (None, {"OPENAI_BASE_URL": "vllm:8000/v1"}, "must start with http"),
+])
+def test_no_silent_ignore_llm_settings_are_validated(nsi_env, monkeypatch, unset, extra, fragment):
+    if unset:
+        monkeypatch.delenv(unset)
+    for k, v in extra.items():
+        monkeypatch.setenv(k, v)
+    with pytest.raises(runner.ConfigError) as err:
+        runner.build_runner_config()
+    assert fragment in str(err.value)
+
+
+async def test_no_silent_ignore_missing_llm_still_publishes_a_configuration_root_cause(nsi_env, monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER")
+    published = {}
+    monkeypatch.setattr(runner, "publish_gate_summary", lambda nsi_cfg, gate: published.update(gate=gate))
+    assert await runner.main() == 1
+    rc = published["gate"].rootCause
+    assert rc["stage"] == "Configuration" and "EvalRun.spec.llm" in rc["details"]
+
+
+class _FakeAsyncOpenAI:
+    """Records the client kwargs and the three probe requests; fails the request named in ``fail``."""
+
+    def __init__(self, calls, fail=None):
+        self.calls, self.fail = calls, fail
+
+    def __call__(self, **kwargs):
+        self.calls.append(("client", kwargs))
+        outer = self
+
+        def endpoint(name):
+            async def call(**kw):
+                outer.calls.append((name, kw))
+                if outer.fail == name:
+                    raise RuntimeError(f"{name} is not supported by this server")
+            return type("E", (), {"create": staticmethod(call), "parse": staticmethod(call)})()
+
+        client = type("C", (), {})()
+        client.chat = type("Chat", (), {"completions": endpoint("chat")})()
+        client.embeddings = endpoint("embeddings")
+        client.beta = type("Beta", (), {})()
+        client.beta.chat = type("BetaChat", (), {"completions": endpoint("parse")})()
+        return client
+
+
+LLM = LLMSettings(provider="openai", model="llama", embedder="bge-m3", base_url="http://vllm:8000/v1")
+
+
+async def test_llm_probe_checks_the_judge_the_embedder_and_structured_outputs():
+    calls = []
+    await REAL_PROBE_LLM(LLM, client_factory=_FakeAsyncOpenAI(calls))
+    (_, client_kwargs), (chat, chat_kw), (emb, emb_kw), (parse, parse_kw) = calls
+    assert client_kwargs["base_url"] == "http://vllm:8000/v1" and client_kwargs["api_key"] == "no-api-key"
+    assert (chat, chat_kw["model"]) == ("chat", "llama")
+    assert (emb, emb_kw["model"]) == ("embeddings", "bge-m3")
+    assert (parse, parse_kw["model"]) == ("parse", "llama") and parse_kw["response_format"] is runner._ProbeAnswer
+
+
+@pytest.mark.parametrize("fail, fragment", [
+    ("chat", "judge model 'llama'"),
+    ("embeddings", "embedding model 'bge-m3'"),
+    ("parse", "structured outputs (json_schema, required by the Safety Judge)"),
+])
+async def test_llm_probe_failure_names_what_is_missing(fail, fragment):
+    with pytest.raises(runner.ConfigError) as err:
+        await REAL_PROBE_LLM(LLM, client_factory=_FakeAsyncOpenAI([], fail))
+    assert fragment in str(err.value) and "http://vllm:8000/v1" in str(err.value)
+
+
+async def test_llm_probe_failure_does_not_leak_the_api_key():
+    key = "sk-" + "b" * 40
+    llm = LLMSettings(provider="openai", model="m", embedder="e", api_key=key)
+
+    def factory(**kwargs):
+        raise RuntimeError(f"401 Incorrect API key provided: {kwargs['api_key']}")
+
+    with pytest.raises(runner.ConfigError) as err:
+        await REAL_PROBE_LLM(llm, client_factory=factory)
+    assert key not in str(err.value) and "<redacted>" in str(err.value)

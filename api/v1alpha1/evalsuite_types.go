@@ -237,9 +237,6 @@ type Evaluator struct {
 	// Provider builtin: always required; only omitted or true is accepted.
 	// +kubebuilder:validation:Optional
 	Required *bool `json:"required,omitempty"`
-	// Judge model (provider deepeval only); defaults to the EvalRun model.
-	// +kubebuilder:validation:Optional
-	Model string `json:"model,omitempty"`
 	// Judge runs per conversation; the median is used (provider deepeval only).
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=1

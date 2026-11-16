@@ -3,8 +3,14 @@ kind: EvalRun
 metadata:
   name: demo-run-agent-multiturn-1
 spec:
-  model: "gpt-5-mini"                 # judge model for optional semantic evaluators
-  embedder: "text-embedding-3-small"
+  # Judge of the deepeval evaluator. A multi-turn suite without a deepeval evaluator must omit spec.llm.
+  # No embedder: only RAG suites use an embedding model.
+  llm:
+    provider: openai
+    model: "gpt-5-mini"
+    apiKeySecretRef:
+      name: openai-credentials
+      key: apiKey
   summaryBucket: "eval-artifacts"
   suiteRef:
     name: demo-suite-agent-multiturn

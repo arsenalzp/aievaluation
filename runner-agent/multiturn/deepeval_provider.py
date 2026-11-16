@@ -13,6 +13,7 @@ import statistics
 from typing import Any, Dict, List, Optional
 
 from .config import EvaluatorConfig, PROVIDER_DEEPEVAL
+from .llm_settings import PROVIDER_OPENAI, LLMSettings
 from .models import Conversation, SemanticScore
 from .semantic import SemanticProvider, register_semantic_provider
 
@@ -43,6 +44,13 @@ class DeepEvalProvider(SemanticProvider):
     def version(self) -> str:
         return self._version
 
+    def judge_model(self, llm: LLMSettings) -> Any:
+        """EvalRun.spec.llm -> DeepEval judge model. Provider openai: the OpenAI API or an OpenAI-compatible server."""
+        if llm.provider != PROVIDER_OPENAI:
+            raise RuntimeError(f"the deepeval evaluator does not support LLM provider {llm.provider!r}")
+        from deepeval.models import GPTModel
+        return GPTModel(model=llm.model, api_key=llm.client_api_key, base_url=llm.base_url)
+
     def build_test_case(self, conversation: Conversation) -> Any:
         """Canonical Conversation -> ``deepeval.test_case.ConversationalTestCase``."""
         Turn, ToolCall = self._cases.Turn, self._cases.ToolCall
@@ -59,7 +67,10 @@ class DeepEvalProvider(SemanticProvider):
         return self._cases.ConversationalTestCase(turns=turns, name=conversation.case_id)
 
     def evaluate(self, conversation: Conversation, metrics: List[str],
-                 thresholds: Dict[str, Optional[float]], model: Optional[str], samples: int) -> List[SemanticScore]:
+                 thresholds: Dict[str, Optional[float]], llm: Optional[LLMSettings], samples: int) -> List[SemanticScore]:
+        if llm is None:
+            raise RuntimeError("the deepeval evaluator needs a judge LLM; set EvalRun.spec.llm")
+        judge = self.judge_model(llm)
         test_case = self.build_test_case(conversation)
         out: List[SemanticScore] = []
         for name in metrics:
@@ -72,13 +83,13 @@ class DeepEvalProvider(SemanticProvider):
             threshold = thresholds.get(name)
             scores: List[float] = []
             reasons: List[str] = []
-            used_model: Optional[str] = model
+            used_model: Optional[str] = llm.model
             error: Optional[str] = None
             for _ in range(max(1, samples)):
                 try:
                     metric = getattr(self._metrics, cls_name)(
                         threshold=threshold if threshold is not None else 0.5,
-                        model=model, include_reason=True, async_mode=False, verbose_mode=False,
+                        model=judge, include_reason=True, async_mode=False, verbose_mode=False,
                     )
                     score = metric.measure(test_case, _show_indicator=False)
                     scores.append(float(score if score is not None else metric.score))

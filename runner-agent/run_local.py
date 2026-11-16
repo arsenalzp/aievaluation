@@ -9,6 +9,10 @@ Job runs.
     python run_local.py --dataset ../examples/dataset-agent-multiturn.jsonl \
         --suite ../examples/multiturn-local/suite.json --target http://127.0.0.1:8080 --no-semantic
 
+The judge LLM of a deepeval evaluator comes from the same variables the controller renders from
+EvalRun.spec.llm: LLM_PROVIDER=openai, OPENAI_MODEL, OPENAI_API_KEY and/or OPENAI_BASE_URL
+(e.g. OPENAI_BASE_URL=http://127.0.0.1:11434/v1 for a local Ollama). They are not passed with --no-semantic.
+
 Exit code: 0 for PASS/WARN, 1 for FAIL (the Kubernetes Job always exits 0 and reports the verdict in
 gate_summary.json instead).
 """
@@ -22,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from multiturn.config import PROVIDER_BUILTIN, SEMANTIC_THRESHOLD_FIELDS  # noqa: E402
 from multiturn.entrypoint import run_multiturn_job  # noqa: E402
+from multiturn.llm_settings import LLM_ENV  # noqa: E402
 
 
 class DirectoryUploader:
@@ -51,7 +56,6 @@ def main() -> int:
     ap.add_argument("--target", required=True, help="agent endpoint implementing the session turn contract")
     ap.add_argument("--out", default=None, help="artifact directory (default: a temp dir)")
     ap.add_argument("--run-name", default="local-run")
-    ap.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5-mini"), help="default judge model")
     ap.add_argument("--no-semantic", action="store_true",
                     help="skip semantic (DeepEval) evaluation: drops the deepeval evaluator and the semantic thresholds")
     args = ap.parse_args()
@@ -71,11 +75,13 @@ def main() -> int:
     out = args.out or tempfile.mkdtemp(prefix="evalrun-local-")
     prefix = f"runs/{args.run_name}"
     env = {"EVALRUN_NAME": args.run_name, "EVALSUITE_NAME": "local-suite", "S3_RUN_PREFIX": prefix}
+    if any(e.get("provider") == "deepeval" for e in suite.get("evaluators", [])):
+        env.update({k: os.environ[k] for k in LLM_ENV if os.environ.get(k)})  # the judge (EvalRun.spec.llm)
     result = run_multiturn_job(
         suite=suite, env=env, dataset_path=args.dataset, bucket="local",
         gate_summary_key=f"{prefix}/gate_summary.json", scores_key=f"{prefix}/scores.json",
         details_key=f"{prefix}/details.jsonl", target_endpoint=args.target,
-        uploader=DirectoryUploader(out), llm_model=args.model,
+        uploader=DirectoryUploader(out),
     )
     print(f"\nverdict : {result.verdict}\nsummary : {result.summary}")
     if result.root_cause.get("stage") != "None":

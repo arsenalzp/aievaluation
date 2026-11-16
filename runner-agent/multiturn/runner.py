@@ -18,6 +18,7 @@ from .checks import (
     EVALUATOR_VERSION, Check, CheckContext, Limits, derive_events, run_checks, _tighter,
 )
 from .config import MultiTurnSettings
+from .llm_settings import LLMSettings
 from .dataset import MultiTurnCase
 from .models import (
     SCHEMA_VERSION, SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_MEDIUM, Conversation, ToolCall, Turn, Violation,
@@ -149,7 +150,7 @@ def evaluate_run(
     layout: ArtifactLayout,
     run_info: Dict[str, Any],
     baseline: Optional[Dict[str, Any]] = None,
-    default_model: Optional[str] = None,
+    llm: Optional[LLMSettings] = None,
     phoenix_fetcher: Optional[PhoenixRestFetcher] = None,
     provider_factory: Optional[ProviderFactory] = None,
     checks: Optional[Sequence[Check]] = None,
@@ -230,7 +231,7 @@ def evaluate_run(
             t = cr.first_trial()
             if t.status == "ERROR" and t.error:
                 continue
-            t.semantic = run_semantic_evaluators(t.conversation, settings, default_model=default_model,
+            t.semantic = run_semantic_evaluators(t.conversation, settings, llm=llm,
                                                  provider_factory=provider_factory, redact=redact_conversation)
             for sr in t.semantic:
                 if sr.error:
@@ -262,7 +263,7 @@ def evaluate_run(
         total_cases=len(case_results)))
 
     artifacts = layout.artifact_uris()
-    scores = _scores_payload(run_info, settings, case_results, aggregates, semantic_aggs, regression, builtin.name)
+    scores = _scores_payload(run_info, settings, case_results, aggregates, semantic_aggs, regression, builtin.name, llm)
     write_json_artifact(uploader, layout.scores_key, scores)
     write_json_artifact(uploader, layout.manifest_key, _manifest(run_info, settings, case_results, layout, decision))
     write_json_artifact(uploader, layout.gate_summary_key, {
@@ -344,7 +345,7 @@ def _regression(aggregates: Dict[str, Optional[float]], semantic: List[gatemod.S
 
 def _scores_payload(run_info: Dict[str, Any], settings: MultiTurnSettings, cases: List[CaseResult],
                     aggregates: Dict[str, Optional[float]], semantic: List[gatemod.SemanticAggregate],
-                    regression: Dict[str, Any], builtin_name: str) -> Dict[str, Any]:
+                    regression: Dict[str, Any], builtin_name: str, llm: Optional[LLMSettings]) -> Dict[str, Any]:
     all_trials = [t for cr in cases for t in cr.trials]
     violations = [v for t in all_trials for v in t.violations]
     by_sev: Dict[str, int] = {}
@@ -359,7 +360,7 @@ def _scores_payload(run_info: Dict[str, Any], settings: MultiTurnSettings, cases
         "engine": {"name": RUNNER_NAME, "version": RUNNER_VERSION,
                    "evaluators": [{"name": builtin_name, "provider": "builtin", "version": EVALUATOR_VERSION}] +
                                  [{"name": e.name, "provider": e.provider, "required": e.required, "metrics": settings.semantic_metrics(),
-                                   "model": e.model, "samples": e.samples} for e in settings.semantic_evaluators()]},
+                                   "model": llm.model if llm else None, "samples": e.samples} for e in settings.semantic_evaluators()]},
         "aggregatedScores": {
             "total_cases": len(cases),
             "passed_cases": sum(1 for c in cases if c.pass_all),

@@ -221,6 +221,94 @@ class TargetResponseError(RuntimeError):
         super().__init__(f"target response for caseId={case_id!r} violates the endpoint contract: {message}")
 
 
+# ============================================================
+# Judge LLM (EvalRun.spec.llm)
+# ============================================================
+
+LLM_PROVIDER_OPENAI = "openai"
+LLM_PROVIDERS = (LLM_PROVIDER_OPENAI,)
+# The OpenAI SDK refuses to build a client without an API key; a server without authentication ignores the
+# Authorization header, so this placeholder is sent only when spec.llm.url is set and no key is configured.
+NO_API_KEY = "no-api-key"
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    """EvalRun.spec.llm as rendered by the controller (LLM_PROVIDER, OPENAI_MODEL, OPENAI_EMBEDDER,
+    OPENAI_BASE_URL, OPENAI_API_KEY). The RAG metrics, the embeddings and the Safety Judge all use it."""
+    provider: str
+    model: str
+    embedder: str
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+
+    @property
+    def endpoint(self) -> str:
+        return self.base_url or f"{self.provider} public API"
+
+    def client_kwargs(self) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {"api_key": self.api_key or NO_API_KEY}
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+        return kwargs
+
+
+def parse_llm_env() -> LLMSettings:
+    """Strictly read the judge LLM env contract; a RAG run always needs a judge model and an embedder."""
+    def get(name: str) -> Optional[str]:
+        value = os.getenv(name)
+        return value.strip() if value and value.strip() else None
+
+    provider, model, embedder = get("LLM_PROVIDER"), get("OPENAI_MODEL"), get("OPENAI_EMBEDDER")
+    base_url, api_key = get("OPENAI_BASE_URL"), get("OPENAI_API_KEY")
+    if provider is None:
+        raise ConfigError("the RAG metrics and the Safety Judge call an LLM but no LLM is configured: set EvalRun.spec.llm "
+                          "(env LLM_PROVIDER, OPENAI_MODEL, OPENAI_EMBEDDER and OPENAI_API_KEY or OPENAI_BASE_URL)")
+    if provider not in LLM_PROVIDERS:
+        raise ConfigError(f"LLM_PROVIDER (EvalRun.spec.llm.provider) must be one of {list(LLM_PROVIDERS)}, got {provider!r}")
+    if model is None:
+        raise ConfigError("OPENAI_MODEL (EvalRun.spec.llm.model) is required")
+    if embedder is None:
+        raise ConfigError("OPENAI_EMBEDDER (EvalRun.spec.llm.embedder) is required: the RAG metrics use an embedding model")
+    if base_url is not None and not base_url.startswith(("http://", "https://")):
+        raise ConfigError(f"OPENAI_BASE_URL (EvalRun.spec.llm.url) must start with http:// or https://, got {base_url!r}")
+    if base_url is None and api_key is None:
+        raise ConfigError(f"OPENAI_API_KEY (EvalRun.spec.llm.apiKeySecretRef) is required without "
+                          f"OPENAI_BASE_URL (spec.llm.url): the public {provider} API needs an API key")
+    return LLMSettings(provider=provider, model=model, embedder=embedder, base_url=base_url, api_key=api_key)
+
+
+class _ProbeAnswer(BaseModel):
+    ok: bool
+
+
+async def probe_llm(llm: LLMSettings, client_factory: Any = None) -> None:
+    """Fail fast with an actionable ConfigError before any case is evaluated: the judge model must answer, the
+    embedder must embed and the server must support structured outputs (json_schema), which the Safety Judge
+    uses. Otherwise every case would fail with a judge error (and the fail-closed Safety Judge would report
+    a security failure for each of them)."""
+    factory = client_factory or AsyncOpenAI
+    where = f"at {llm.endpoint} (EvalRun.spec.llm)"
+    messages = [{"role": "user", "content": "Reply with ok=true."}]
+    checks = (
+        (f"judge model {llm.model!r}", lambda c: c.chat.completions.create(model=llm.model, messages=messages)),
+        (f"embedding model {llm.embedder!r}", lambda c: c.embeddings.create(model=llm.embedder, input=["probe"])),
+        (f"judge model {llm.model!r} with structured outputs (json_schema, required by the Safety Judge)",
+         lambda c: c.beta.chat.completions.parse(model=llm.model, messages=messages, response_format=_ProbeAnswer)),
+    )
+    client = None
+    for what, call in checks:
+        try:
+            client = client or factory(max_retries=1, timeout=60, **llm.client_kwargs())
+            await call(client)
+        except Exception as exc:  # noqa: BLE001 - every failure is a configuration problem of the run
+            message = str(exc)
+            if llm.api_key:
+                message = message.replace(llm.api_key, "<redacted>")
+            raise ConfigError(f"the LLM is not usable: {what} {where} failed a test request: "
+                              f"{type(exc).__name__}: {message[:500]}") from exc
+
+
 def _section(parent: Dict[str, Any], key: str, path: str, allowed: Tuple[str, ...]) -> Dict[str, Any]:
     value = parent.get(key)
     full = f"{path}.{key}" if path else key
@@ -302,9 +390,9 @@ class RunnerConfig:
     scores_key: str
     details_key: str
 
-    llm_model: str
-    llm_embedder: str
-    llm_api_key: str
+    # EvalRun.spec.llm; None only on the failure path, which must publish the FAIL gate summary even when the
+    # LLM configuration is the problem.
+    llm: Optional[LLMSettings]
 
     thresholds: ThresholdConfig
     regression_max_drop: Optional[float] = None
@@ -346,8 +434,10 @@ def build_runner_config(parse_suite: bool = True) -> RunnerConfig:
     itself is invalid: it reads the env contract and skips the suite thresholds."""
     suite_config_path = getenv_required("SUITE_CONFIG")
     thresholds, regression_max_drop, timeout_s = ThresholdConfig(), None, 60
+    llm: Optional[LLMSettings] = None
     if parse_suite:
         thresholds, regression_max_drop, timeout_s = parse_rag_suite(load_suite_config(suite_config_path))
+        llm = parse_llm_env()
 
     return RunnerConfig(
         evalrun_name=getenv_required("EVALRUN_NAME"),
@@ -379,9 +469,7 @@ def build_runner_config(parse_suite: bool = True) -> RunnerConfig:
         thresholds=thresholds,
         regression_max_drop=regression_max_drop,
 
-        llm_model=getenv_required("OPENAI_MODEL"),
-        llm_embedder=getenv_required("OPENAI_EMBEDDER"),
-        llm_api_key=getenv_required("OPENAI_API_KEY")
+        llm=llm,
     )
 
 
@@ -628,11 +716,10 @@ class RagasAdapter:
     Adapter layer around ragas so runner core stays stable.
     """
 
-    def __init__(self, model_name, embedder_name, api_key) -> None:
-        self._model_name = model_name
-        self._embedder_name = embedder_name
-        self._openai_api_key = api_key
-        pass
+    def __init__(self, llm: LLMSettings) -> None:
+        self._llm = llm
+        self._model_name = llm.model
+        self._embedder_name = llm.embedder
       
     @staticmethod
     def _build_hf_dataset(records: List[EvalRecord]) -> EvaluationDataset:
@@ -737,7 +824,7 @@ class RagasAdapter:
           "max_completion_tokens": 8192,
           "max_tokens": 8192
         }
-        openai_async_client = AsyncOpenAI(api_key=self._openai_api_key)
+        openai_async_client = AsyncOpenAI(**self._llm.client_kwargs())
         ragas_llm = llm_factory(
           model=self._model_name,
           client=openai_async_client,
@@ -1166,6 +1253,11 @@ async def main() -> int:
         if not cases:
             raise RuntimeError("dataset is empty")
 
+        # 2.1) Fail fast on a wrong LLM URL, key, model name or missing server capability
+        await probe_llm(cfg.llm)
+        print(f"judge LLM: provider={cfg.llm.provider} model={cfg.llm.model} embedder={cfg.llm.embedder} "
+              f"endpoint={cfg.llm.endpoint}")
+
         # 3) Load optional baseline
         baseline = load_optional_baseline(cfg)
 
@@ -1176,11 +1268,7 @@ async def main() -> int:
             records.append(record)
 
         # 5) Evaluate with Ragas
-        ragas_adapter = RagasAdapter(
-            model_name=cfg.llm_model,
-            embedder_name=cfg.llm_embedder,
-            api_key=cfg.llm_api_key
-        )
+        ragas_adapter = RagasAdapter(cfg.llm)
         per_case_scores, ragas_meta = await ragas_adapter.score_records(records)
 
         # 6) Per-case pass/fail markers

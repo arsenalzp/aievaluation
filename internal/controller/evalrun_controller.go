@@ -199,6 +199,10 @@ func (r *EvalRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "SuiteInvalid", "Pending", fmt.Sprintf("EvalSuite %q is invalid: %v", suite.Name, err), 30*time.Second)
 	}
 
+	if err := validateRunLLM(&run, &suite); err != nil {
+		return r.setStatusAndRequeue(ctx, &run, aieval.PhasePending, "LLMInvalid", "Pending", fmt.Sprintf("EvalRun %q: %v", run.Name, err), 30*time.Second)
+	}
+
 	// 3) Snapshot suiteSpecHash (Skipped comment block for brevity)
 	suiteHash := hashSuiteSpec(&suite)
 	if run.Status.SuiteSpecHash == "" {
@@ -519,9 +523,8 @@ func buildEvalJob(
 		{Name: "S3_SUMMARY_BUCKET", Value: run.Spec.SummaryBucket},
 		{Name: "S3_SUMMARY_KEY", Value: fmt.Sprintf("%s/gate_summary.json", runPrefix)},
 		{Name: "TARGET_ENDPOINT", Value: run.Spec.TargetEndpoint},
-		{Name: "OPENAI_MODEL", Value: run.Spec.Model},
-		{Name: "OPENAI_EMBEDDER", Value: run.Spec.Embedder},
 	}
+	env = append(env, llmEnv(run.Spec.LLM)...)
 
 	// shared S3 credentials/config from Secret
 	env = append(env,
@@ -540,15 +543,6 @@ func buildEvalJob(
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: "eval-s3-credentials"},
 					Key:                  "secretKey",
-				},
-			},
-		},
-		corev1.EnvVar{
-			Name: "OPENAI_API_KEY",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "openai-credentials"},
-					Key:                  "apiKey",
 				},
 			},
 		},
@@ -751,6 +745,97 @@ func validateSuite(suite *aieval.EvalSuite) error {
 	return validateEvaluators(suite)
 }
 
+const llmProviderOpenAI = "openai"
+
+// suiteLLMUse reports whether the runner of this suite calls an LLM judge and whether it needs an embedder.
+// RAG: ragas metrics and the Safety Judge always run (judge + embedder). Single-turn agent: the Phoenix
+// judges run for every case (judge). Multi-turn: only a provider deepeval evaluator calls a judge.
+// The dummy execution mode calls nothing.
+func suiteLLMUse(suite *aieval.EvalSuite) (judge bool, embedder bool, what string) {
+	switch {
+	case suite.Spec.Execution.Mode == "dummy":
+		return false, false, "spec.execution.mode is dummy"
+	case isMultiTurn(suite):
+		for _, ev := range suite.Spec.Evaluators {
+			if ev.Provider == "deepeval" {
+				return true, false, "the multi-turn deepeval evaluator"
+			}
+		}
+		return false, false, "a multi-turn suite without a deepeval evaluator"
+	case suite.Spec.Metrics.Agent != nil:
+		return true, false, "the single-turn agent judges"
+	case suite.Spec.Metrics.Rag != nil:
+		return true, true, "the RAG metrics and the Safety Judge"
+	}
+	return false, false, "a suite without metrics"
+}
+
+// validateRunLLM checks EvalRun.spec.llm against what the suite's runner uses: a judge-using suite needs it,
+// any other suite must not set it, and every set field must be used (nothing is silently ignored).
+func validateRunLLM(run *aieval.EvalRun, suite *aieval.EvalSuite) error {
+	judge, embedder, what := suiteLLMUse(suite)
+	llm := run.Spec.LLM
+	switch {
+	case llm == nil && judge:
+		return fmt.Errorf("spec.llm is required: %s calls an LLM judge (set spec.llm.provider, spec.llm.model and spec.llm.apiKeySecretRef or spec.llm.url)", what)
+	case llm == nil:
+		return nil
+	case !judge:
+		return fmt.Errorf("spec.llm is set but nothing uses it: %s calls no LLM judge; remove spec.llm", what)
+	}
+	if llm.Provider != llmProviderOpenAI {
+		return fmt.Errorf("spec.llm.provider must be %s, got %q", llmProviderOpenAI, llm.Provider)
+	}
+	if llm.Model == "" {
+		return fmt.Errorf("spec.llm.model is required")
+	}
+	if embedder && llm.Embedder == "" {
+		return fmt.Errorf("spec.llm.embedder is required: %s use an embedding model", what)
+	}
+	if !embedder && llm.Embedder != "" {
+		return fmt.Errorf("spec.llm.embedder is set but nothing uses it: only RAG suites use an embedding model; remove spec.llm.embedder")
+	}
+	if llm.URL == "" && llm.APIKeySecretRef == nil {
+		return fmt.Errorf("spec.llm.apiKeySecretRef is required when spec.llm.url is not set: the public %s API needs an API key", llm.Provider)
+	}
+	if llm.URL != "" && !strings.HasPrefix(llm.URL, "http://") && !strings.HasPrefix(llm.URL, "https://") {
+		return fmt.Errorf("spec.llm.url must start with http:// or https://, got %q", llm.URL)
+	}
+	if ref := llm.APIKeySecretRef; ref != nil && (ref.Name == "" || ref.Key == "") {
+		return fmt.Errorf("spec.llm.apiKeySecretRef needs both name and key")
+	}
+	return nil
+}
+
+// llmEnv renders EvalRun.spec.llm into the runner env contract. The OPENAI_* names are the ones the
+// OpenAI SDK reads, so a custom runner image works with any OpenAI-compatible server unchanged.
+// Variables of unset fields are omitted.
+func llmEnv(llm *aieval.LLMSpec) []corev1.EnvVar {
+	if llm == nil {
+		return nil
+	}
+	env := []corev1.EnvVar{
+		{Name: "LLM_PROVIDER", Value: llm.Provider},
+		{Name: "OPENAI_MODEL", Value: llm.Model},
+	}
+	if llm.Embedder != "" {
+		env = append(env, corev1.EnvVar{Name: "OPENAI_EMBEDDER", Value: llm.Embedder})
+	}
+	if llm.URL != "" {
+		env = append(env, corev1.EnvVar{Name: "OPENAI_BASE_URL", Value: llm.URL})
+	}
+	if ref := llm.APIKeySecretRef; ref != nil {
+		env = append(env, corev1.EnvVar{
+			Name: "OPENAI_API_KEY",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: ref.Name},
+				Key:                  ref.Key,
+			}},
+		})
+	}
+	return env
+}
+
 // semanticThresholds lists the semantic metrics that have a threshold in spec.metrics.agent.conversation.
 // It is the single source of the metrics a provider deepeval evaluator computes.
 func semanticThresholds(suite *aieval.EvalSuite) []string {
@@ -796,8 +881,8 @@ func validateEvaluators(suite *aieval.EvalSuite) error {
 			if ev.Required != nil && !*ev.Required {
 				return fmt.Errorf("spec.evaluators[%d]: the builtin evaluator is always required; remove required: false", i)
 			}
-			if ev.Model != "" || ev.Samples != nil {
-				return fmt.Errorf("spec.evaluators[%d]: model and samples apply only to provider deepeval; the builtin evaluator uses no judge", i)
+			if ev.Samples != nil {
+				return fmt.Errorf("spec.evaluators[%d]: samples applies only to provider deepeval; the builtin evaluator uses no judge", i)
 			}
 		case "deepeval":
 			if ev.Type == "deterministic" {

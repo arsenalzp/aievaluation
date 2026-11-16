@@ -21,7 +21,7 @@ SEMANTIC_THRESHOLD_FIELDS = {
     "conversationCompleteness": "minConversationCompleteness",
     "turnRelevancy": "minTurnRelevancy",
 }
-EVALUATOR_FIELDS = ("name", "provider", "type", "required", "model", "samples")
+EVALUATOR_FIELDS = ("name", "provider", "type", "required", "samples")
 # Flat single-turn fields the multi-turn runner does not read. No synonyms or fallbacks: every metric
 # has exactly one field.
 SINGLE_TURN_ONLY_AGENT_FIELDS = {
@@ -48,7 +48,6 @@ class EvaluatorConfig:
     provider: str = PROVIDER_BUILTIN
     type: str = TYPE_DETERMINISTIC
     required: bool = False
-    model: Optional[str] = None
     samples: int = 1
 
 
@@ -225,7 +224,8 @@ def parse_multiturn_settings(suite: Dict[str, Any]) -> MultiTurnSettings:
         unknown = sorted(set(raw) - set(EVALUATOR_FIELDS))
         if unknown:
             hint = (" (semantic metrics are selected by their thresholds in metrics.agent.conversation)"
-                    if "metrics" in unknown else "")
+                    if "metrics" in unknown else
+                    " (the judge model is EvalRun.spec.llm.model)" if "model" in unknown else "")
             raise ConfigError(f"{p}: unknown field(s) {unknown}; supported: {list(EVALUATOR_FIELDS)}{hint}")
         if raw["name"] in seen:
             raise ConfigError(f"{p}.name {raw['name']!r} is duplicated")
@@ -246,8 +246,8 @@ def parse_multiturn_settings(suite: Dict[str, Any]) -> MultiTurnSettings:
                 raise ConfigError(f"{p}: builtin evaluators are deterministic")
             if required is False:
                 raise ConfigError(f"{p}: the builtin evaluator is always required; remove required: false")
-            if raw.get("model") is not None or raw.get("samples") is not None:
-                raise ConfigError(f"{p}: model and samples apply only to provider {PROVIDER_DEEPEVAL}; "
+            if raw.get("samples") is not None:
+                raise ConfigError(f"{p}: samples applies only to provider {PROVIDER_DEEPEVAL}; "
                                   "the builtin evaluator uses no judge")
             s.evaluators.append(EvaluatorConfig(name=raw["name"], provider=provider, type=etype, required=True))
             continue
@@ -258,7 +258,7 @@ def parse_multiturn_settings(suite: Dict[str, Any]) -> MultiTurnSettings:
             raise ConfigError(f"{p}.samples must be <= 5")
         s.evaluators.append(EvaluatorConfig(
             name=raw["name"], provider=provider, type=etype, required=bool(required),
-            model=raw.get("model") or None, samples=samples,
+            samples=samples,
         ))
 
     if s.evaluators and not s.is_multi_turn:

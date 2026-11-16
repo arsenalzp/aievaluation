@@ -1,3 +1,3 @@
-from llm.llm import base_llm
+from llm.llm import build_phoenix_llm
 
-__all__ = ["base_llm"]
+__all__ = ["build_phoenix_llm"]
