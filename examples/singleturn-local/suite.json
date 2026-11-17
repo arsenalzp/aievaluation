@@ -1,0 +1,16 @@
+{
+  "metrics": {
+    "agent": {
+      "minToolSelection": 0.9,
+      "minToolExecution": 0.85,
+      "minToolInvocation": 0.9,
+      "maxPolicyViolations": 0
+    }
+  },
+  "regressionPolicy": {
+    "maxDrop": 0.03
+  },
+  "execution": {
+    "timeoutSeconds": 60
+  }
+}

@@ -1,0 +1,21 @@
+{
+      "metrics": {
+        "rag": {
+          "retrieval": {
+            "minContextRecall": 0.7,
+            "minContextPrecision": 0.65
+          },
+          "generation": {
+            "minFaithfulness": 0.8,
+            "minCorrectness": 0.71,
+            "minRelevancy": 0.71
+          }
+        }
+      },
+      "regressionPolicy": {
+        "maxDrop": 0.3
+      },
+      "execution": {
+        "timeoutSeconds": 300
+      }
+}
