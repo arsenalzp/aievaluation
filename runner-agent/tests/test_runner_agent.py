@@ -2093,6 +2093,39 @@ def test_median_spread_reason_and_model_are_recorded(monkeypatch):
     assert rel.score == 0.5 and rel.passed is False
 
 
+class SometimesSilentMetric(FakeMetric):
+    """Like FakeMetric, but the judge gives no reason for a score of 0.6."""
+
+    def measure(self, test_case, _show_indicator=True):
+        score = super().measure(test_case, _show_indicator)
+        if score == 0.6:
+            self.reason = None
+        return score
+
+
+def test_median_reason_belongs_to_the_median_sample_when_a_sample_has_no_reason(monkeypatch):
+    # sample 1 (0.6) has no reason; the median is sample 3 (0.8). Reasons used to be collected only when present,
+    # so index 2 pointed past the shifted list and the median score lost its own reason.
+    FakeMetric.scores = iter([0.6, 0.9, 0.8])
+    provider = patched_provider(monkeypatch, KnowledgeRetentionMetric=SometimesSilentMetric)
+    settings = deepeval_settings()
+    settings.min_turn_relevancy = None  # only knowledgeRetention is evaluated
+    (r,) = run_semantic_evaluators(conv(), settings, llm=JUDGE, provider_factory=lambda cfg: provider)
+    (ret,) = r.scores
+    assert (ret.score, ret.spread) == (0.8, [0.6, 0.9])
+    assert ret.reason == "reason for 0.8"
+
+
+def test_median_without_a_reason_reports_no_reason_instead_of_another_samples(monkeypatch):
+    FakeMetric.scores = iter([0.9, 0.6, 0.5])  # median 0.6 has no reason
+    provider = patched_provider(monkeypatch, KnowledgeRetentionMetric=SometimesSilentMetric)
+    settings = deepeval_settings()
+    settings.min_turn_relevancy = None
+    (r,) = run_semantic_evaluators(conv(), settings, llm=JUDGE, provider_factory=lambda cfg: provider)
+    (ret,) = r.scores
+    assert ret.score == 0.6 and ret.reason is None
+
+
 def test_provider_error_is_captured_not_raised(monkeypatch):
     provider = patched_provider(monkeypatch, KnowledgeRetentionMetric=ExplodingMetric, TurnRelevancyMetric=ExplodingMetric)
     (r,) = run_semantic_evaluators(conv(), deepeval_settings(required=True), llm=JUDGE, provider_factory=lambda cfg: provider)

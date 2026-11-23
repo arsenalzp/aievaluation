@@ -82,7 +82,8 @@ class DeepEvalProvider(SemanticProvider):
                 continue
             threshold = thresholds.get(name)
             scores: List[float] = []
-            reasons: List[str] = []
+            # reason of each sample, index-aligned with ``scores`` (None when the judge gave none)
+            reasons: List[Optional[str]] = []
             used_model: Optional[str] = llm.model
             error: Optional[str] = None
             for _ in range(max(1, samples)):
@@ -92,9 +93,9 @@ class DeepEvalProvider(SemanticProvider):
                         model=judge, include_reason=True, async_mode=False, verbose_mode=False,
                     )
                     score = metric.measure(test_case, _show_indicator=False)
+                    reason = getattr(metric, "reason", None)
                     scores.append(float(score if score is not None else metric.score))
-                    if getattr(metric, "reason", None):
-                        reasons.append(str(metric.reason))
+                    reasons.append(str(reason) if reason else None)
                     used_model = getattr(metric, "evaluation_model", None) or used_model
                 except Exception as exc:  # noqa: BLE001
                     error = f"{type(exc).__name__}: {exc}"
@@ -109,7 +110,7 @@ class DeepEvalProvider(SemanticProvider):
             idx = min(range(len(scores)), key=lambda i: abs(scores[i] - median))
             out.append(SemanticScore(
                 metric=name, score=round(float(median), 4), threshold=threshold,
-                reason=reasons[idx] if idx < len(reasons) else None, model=used_model,
+                reason=reasons[idx], model=used_model,
                 evaluator=PROVIDER_DEEPEVAL, version=self.version, samples=len(scores),
                 spread=[min(scores), max(scores)] if len(scores) > 1 else None,
             ))
