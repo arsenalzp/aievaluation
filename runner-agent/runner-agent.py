@@ -395,9 +395,9 @@ def build_runner_config(parse_suite: bool = True) -> RunnerConfig:
 # ============================================================
 
 def download_dataset(cfg: RunnerConfig) -> str:
-    print("--downloading dataset--")
     bucket = cfg.dataset_s3_bucket
     key = cfg.dataset_s3_key
+    print(f"downloading dataset {bucket}/{key}", flush=True)
 
     ensure_dir(os.path.dirname(cfg.dataset_file))
 
@@ -417,7 +417,7 @@ def download_dataset(cfg: RunnerConfig) -> str:
 
 
 def load_optional_baseline(cfg: RunnerConfig) -> Optional[Dict[str, Any]]:
-    print("--downloading optional dataset--")
+    print(f"loading baseline {cfg.s3_bucket}/{cfg.s3_baseline_key}", flush=True)
     resp = requests.get(f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.s3_baseline_key}")
 
     if getattr(resp, "status_code", None) == 404:
@@ -433,7 +433,7 @@ def load_optional_baseline(cfg: RunnerConfig) -> Optional[Dict[str, Any]]:
 
 
 def upload_json(cfg: RunnerConfig, key: str, payload: Dict[str, Any]) -> Any:
-    print("--uploading JSON--")
+    print(f"uploading {cfg.s3_bucket}/{key}", flush=True)
     def safe_serialize(obj):
         if isinstance(obj, bytes):
             return obj.decode("utf-8", errors="ignore")
@@ -459,7 +459,7 @@ def upload_json(cfg: RunnerConfig, key: str, payload: Dict[str, Any]) -> Any:
 
 
 def upload_text(cfg: RunnerConfig, key: str, text: str, content_type: str = "text/plain") -> Any:
-    print("--uploading text--")
+    print(f"uploading {cfg.s3_bucket}/{key}", flush=True)
     headers = {"Content-Type": f"{content_type}; charset=utf-8"}
 
     resp = requests.put(
@@ -727,7 +727,6 @@ def resolve_agent_trace(data: Dict[str, Any], case_id: Optional[str] = None) -> 
 # ============================================================
 
 def call_agent_endpoint_raw(cfg: RunnerConfig, case: AgentDatasetCase) -> Dict[str, Any]:
-    print("--calling an agent endpoint--")
     headers = {"Content-Type": "application/json"}
 
     payload = {
@@ -1488,7 +1487,10 @@ class PhoenixAgentAdapter:
         self,
         records: List[AgentEvalRecord],
     ) -> Tuple[List[AgentPerCaseScore], Dict[str, Any]]:
-        scores = [self.score_record(record) for record in records]
+        scores = []
+        for n, record in enumerate(records, start=1):
+            print(f"evaluating case {n}/{len(records)} {record.case_id}", flush=True)
+            scores.append(self.score_record(record))
 
         return scores, {
             "metricNames": [
@@ -1932,7 +1934,6 @@ def publish_details_jsonl(
     records: List[AgentEvalRecord],
     scores: List[AgentPerCaseScore],
 ) -> None:
-    print("--publishing details jsonl--")
     score_by_case = {x.case_id: x for x in scores}
     lines: List[str] = []
 
@@ -1968,7 +1969,6 @@ def publish_scores_json(
     per_case: List[AgentPerCaseScore],
     deepeval_meta: Dict[str, Any],
 ) -> None:
-    print("--publishing scores jsonl--")
     payload = {
         "schemaVersion": "evalrun.scores/v1",
         "evaluationType": "agent",
@@ -1991,7 +1991,6 @@ def publish_scores_json(
 
 
 def publish_gate_summary(cfg: RunnerConfig, gate: GateSummary) -> None:
-    print("--publishing gate summary--")
     upload_json(cfg, cfg.gate_summary_key, asdict(gate))
 
 
@@ -2052,6 +2051,7 @@ async def main() -> int:
 
         dataset_path = download_dataset(cfg)
 
+        print("parsing dataset", flush=True)
         suite = load_suite_config(cfg.suite_config_path)
         multi_turn = get_interaction_mode(suite) == INTERACTION_MULTI
         guard_dataset_matches_mode(dataset_path, multi_turn)
@@ -2063,17 +2063,20 @@ async def main() -> int:
         cases = parse_dataset_jsonl(dataset_path)
         if not cases:
             raise RuntimeError("dataset is empty")
+        print(f"dataset has {len(cases)} single-turn cases", flush=True)
 
+        print(f"checking judge LLM {cfg.llm.model} at {cfg.llm.endpoint}", flush=True)
         probe_llm(cfg.llm)  # fail fast on a wrong URL, key or model name, before the agent is called
-        print(f"judge LLM: provider={cfg.llm.provider} model={cfg.llm.model} endpoint={cfg.llm.endpoint}")
 
         baseline = load_optional_baseline(cfg)
 
         records: List[AgentEvalRecord] = []
-        for case in cases:
+        for n, case in enumerate(cases, start=1):
+            print(f"calling agent for case {n}/{len(cases)} {case.case_id}", flush=True)
             record = call_agent_endpoint(cfg, case)
             records.append(record)
-        
+
+        print("running evaluator (Phoenix judges)", flush=True)
         adapter = PhoenixAgentAdapter(model=cfg.llm.model, llm=build_phoenix_llm(cfg.llm))
         per_case_scores, deepeval_meta = adapter.score_records(records)
 
@@ -2095,6 +2098,7 @@ async def main() -> int:
             regression=regression,
         )
 
+        print(f"verdict: {gate.verdict}", flush=True)
         publish_details_jsonl(cfg, records, per_case_scores)
         publish_scores_json(cfg, agg, regression, per_case_scores, deepeval_meta)
         publish_gate_summary(cfg, gate)

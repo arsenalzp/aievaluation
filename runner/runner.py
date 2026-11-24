@@ -480,6 +480,7 @@ def build_runner_config(parse_suite: bool = True) -> RunnerConfig:
 def download_dataset(cfg: RunnerConfig) -> str:
     bucket = cfg.dataset_s3_bucket
     key = cfg.dataset_s3_key
+    print(f"downloading dataset {bucket}/{key}", flush=True)
 
     ensure_dir(os.path.dirname(cfg.dataset_file))
     resp = requests.get(f"{cfg.s3_endpoint}/buckets/{bucket}/objects/{key}")
@@ -497,6 +498,7 @@ def download_dataset(cfg: RunnerConfig) -> str:
 
 
 def load_optional_baseline(cfg: RunnerConfig) -> Optional[Dict[str, Any]]:
+    print(f"loading baseline {cfg.s3_bucket}/{cfg.s3_baseline_key}", flush=True)
     resp = requests.get(f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{cfg.s3_baseline_key}")
     
     if getattr(resp, "status_code", None) == 404:
@@ -519,6 +521,7 @@ def upload_json(cfg: RunnerConfig, key: str, payload: Dict[str, Any]) -> None:
         raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
     
     body = json.dumps(payload, ensure_ascii=False, indent=2, default=safe_serialize).encode("utf-8")
+    print(f"uploading {cfg.s3_bucket}/{key}", flush=True)
     
     resp = requests.put(
         f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{key}",
@@ -536,6 +539,7 @@ def upload_json(cfg: RunnerConfig, key: str, payload: Dict[str, Any]) -> None:
 
 def upload_text(cfg: RunnerConfig, key: str, text: str, content_type: str = "text/plain") -> None:
     headers = {"Content-Type": f"{content_type}; charset=utf-8"}
+    print(f"uploading {cfg.s3_bucket}/{key}", flush=True)
 
     resp = requests.put(
         f"{cfg.s3_endpoint}/buckets/{cfg.s3_bucket}/objects/{key}",
@@ -768,6 +772,7 @@ class RagasAdapter:
         )
         
         async def _eval_single(record: EvalRecord) -> SafetyAuditVerdict:
+            print(f"evaluating case {record.case_id} with the Safety Judge", flush=True)
             user_message = f"User Input (Attack Payload):\n{record.question}\n\nSystem Response:\n{record.answer}"
             try:
                 completion = await openai_client.beta.chat.completions.parse(
@@ -844,6 +849,7 @@ class RagasAdapter:
             
         @experiment(ExperimentResult, backend="inmemory")
         async def run_evaluation(row):
+            print(f"evaluating case {row.case_id} with ragas", flush=True)
             correctness_result = await answer_correctness.ascore(
                 user_input=row.user_input,
                 response=row.response,
@@ -882,8 +888,10 @@ class RagasAdapter:
             return [], {"metricNames": []}
 
         dataset = self._build_hf_dataset(records)
+        print(f"running evaluator (ragas) on {len(records)} cases", flush=True)
         result = await run_evaluation.arun(dataset)
         
+        print(f"running evaluator (Safety Judge) on {len(records)} cases", flush=True)
         sec_results: List[SafetyAuditVerdict] = await self.evaluate_safety_case(openai_async_client, records)
         
         safety_map: Dict[str, SafetyAuditVerdict] = {v.case_id: v for v in sec_results}
@@ -1249,21 +1257,23 @@ async def main() -> int:
         dataset_path = download_dataset(cfg)
 
         # 2) Parse dataset
+        print("parsing dataset", flush=True)
         cases = parse_dataset_jsonl(dataset_path)
         if not cases:
             raise RuntimeError("dataset is empty")
+        print(f"dataset has {len(cases)} cases", flush=True)
 
         # 2.1) Fail fast on a wrong LLM URL, key, model name or missing server capability
+        print(f"checking judge LLM {cfg.llm.model} and embedder {cfg.llm.embedder} at {cfg.llm.endpoint}", flush=True)
         await probe_llm(cfg.llm)
-        print(f"judge LLM: provider={cfg.llm.provider} model={cfg.llm.model} embedder={cfg.llm.embedder} "
-              f"endpoint={cfg.llm.endpoint}")
 
         # 3) Load optional baseline
         baseline = load_optional_baseline(cfg)
 
         # 4) Call target endpoint and collect eval records
         records: List[EvalRecord] = []
-        for case in cases:
+        for n, case in enumerate(cases, start=1):
+            print(f"calling RAG system for case {n}/{len(cases)} {case.case_id}", flush=True)
             record = call_target_endpoint(cfg, case)
             records.append(record)
 
@@ -1293,6 +1303,8 @@ async def main() -> int:
             threshold_notes=threshold_notes,
             regression=regression,
         )
+
+        print(f"verdict: {gate.verdict}", flush=True)
 
         # 11) Publish artifacts
         publish_details_jsonl(cfg, records, per_case_scores)

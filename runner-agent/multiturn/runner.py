@@ -163,8 +163,11 @@ def evaluate_run(
 
     # 1. execute all scripted sessions
     executions: List[_Executed] = []
-    for case in cases:
+    print("running evaluator (built-in checks)", flush=True)
+    for n, case in enumerate(cases, start=1):
         for trial in range(1, settings.trials + 1):
+            print(f"evaluating case {n}/{len(cases)} {case.case_id}"
+                  + (f" trial {trial}/{settings.trials}" if settings.trials > 1 else ""), flush=True)
             executions.append(execute_conversation(case, trial, session_id_for(case, evalrun, trial), adapter, settings))
 
     # 2. trace observations from Phoenix (once for the whole run)
@@ -227,7 +230,9 @@ def evaluate_run(
 
     # 3. optional semantic evaluation (first trial of each case)
     if settings.semantic_evaluators():
-        for cr in case_results:
+        print("running evaluator (DeepEval)", flush=True)
+        for n, cr in enumerate(case_results, start=1):
+            print(f"evaluating case {n}/{len(case_results)} {cr.case_id} with DeepEval", flush=True)
             t = cr.first_trial()
             if t.status == "ERROR" and t.error:
                 continue

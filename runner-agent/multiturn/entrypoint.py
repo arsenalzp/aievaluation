@@ -43,9 +43,10 @@ def run_multiturn_job(
     cases = parse_multiturn_dataset(dataset_path)
     if not cases:
         raise RuntimeError("dataset is empty")
+    print(f"dataset has {len(cases)} multi-turn cases", flush=True)
     if llm is not None:
+        print(f"checking judge LLM {llm.model} at {llm.endpoint}", flush=True)
         (llm_probe or probe_llm)(llm)  # fail fast on a wrong URL, key or model name
-        print(f"judge LLM: provider={llm.provider} model={llm.model} endpoint={llm.endpoint}")
 
     adapter = create_target_adapter("stateless", endpoint=target_endpoint,
                                     timeout_seconds=settings.timeout_seconds, post=post)
@@ -66,5 +67,5 @@ def run_multiturn_job(
     result = evaluate_run(settings=settings, cases=cases, adapter=adapter, uploader=uploader, layout=layout,
                           run_info=run_info, baseline=baseline, llm=llm, phoenix_fetcher=fetcher,
                           provider_factory=provider_factory, **kwargs)
-    print(f"multi-turn evaluation finished: verdict={result.verdict} cases={len(result.cases)} :: {result.summary}")
+    print(f"verdict: {result.verdict} ({result.summary})", flush=True)
     return result
