@@ -139,7 +139,7 @@ def serve(agent: FakeTravelAgent, port: int) -> HTTPServer:  # pragma: no cover 
         def log_message(self, *_: Any) -> None:
             return
 
-    return HTTPServer(("127.0.0.1", port), Handler)
+    return HTTPServer(("0.0.0.0", port), Handler)
 
 
 if __name__ == "__main__":  # pragma: no cover
@@ -148,5 +148,5 @@ if __name__ == "__main__":  # pragma: no cover
     ap.add_argument("--flags", default="", help=f"comma separated: {sorted(KNOWN_FLAGS)}")
     a = ap.parse_args()
     srv = serve(FakeTravelAgent([f for f in a.flags.split(",") if f]), a.port)
-    print(f"fake travel agent on http://127.0.0.1:{a.port}")
+    print(f"fake travel agent on http://0.0.0.0:{a.port}")
     srv.serve_forever()
